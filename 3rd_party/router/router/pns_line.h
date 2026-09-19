@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2017 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -40,6 +40,7 @@ namespace PNS {
 class LINKED_ITEM;
 class NODE;
 class VIA;
+class SEGMENT;
 
 #define PNS_HULL_MARGIN 10
 
@@ -67,9 +68,9 @@ public:
         LINK_HOLDER( LINE_T ),
         m_blockingObstacle( nullptr )
     {
-        m_hasVia = false;
         m_width = 1;        // Dummy value
         m_snapThreshhold = 0;
+        m_via = nullptr;
     }
 
     LINE( const LINE& aOther );
@@ -86,22 +87,22 @@ public:
     {
         m_net = aBase.m_net;
         m_layers = aBase.m_layers;
-        m_hasVia = false;
+        m_via = nullptr;
     }
 
     /**
      * Construct a LINE for a lone VIA (ie a stitching via).
      */
-    LINE( const VIA& aVia ) :
+    LINE( VIA* aVia ) :
         LINK_HOLDER( LINE_T ),
         m_blockingObstacle( nullptr )
     {
-        m_hasVia = true;
         m_via = aVia;
-        m_width = aVia.Diameter();
-        m_net = aVia.Net();
-        m_layers = aVia.Layers();
-        m_rank = aVia.Rank();
+        // TODO(JE) Padstacks - does this matter?
+        m_width = aVia->Diameter( aVia->Layers().Start() );
+        m_net = aVia->Net();
+        m_layers = aVia->Layers();
+        m_rank = aVia->Rank();
         m_snapThreshhold = 0;
     }
 
@@ -115,7 +116,11 @@ public:
     /// @copydoc ITEM::Clone()
     virtual LINE* Clone() const override;
 
+    // Copy operator
     LINE& operator=( const LINE& aOther );
+
+    // Move assignment operator
+    LINE& operator=( LINE&& aOther ) noexcept;
 
     bool IsLinkedChecked() const
     {
@@ -130,7 +135,7 @@ public:
     }
 
     ///< Return the shape of the line.
-    const SHAPE* Shape() const override { return &m_line; }
+    const SHAPE* Shape( int aLayer ) const override { return &m_line; }
 
     ///< Modifiable accessor to the underlying shape.
     SHAPE_LINE_CHAIN& Line() { return m_line; }
@@ -143,6 +148,7 @@ public:
 
     ///< Return the \a aIdx-th point of the line.
     const VECTOR2I& CPoint( int aIdx ) const { return m_line.CPoint( aIdx ); }
+    const VECTOR2I& CLastPoint() const { return m_line.CLastPoint(); }
     const SEG CSegment( int aIdx ) const { return m_line.CSegment( aIdx ); }
 
     ///< Set line width.
@@ -183,30 +189,55 @@ public:
 
     bool Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPath, bool aCw ) const;
 
-    bool Is45Degree() const;
-
     ///< Print out all linked segments.
     void ShowLinks() const;
 
-    bool EndsWithVia() const { return m_hasVia; }
+    bool EndsWithVia() const { return m_via != nullptr; }
+
+    int FindSegment( const SEGMENT* aSeg ) const;
 
     void AppendVia( const VIA& aVia );
-    void RemoveVia() { m_hasVia = false; }
+    void LinkVia( VIA* aVia );
+    void RemoveVia();
 
-    const VIA& Via() const { return m_via; }
+    VIA& Via() { return *m_via; }
+    const VIA& Via() const { return *m_via; }
 
-    void SetViaDiameter( int aDiameter ) { m_via.SetDiameter( aDiameter ); }
-    void SetViaDrill( int aDrill ) { m_via.SetDrill( aDrill ); }
+    void SetViaDiameter( int aDiameter )
+    {
+        wxCHECK( m_via, /* void */ );
+        wxCHECK2_MSG( m_via->StackMode() == VIA::STACK_MODE::NORMAL,
+                      m_via->SetStackMode( VIA::STACK_MODE::NORMAL ),
+                      wxS( "Warning: converting a complex viastack to normal in PNS_LINE" ) );
+
+        m_via->SetDiameter( VIA::ALL_LAYERS, aDiameter );
+    }
+    void SetViaDrill( int aDrill ) { assert(m_via); m_via->SetDrill( aDrill ); }
 
     virtual void Mark( int aMarker ) const override;
     virtual void Unmark( int aMarker = -1 ) const override;
     virtual int Marker() const override;
 
+    virtual VECTOR2I Anchor( int n ) const override
+    {
+        if( m_line.PointCount() < 1 )
+            return VECTOR2I();
+
+        return ( n == 0 ) ? m_line.CPoint( 0 ) : m_line.CPoint( -1 );
+    }
+
+    virtual int AnchorCount() const override
+    {
+        return ( m_line.PointCount() >= 2 ) ? 2 : m_line.PointCount();
+    }
+
     void SetBlockingObstacle( ITEM* aObstacle ) { m_blockingObstacle = aObstacle; }
     ITEM* GetBlockingObstacle() const { return m_blockingObstacle; }
 
     void DragSegment( const VECTOR2I& aP, int aIndex, bool aFreeAngle = false );
-    void DragCorner( const VECTOR2I& aP, int aIndex, bool aFreeAngle = false );
+    void DragCorner( const VECTOR2I& aP, int aIndex, bool aFreeAngle = false, DIRECTION_45 aPreferredEndingDirection = DIRECTION_45() );
+
+    void DragArc( const VECTOR2I& aP, int aIndex );
 
     void SetRank( int aRank ) override;
     int Rank() const override;
@@ -230,7 +261,7 @@ public:
 
 private:
     void dragSegment45( const VECTOR2I& aP, int aIndex );
-    void dragCorner45( const VECTOR2I& aP, int aIndex );
+    void dragCorner45( const VECTOR2I& aP, int aIndex, DIRECTION_45 aPreferredEndingDirection );
     void dragSegmentFree( const VECTOR2I& aP, int aIndex );
     void dragCornerFree( const VECTOR2I& aP, int aIndex );
 
@@ -246,9 +277,7 @@ private:
 
     int              m_snapThreshhold;      ///< Width to smooth out jagged segments.
 
-    bool             m_hasVia;              ///< Optional via at the end point.
-    VIA              m_via;
-
+    VIA*             m_via;
     ITEM*            m_blockingObstacle;    ///< For mark obstacle mode.
 };
 

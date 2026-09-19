@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2015 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -35,11 +35,21 @@ class JOINT;
 class ITEM;
 class SOLID;
 class DIFF_PAIR;
+class ROUTER_IFACE;
+class LINKED_ITEM;
+class VIA;
 
 class TOPOLOGY
 {
 public:
-    typedef std::set<JOINT*> JOINT_SET;
+
+    struct CLUSTER
+    {
+        const ITEM* m_key = nullptr;
+        std::vector<ITEM*> m_items;
+    };
+
+    typedef std::set<const JOINT*> JOINT_SET;
 
     TOPOLOGY( NODE* aNode ):
         m_world( aNode ) {};
@@ -47,12 +57,15 @@ public:
     ~TOPOLOGY() {};
 
     bool SimplifyLine( LINE *aLine );
-    ITEM* NearestUnconnectedItem( JOINT* aStart, int* aAnchor = nullptr,
+    ITEM* NearestUnconnectedItem( const JOINT* aStart, int* aAnchor = nullptr,
                                   int aKindMask = ITEM::ANY_T );
+
+    bool NearestUnconnectedAnchorPoint( const LINE* aTrack, VECTOR2I& aPoint, PNS_LAYER_RANGE& aLayers,
+                                        ITEM*& aItem );
     bool LeadingRatLine( const LINE* aTrack, SHAPE_LINE_CHAIN& aRatLine );
 
-    const JOINT_SET ConnectedJoints( JOINT* aStart );
-    const ITEM_SET ConnectedItems( JOINT* aStart, int aKindMask = ITEM::ANY_T );
+    const JOINT_SET ConnectedJoints( const JOINT* aStart );
+    const ITEM_SET ConnectedItems( const JOINT* aStart, int aKindMask = ITEM::ANY_T );
     const ITEM_SET ConnectedItems( ITEM* aStart, int aKindMask = ITEM::ANY_T );
     int64_t ShortestConnectionLength( ITEM* aFrom, ITEM* aTo );
 
@@ -65,7 +78,7 @@ public:
      * @return a set of items in the path.
      */
     const ITEM_SET AssembleTrivialPath( ITEM* aStart,
-                                        std::pair<JOINT*, JOINT*>* aTerminalJoints = nullptr,
+                                        std::pair<const JOINT*, const JOINT*>* aTerminalJoints = nullptr,
                                         bool aFollowLockedSegments = false );
 
     /**
@@ -80,20 +93,51 @@ public:
      * @param aEndPad will be filled with the ending pad of the path, if found.
      * @return an item set containing all the items in the path.
      */
-    const ITEM_SET AssembleTuningPath( ITEM* aStart, SOLID** aStartPad = nullptr,
+    const ITEM_SET AssembleTuningPath( ROUTER_IFACE* aRouterIface, ITEM* aStart, SOLID** aStartPad = nullptr,
                                        SOLID** aEndPad = nullptr );
 
     const DIFF_PAIR AssembleDiffPair( SEGMENT* aStart );
 
     bool AssembleDiffPair( ITEM* aStart, DIFF_PAIR& aPair );
 
-    const std::set<ITEM*> AssembleCluster( ITEM* aStart, int aLayer );
+    const CLUSTER AssembleCluster( ITEM* aStart, int aLayer, double aAreaExpansionLimit = 0.0, NET_HANDLE aExcludedNet = nullptr );
 
 private:
     const int DP_PARALLELITY_THRESHOLD = 5;
 
-    bool followTrivialPath( LINE* aLine, bool aLeft, ITEM_SET& aSet, std::set<ITEM*>& aVisited,
-                            JOINT** aTerminalJoint = nullptr );
+    struct PATH_RESULT
+    {
+        ITEM_SET    m_items;
+        const JOINT* m_end;
+        int         m_length;
+
+        PATH_RESULT() : m_end( nullptr ), m_length( 0 ) {}
+    };
+
+    struct WALK_RESULT
+    {
+        ITEM_SET m_items;
+        SOLID*   m_endPad;
+        int64_t  m_length;
+
+        WALK_RESULT() :
+                m_endPad( nullptr ),
+                m_length( -1 )
+        {
+        }
+    };
+
+    std::vector<LINE> findLinesFromVia( ROUTER_IFACE* aRouterIface, VIA* aVia, const std::set<ITEM*>& aVisited );
+
+    WALK_RESULT walkTuningPath( ROUTER_IFACE* aRouterIface, LINE& aStartLine, bool aStartFromBack,
+                                const std::set<ITEM*>& aVisited );
+
+    PATH_RESULT followBranch( const JOINT* aStartJoint, LINKED_ITEM* aPrev,
+                              std::set<ITEM*>& aVisited, bool aFollowLockedSegments );
+
+    ITEM_SET followTrivialPath( LINE* aLine, const JOINT** aTerminalJointA,
+                                const JOINT** aTerminalJointB,
+                                bool aFollowLockedSegments = false );
 
     NODE *m_world;
 };

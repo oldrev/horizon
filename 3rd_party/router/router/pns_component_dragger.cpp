@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2020 CERN
- * Copyright (C) 2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -56,7 +56,7 @@ bool COMPONENT_DRAGGER::Start( const VECTOR2I& aP, ITEM_SET& aPrimitives )
     std::unordered_set<LINKED_ITEM*> seenItems;
 
     auto addLinked =
-            [&]( SOLID* aSolid, JOINT* aJoint, LINKED_ITEM* aItem, VECTOR2I aOffset = {} )
+            [&]( SOLID* aSolid, const JOINT* aJoint, LINKED_ITEM* aItem, VECTOR2I aOffset = {} )
             {
                 if( seenItems.count( aItem ) )
                     return;
@@ -64,15 +64,15 @@ bool COMPONENT_DRAGGER::Start( const VECTOR2I& aP, ITEM_SET& aPrimitives )
                 seenItems.insert( aItem );
 
                 // Segments that go directly between two linked pads are special-cased
-                VECTOR2I otherEnd = ( aJoint->Pos() == aItem->Anchor( 0 ) ) ?
-                                    aItem->Anchor( 1 ) : aItem->Anchor( 0 );
-                JOINT* otherJoint = m_world->FindJoint( otherEnd, aItem->Layer(), aItem->Net() );
+                VECTOR2I otherEnd = ( aJoint->Pos() == aItem->Anchor( 0 ) ) ? aItem->Anchor( 1 )
+                                                                            : aItem->Anchor( 0 );
+                const JOINT* otherJoint = m_world->FindJoint( otherEnd, aItem->Layer(), aItem->Net() );
 
                 if( otherJoint && otherJoint->LinkCount( ITEM::SOLID_T ) )
                 {
-                    for( const ITEM_SET::ENTRY& otherItem : otherJoint->LinkList() )
+                    for( ITEM* otherItem : otherJoint->LinkList() )
                     {
-                        if( aPrimitives.Contains( otherItem.item ) )
+                        if( aPrimitives.Contains( otherItem ) )
                         {
                             m_fixedItems.insert( aItem );
                             return;
@@ -89,17 +89,17 @@ bool COMPONENT_DRAGGER::Start( const VECTOR2I& aP, ITEM_SET& aPrimitives )
 
                 // Lines that go directly between two linked pads are also special-cased
                 const SHAPE_LINE_CHAIN& line = cn.origLine.CLine();
-                JOINT* jA = m_world->FindJoint( line.CPoint( 0 ), aItem->Layer(), aItem->Net() );
-                JOINT* jB = m_world->FindJoint( line.CPoint( -1 ), aItem->Layer(), aItem->Net() );
+                const JOINT* jA = m_world->FindJoint( line.CPoint( 0 ), aItem->Layer(), aItem->Net() );
+                const JOINT* jB = m_world->FindJoint( line.CLastPoint(), aItem->Layer(), aItem->Net() );
 
                 wxASSERT( jA == aJoint || jB == aJoint );
-                JOINT* jSearch = ( jA == aJoint ) ? jB : jA;
+                const JOINT* jSearch = ( jA == aJoint ) ? jB : jA;
 
                 if( jSearch && jSearch->LinkCount( ITEM::SOLID_T ) )
                 {
-                    for( const ITEM_SET::ENTRY& otherItem : jSearch->LinkList() )
+                    for( ITEM* otherItem : jSearch->LinkList() )
                     {
-                        if( aPrimitives.Contains( otherItem.item ) )
+                        if( aPrimitives.Contains( otherItem ) )
                         {
                             for( ITEM* item : cn.origLine.Links() )
                                 m_fixedItems.insert( item );
@@ -109,27 +109,27 @@ bool COMPONENT_DRAGGER::Start( const VECTOR2I& aP, ITEM_SET& aPrimitives )
                     }
                 }
 
-                m_conns.push_back( cn );
+                m_conns.push_back( std::move( cn ) );
             };
 
-    for( auto item : aPrimitives.Items() )
+    for( ITEM* item : aPrimitives.Items() )
     {
-        if( item.item->Kind() != ITEM::SOLID_T )
+        if( item->Kind() != ITEM::SOLID_T )
             continue;
 
-        SOLID* solid = static_cast<SOLID*>( item.item );
+        SOLID* solid = static_cast<SOLID*>( item );
 
         m_solids.insert( solid );
 
-        if( !item.item->IsRoutable() )
+        if( !item->IsRoutable() )
             continue;
 
-        JOINT* jt = m_world->FindJoint( solid->Pos(), solid );
+        const JOINT* jt = m_world->FindJoint( solid->Pos(), solid );
 
-        for( auto link : jt->LinkList() )
+        for( ITEM* link : jt->LinkList() )
         {
-            if( link.item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
-                addLinked( solid, jt, static_cast<LINKED_ITEM*>( link.item ) );
+            if( link->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+                addLinked( solid, jt, static_cast<LINKED_ITEM*>( link ) );
         }
 
         std::vector<JOINT*> extraJoints;
@@ -141,9 +141,9 @@ bool COMPONENT_DRAGGER::Start( const VECTOR2I& aP, ITEM_SET& aPrimitives )
         {
             if( extraJoint->Net() == jt->Net() && extraJoint->LinkCount() == 1 )
             {
-                LINKED_ITEM* li = static_cast<LINKED_ITEM*>( extraJoint->LinkList()[0].item );
+                LINKED_ITEM* li = static_cast<LINKED_ITEM*>( extraJoint->LinkList().front() );
 
-                if( li->Collide( solid, nullptr, m_world ) )
+                if( li->Collide( solid, m_world, solid->Layer() ) )
                     addLinked( solid, extraJoint, li, extraJoint->Pos() - solid->Pos() );
             }
         }
@@ -160,7 +160,7 @@ bool COMPONENT_DRAGGER::Drag( const VECTOR2I& aP )
     m_world->KillChildren();
     m_currentNode = m_world->Branch();
 
-    for( const ITEM_SET::ENTRY& item : m_initialDraggedItems.Items() )
+    for( ITEM* item : m_initialDraggedItems )
         m_currentNode->Remove( item );
 
     m_draggedItems.Clear();
@@ -232,7 +232,7 @@ bool COMPONENT_DRAGGER::Drag( const VECTOR2I& aP )
         l_new.ClearLinks();
         l_new.DragCorner( cn.p_next, cn.origLine.CLine().Find( cn.p_orig ) );
 
-        PNS_DBG( Dbg(), AddLine, l_new.CLine(), BLUE, 100000, "cdrag-new-fanout" );
+        PNS_DBG( Dbg(), AddItem, &l_new, BLUE, 0, wxT( "cdrag-new-fanout" ) );
         m_draggedItems.Add( l_new );
 
         LINE l_orig( cn.origLine );
@@ -244,13 +244,13 @@ bool COMPONENT_DRAGGER::Drag( const VECTOR2I& aP )
 }
 
 
-bool COMPONENT_DRAGGER::FixRoute()
+bool COMPONENT_DRAGGER::FixRoute( bool aForceCommit )
 {
     NODE* node = CurrentNode();
 
     if( node )
     {
-        if( Settings().AllowDRCViolations() || !node->CheckColliding( m_draggedItems ) )
+        if( Settings().AllowDRCViolations() || aForceCommit || !node->CheckColliding( m_draggedItems ) )
         {
             Router()->CommitRouting( node );
             return true;

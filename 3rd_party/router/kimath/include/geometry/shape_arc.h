@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2018 CERN
- * Copyright (C) 2019-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software; you can redistribute it and/or
@@ -23,14 +23,18 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
  */
 
-#ifndef __SHAPE_ARC_H
-#define __SHAPE_ARC_H
+#pragma once
 
+#include <core/mirror.h>     // for FLIP_DIRECTION
 #include <geometry/shape.h>
-#include <convert_to_biu.h>
+#include <base_units.h>
 #include <math/vector2d.h>   // for VECTOR2I
+#include <geometry/eda_angle.h>
 
+class CIRCLE;
+class SHAPE_CIRCLE;
 class SHAPE_LINE_CHAIN;
+class SHAPE_RECT;
 
 class SHAPE_ARC : public SHAPE
 {
@@ -38,7 +42,8 @@ public:
 
     SHAPE_ARC() :
         SHAPE( SH_ARC ),
-        m_width( 0 )
+        m_width( 0 ),
+        m_radius( 0 )
     {};
 
     /**
@@ -49,11 +54,11 @@ public:
      *
      * @param aArcCenter is the arc center.
      * @param aArcStartPoint is the arc start point.
-     * @param aCenterAngle is the arc angle in degrees.
+     * @param aCenterAngle is the arc angle.
      * @param aWidth is the arc line thickness.
      */
-    SHAPE_ARC( const VECTOR2I& aArcCenter, const VECTOR2I& aArcStartPoint, double aCenterAngle,
-               int aWidth = 0 );
+    SHAPE_ARC( const VECTOR2I& aArcCenter, const VECTOR2I& aArcStartPoint,
+               const EDA_ANGLE& aCenterAngle, int aWidth = 0 );
 
     /**
      * @param aArcStart is the arc start point.
@@ -76,6 +81,8 @@ public:
 
     SHAPE_ARC( const SHAPE_ARC& aOther );
 
+    SHAPE_ARC( const SHAPE_ARC& aOther, int aWidth );
+
     virtual ~SHAPE_ARC() {}
 
     SHAPE* Clone() const override
@@ -93,7 +100,7 @@ public:
      * @return this arc.
      */
     SHAPE_ARC& ConstructFromStartEndAngle( const VECTOR2I& aStart, const VECTOR2I& aEnd,
-                                           double aAngle, double aWidth = 0 );
+                                           const EDA_ANGLE& aAngle, double aWidth = 0 );
 
     /**
      * Constructs this arc from the given start, end and center.
@@ -111,9 +118,51 @@ public:
     const VECTOR2I& GetP0() const { return m_start; }
     const VECTOR2I& GetP1() const { return m_end; }
     const VECTOR2I& GetArcMid() const { return m_mid; }
-    VECTOR2I GetCenter() const;
+    const VECTOR2I& GetCenter() const;
 
     const BOX2I BBox( int aClearance = 0 ) const override;
+
+    VECTOR2I NearestPoint( const VECTOR2I& aP ) const;
+
+    /**
+      * Compute closest points between this arc and \a aArc.
+      *
+      * @param aPtA point on this arc (output)
+      * @param aPtB point on the other arc (output)
+      * @param aDistSq squared distance between points (output)
+      * @return true if the operation was successful
+      */
+    bool NearestPoints( const SHAPE_ARC& aArc, VECTOR2I& aPtA, VECTOR2I& aPtB, int64_t& aDistSq ) const;
+
+    /**
+      * Compute closest points between this arc and \a aCircle.
+      *
+      * @param aPtA point on this arc (output)
+      * @param aPtB point on the circle (output)
+      * @param aDistSq squared distance between points (output)
+      * @return true if the operation was successful
+      */
+    bool NearestPoints( const SHAPE_CIRCLE& aCircle, VECTOR2I& aPtA, VECTOR2I& aPtB, int64_t& aDistSq ) const;
+
+    /**
+      * Compute closest points between this arc and \a aSeg.
+      *
+      * @param aPtA point on this arc (output)
+      * @param aPtB point on the segment (output)
+      * @param aDistSq squared distance between points (output)
+      * @return true if the operation was successful
+      */
+    bool NearestPoints( const SEG& aSeg, VECTOR2I& aPtA, VECTOR2I& aPtB, int64_t& aDistSq ) const;
+
+    /**
+      * Compute closest points between this arc and \a aRect.
+      *
+      * @param aPtA point on this arc (output)
+      * @param aPtB point on the rectangle (output)
+      * @param aDistSq squared distance between points (output)
+      * @return true if the operation was successful
+      */
+    bool NearestPoints( const SHAPE_RECT& aRect, VECTOR2I& aPtA, VECTOR2I& aPtB, int64_t& aDistSq ) const;
 
     bool Collide( const SEG& aSeg, int aClearance = 0, int* aActual = nullptr,
                   VECTOR2I* aLocation = nullptr ) const override;
@@ -138,22 +187,32 @@ public:
     int IntersectLine( const SEG& aSeg, std::vector<VECTOR2I>* aIpsBuffer ) const;
 
     /**
-     * Find intersection points between this arc and aArc. Ignores arc width.
+     * Find intersection points between this arc and a CIRCLE. Ignores arc width.
      *
-     * @param aSeg
+     * @param aCircle Circle to intersect against
+     * @param aIpsBuffer Buffer to store the resulting intersection points (if any)
+     * @return Number of intersection points found
+     */
+    int Intersect( const CIRCLE& aArc, std::vector<VECTOR2I>* aIpsBuffer ) const;
+
+    /**
+     * Find intersection points between this arc and another arc. Ignores arc width.
+     *
+     * @param aArc Arc to intersect against
      * @param aIpsBuffer Buffer to store the resulting intersection points (if any)
      * @return Number of intersection points found
      */
     int Intersect( const SHAPE_ARC& aArc, std::vector<VECTOR2I>* aIpsBuffer ) const;
 
-    bool IsClockwise() const;
+    VECTOR2I GetStart() const override { return m_start; }
+    VECTOR2I GetEnd() const override { return m_end; }
 
-    void SetWidth( int aWidth )
+    void SetWidth( int aWidth ) override
     {
         m_width = aWidth;
     }
 
-    int GetWidth() const
+    int GetWidth() const override
     {
         return m_width;
     }
@@ -163,17 +222,19 @@ public:
         return true;
     }
 
+    bool IsEffectiveLine() const;
+
     void Move( const VECTOR2I& aVector ) override;
 
     /**
      * Rotate the arc by a given angle about a point.
      *
      * @param aCenter is the rotation center.
-     * @param aAngle rotation angle in radians.
+     * @param aAngle rotation angle.
      */
-    void Rotate( double aAngle, const VECTOR2I& aCenter ) override;
+    void Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter ) override;
 
-    void Mirror( bool aX = true, bool aY = false, const VECTOR2I& aVector = { 0, 0 } );
+    void Mirror( const VECTOR2I& aRef, FLIP_DIRECTION aFlipDirection );
 
     void Mirror( const SEG& axis );
 
@@ -189,19 +250,21 @@ public:
     }
 
     /**
-     * @return the central angle of the arc shape in degrees, normalized between 0.0, 360.0 deg.
+     * Get the "central angle" of the arc - this is the angle at the point of the "pie slice".
+     *
+     * @return the central angle of the arc shape, normalized between -360..360 deg.
      */
-    double  GetCentralAngle() const;
+    EDA_ANGLE GetCentralAngle() const;
 
     /**
-     * @return the start angle of the arc shape in degrees, normalized between 0.0, 360.0 deg.
+     * @return the start angle of the arc shape, normalized between 0..360 deg.
      */
-    double  GetStartAngle() const;
+    EDA_ANGLE GetStartAngle() const;
 
     /**
-     * @return the end angle of the arc shape in degrees, normalized between 0.0, 360.0 deg.
+     * @return the end angle of the arc shape, normalized between 0..360 deg.
      */
-    double  GetEndAngle() const;
+    EDA_ANGLE GetEndAngle() const;
 
     /**
      * @return the length of the arc shape.
@@ -217,7 +280,7 @@ public:
      *
      * @return a default accuracy value for ConvertToPolyline() to build the polyline.
      */
-    static double DefaultAccuracyForPCB(){ return 0.005 * PCB_IU_PER_MM; }
+    static int DefaultAccuracyForPCB() { return ARC_HIGH_DEF; }
 
     /**
      * Construct a SHAPE_LINE_CHAIN of segments from a given arc.
@@ -228,14 +291,14 @@ public:
      *
      * @todo Unify KiCad internal units.
      *
-     * @param aAccuracy maximum divergence from true arc given in internal units.
-     * @param aEffectiveAccuracy is the actual divergence from true arc given.
-     * the approximation error is between -aEffectiveAccuracy/2 and +aEffectiveAccuracy/2
-     * in internal units
+     * @param aMaxError maximum divergence from true arc given in internal units.
+     * @param aActualError is the actual divergence from true arc given.
+     *                     the approximation error is between -aActualError/2 and
+     *                     +aActualError/2 in internal units
      * @return a #SHAPE_LINE_CHAIN.
      */
-    const SHAPE_LINE_CHAIN ConvertToPolyline( double aAccuracy = DefaultAccuracyForPCB(),
-                                              double* aEffectiveAccuracy = nullptr ) const;
+    const SHAPE_LINE_CHAIN ConvertToPolyline( int aMaxError = DefaultAccuracyForPCB(),
+                                              int* aActualError = nullptr ) const;
 
     bool operator==( SHAPE_ARC const& aArc ) const
     {
@@ -243,14 +306,24 @@ public:
                && ( aArc.m_width == m_width );
     }
 
-private:
-    bool ccw( const VECTOR2I& aA, const VECTOR2I& aB, const VECTOR2I& aC ) const
+    void TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aMaxError, ERROR_LOC aErrorLoc ) const override;
+
+    /**
+     * @return true if the arc is counter-clockwise.
+     */
+    bool IsCCW() const
     {
-        return ( ecoord{ aC.y } - aA.y ) * ( ecoord{ aB.x } - aA.x ) >
-               ( ecoord{ aB.y } - aA.y ) * ( ecoord{ aC.x } - aA.x );
+        VECTOR2L mid = m_mid;
+        VECTOR2L v1 = m_end - mid;
+        VECTOR2L v2 = m_start - mid;
+
+        return v1.Cross( v2 ) > 0;
     }
 
-    void update_bbox();
+    bool IsClockwise() const { return !IsCCW(); }
+
+private:
+    void update_values();
 
     bool sliceContainsPoint( const VECTOR2I& p ) const;
 
@@ -258,12 +331,12 @@ private:
     VECTOR2I m_start;
     VECTOR2I m_mid;
     VECTOR2I m_end;
-
     int      m_width;
-    BOX2I    m_bbox;
+
+    BOX2I    m_bbox;   // Calculated value
+    VECTOR2I m_center; // Calculated value
+    double   m_radius; // Calculated value
 };
 
 // Required for Boost Test BOOST_CHECK_EQUAL:
 std::ostream& operator<<( std::ostream& aStream, const SHAPE_ARC& aArc );
-
-#endif

@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2020 CERN
- * Copyright (C) 2016 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -25,6 +25,7 @@
 #include <memory>
 #include <math/vector2d.h>
 
+#include "pns_router.h"
 #include "pns_algo_base.h"
 #include "pns_itemset.h"
 #include "pns_layerset.h"
@@ -85,7 +86,7 @@ public:
      * and eventually commits it to the world.
      * @return true, if dragging finished with success.
      */
-    virtual bool FixRoute() = 0;
+    virtual bool FixRoute( bool aForceCommit ) = 0;
 
     /**
      * Function CurrentNode()
@@ -97,9 +98,9 @@ public:
     /**
      * Function CurrentNets()
      *
-     * Returns the net code(s) of currently dragged item(s).
+     * Returns the net(s) of currently dragged item(s).
      */
-    virtual const std::vector<int> CurrentNets() const = 0;
+    virtual const std::vector<NET_HANDLE> CurrentNets() const = 0;
 
     /**
      * Function CurrentLayer()
@@ -115,7 +116,13 @@ public:
      */
     virtual const ITEM_SET Traces() = 0;
 
-    virtual void SetMode( int aDragMode ) {};
+    virtual void SetMode( PNS::DRAG_MODE aDragMode ){};
+
+    virtual PNS::DRAG_MODE Mode() const = 0;
+
+    virtual bool GetForceMarkObstaclesMode( bool* aDragStatus ) const = 0;
+
+    virtual std::vector<PNS::ITEM*> GetLastCommittedLeaderSegments() { return std::vector<PNS::ITEM*>(); };
 
 protected:
     NODE*   m_world;

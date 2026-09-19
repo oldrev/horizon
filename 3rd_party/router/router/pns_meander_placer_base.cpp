@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2015 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -18,21 +18,28 @@
  * You should have received a copy of the GNU General Public License along
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <core/typeinfo.h> 
 
 #include "pns_meander_placer_base.h"
 #include "pns_meander.h"
 #include "pns_router.h"
+#include "pns_segment.h"
 #include "pns_solid.h"
 #include "pns_arc.h"
 
 namespace PNS {
+
+const int LENGTH_TARGET_TOLERANCE = 20;
 
 MEANDER_PLACER_BASE::MEANDER_PLACER_BASE( ROUTER* aRouter ) :
         PLACEMENT_ALGO( aRouter )
 {
     m_world = nullptr;
     m_currentWidth = 0;
-    m_padToDieLength = 0;
+    m_startPad_n = nullptr;
+    m_startPad_p = nullptr;
+    m_endPad_n = nullptr;
+    m_endPad_p = nullptr;
 }
 
 
@@ -64,7 +71,7 @@ int MEANDER_PLACER_BASE::Clearance()
     // Assumption: All tracks are part of the same net class.
     // It shouldn't matter which track we pick. They should all have the same clearance if
     // they are part of the same net class. Therefore, pick the first one on the list.
-    ITEM*           itemToCheck = Traces().CItems().front().item;
+    ITEM*           itemToCheck = Traces().CItems().front();
     PNS::CONSTRAINT constraint;
 
     Router()->GetRuleResolver()->QueryConstraint( PNS::CONSTRAINT_TYPE::CT_CLEARANCE, itemToCheck,
@@ -82,77 +89,111 @@ void MEANDER_PLACER_BASE::UpdateSettings( const MEANDER_SETTINGS& aSettings )
 }
 
 
-void MEANDER_PLACER_BASE::cutTunedLine( const SHAPE_LINE_CHAIN& aOrigin, const VECTOR2I& aTuneStart,
-                                        const VECTOR2I& aCursorPos, SHAPE_LINE_CHAIN& aPre,
-                                        SHAPE_LINE_CHAIN& aTuned, SHAPE_LINE_CHAIN& aPost )
+int findAmplitudeBinarySearch( MEANDER_SHAPE& aCopy, int targetLength, int minAmp, int maxAmp )
 {
-    VECTOR2I cp ( aCursorPos );
+    if( minAmp == maxAmp )
+        return maxAmp;
 
-    if( cp == aTuneStart ) // we don't like tuning segments with 0 length
+    aCopy.Resize( minAmp );
+    int minLen = aCopy.CurrentLength();
+
+    aCopy.Resize( maxAmp );
+    int maxLen = aCopy.CurrentLength();
+
+    if( minLen > targetLength )
+        return 0;
+
+    if( maxLen < targetLength )
+        return 0;
+
+    int minError = minLen - targetLength;
+    int maxError = maxLen - targetLength;
+
+    if( std::abs( minError ) < LENGTH_TARGET_TOLERANCE
+        || std::abs( maxError ) < LENGTH_TARGET_TOLERANCE )
     {
-        int idx = aOrigin.FindSegment( cp );
+        return std::abs( minError ) < std::abs( maxError ) ? minAmp : maxAmp;
+    }
+    else
+    {
+        int left =
+                findAmplitudeBinarySearch( aCopy, targetLength, minAmp, ( minAmp + maxAmp ) / 2 );
 
-        if( idx >= 0 )
-        {
-            const SEG& s = aOrigin.CSegment( idx );
-            cp += ( s.B - s.A ).Resize( 2 );
-        }
-        else
-        {
-            cp += VECTOR2I( 2, 5 ); // some arbitrary value that is not 45 degrees oriented
-        }
+        if( left )
+            return left;
+
+        int right =
+                findAmplitudeBinarySearch( aCopy, targetLength, ( minAmp + maxAmp ) / 2, maxAmp );
+
+        if( right )
+            return right;
     }
 
-    VECTOR2I n = aOrigin.NearestPoint( cp, false );
-    VECTOR2I m = aOrigin.NearestPoint( aTuneStart, false );
+    return 0;
+}
 
-    SHAPE_LINE_CHAIN l( aOrigin );
-    l.Split( n );
-    l.Split( m );
 
-    int i_start = l.Find( m );
-    int i_end = l.Find( n );
+int findAmplitudeForLength( MEANDER_SHAPE* m, int targetLength, int minAmp, int maxAmp )
+{
+    MEANDER_SHAPE copy = *m;
 
-    if( i_start > i_end )
+    // Try to keep the same baseline length
+    copy.SetTargetBaselineLength( m->BaselineLength() );
+
+    long long initialGuess = m->Amplitude() - ( m->CurrentLength() - targetLength ) / 2;
+
+    if( initialGuess >= minAmp && initialGuess <= maxAmp )
     {
-        l = l.Reverse();
-        i_start = l.Find( m );
-        i_end = l.Find( n );
+        copy.Resize( minAmp );
+
+        if( std::abs( copy.CurrentLength() - targetLength ) < LENGTH_TARGET_TOLERANCE )
+            return initialGuess;
     }
 
-    aPre = l.Slice( 0, i_start );
-    aPost = l.Slice( i_end, -1 );
-    aTuned = l.Slice( i_start, i_end );
-
-    aTuned.Simplify();
+    // The length is non-trivial, use binary search
+    return findAmplitudeBinarySearch( copy, targetLength, minAmp, maxAmp );
 }
 
 
 void MEANDER_PLACER_BASE::tuneLineLength( MEANDERED_LINE& aTuned, long long int aElongation )
 {
-    long long int remaining = aElongation;
-    bool finished = false;
+    long long int maxElongation = 0;
+    long long int minElongation = 0;
+    bool          finished = false;
 
     for( MEANDER_SHAPE* m : aTuned.Meanders() )
     {
         if( m->Type() != MT_CORNER && m->Type() != MT_ARC )
         {
-            if( remaining >= 0 )
-                remaining -= m->MaxTunableLength() - m->BaselineLength();
+            MEANDER_SHAPE end = *m;
+            MEANDER_TYPE  endType;
 
-            if( remaining < 0 )
+            if( m->Type() == MT_START || m->Type() == MT_SINGLE )
+                endType = MT_SINGLE;
+            else
+                endType = MT_FINISH;
+
+            end.SetType( endType );
+            end.Recalculate();
+
+            long long int maxEndElongation = end.CurrentLength() - end.BaselineLength();
+
+            if( maxElongation + maxEndElongation > aElongation )
             {
                 if( !finished )
                 {
-                    MEANDER_TYPE newType;
-
-                    if( m->Type() == MT_START || m->Type() == MT_SINGLE )
-                        newType = MT_SINGLE;
-                    else
-                        newType = MT_FINISH;
-
-                    m->SetType( newType );
+                    m->SetType( endType );
                     m->Recalculate();
+
+                    if( endType == MT_SINGLE )
+                    {
+                        // Check if we need to fit this meander
+                        long long int endMinElongation =
+                                ( m->MinTunableLength() - m->BaselineLength() );
+
+                        if( minElongation + endMinElongation >= aElongation )
+                            m->MakeEmpty();
+                    }
 
                     finished = true;
                 }
@@ -161,96 +202,60 @@ void MEANDER_PLACER_BASE::tuneLineLength( MEANDERED_LINE& aTuned, long long int 
                     m->MakeEmpty();
                 }
             }
+
+            maxElongation += m->CurrentLength() - m->BaselineLength();
+            minElongation += m->MinTunableLength() - m->BaselineLength();
         }
     }
 
-    remaining = aElongation;
-    int meanderCount = 0;
+    long long int remainingElongation = aElongation;
+    int           meanderCount = 0;
 
     for( MEANDER_SHAPE* m : aTuned.Meanders() )
     {
         if( m->Type() != MT_CORNER && m->Type() != MT_ARC && m->Type() != MT_EMPTY )
         {
-            if(remaining >= 0)
-            {
-                remaining -= m->MaxTunableLength() - m->BaselineLength();
-                meanderCount ++;
-            }
+            remainingElongation -= m->CurrentLength() - m->BaselineLength();
+            meanderCount++;
         }
     }
 
-    long long int balance = 0;
+    long long int lenReductionLeft = -remainingElongation;
+    int           meandersLeft = meanderCount;
 
-    if( meanderCount )
-        balance = -remaining / meanderCount;
+    if( lenReductionLeft < 0 || !meandersLeft )
+        return;
 
-    if( balance >= 0 )
+    for( MEANDER_SHAPE* m : aTuned.Meanders() )
     {
-        for( MEANDER_SHAPE* m : aTuned.Meanders() )
+        if( m->Type() != MT_CORNER && m->Type() != MT_ARC && m->Type() != MT_EMPTY )
         {
-            if( m->Type() != MT_CORNER && m->Type() != MT_ARC && m->Type() != MT_EMPTY )
-            {
-                m->Resize( std::max( m->Amplitude() - balance / 2,
-                           (long long int) m_settings.m_minAmplitude ) );
-            }
-        }
-    }
-}
+            long long int lenReductionHere = lenReductionLeft / meandersLeft;
+            long long int initialLen = m->CurrentLength();
+            int           minAmpl = m->MinAmplitude();
 
+            int amp = findAmplitudeForLength( m, initialLen - lenReductionHere, minAmpl,
+                                              m->Amplitude() );
 
-int MEANDER_PLACER_BASE::GetTotalPadToDieLength( const LINE& aLine ) const
-{
-    int   length = 0;
-    JOINT start;
-    JOINT end;
+            if( amp < minAmpl )
+                amp = minAmpl;
 
-    m_world->FindLineEnds( aLine, start, end );
+            m->SetTargetBaselineLength( m->BaselineLength() );
+            m->Resize( amp );
 
-    // Extract the length of the pad to die for start and end pads
-    for( auto& link : start.LinkList() )
-    {
-        if( const SOLID* solid = dynamic_cast<const SOLID*>( link.item ) )
-        {
-            // If there are overlapping pads, choose the first with a non-zero length
-            if( solid->GetPadToDie() > 0 )
-            {
-                length += solid->GetPadToDie();
+            lenReductionLeft -= initialLen - m->CurrentLength();
+            meandersLeft--;
+
+            if( !meandersLeft )
                 break;
-            }
         }
     }
-
-    for( auto& link : end.LinkList() )
-    {
-        if( const SOLID* solid = dynamic_cast<const SOLID*>( link.item ) )
-        {
-            if( solid->GetPadToDie() > 0 )
-            {
-                length += solid->GetPadToDie();
-                break;
-            }
-        }
-    }
-
-    return length;
 }
 
 
 const MEANDER_SETTINGS& MEANDER_PLACER_BASE::MeanderSettings() const
 {
     return m_settings;
-}
-
-
-int MEANDER_PLACER_BASE::compareWithTolerance(
-        long long int aValue, long long int aExpected, long long int aTolerance ) const
-{
-    if( aValue < aExpected - aTolerance )
-        return -1;
-    else if( aValue > aExpected + aTolerance )
-        return 1;
-    else
-        return 0;
 }
 
 
@@ -278,29 +283,22 @@ VECTOR2I MEANDER_PLACER_BASE::getSnappedStartPoint( LINKED_ITEM* aStartItem, VEC
 }
 
 
-long long int MEANDER_PLACER_BASE::lineLength( const ITEM_SET& aLine ) const
+long long int MEANDER_PLACER_BASE::lineLength( const ITEM_SET& aLine, const SOLID* aStartPad, const SOLID* aEndPad ) const
 {
-    long long int total = 0;
+    if( aLine.Empty() )
+        return 0;
 
-    for( int idx = 0; idx < aLine.Size(); idx++ )
-    {
-        const ITEM* item = aLine[idx];
-
-        if( const LINE* l = dyn_cast<const LINE*>( item ) )
-        {
-            total += l->CLine().Length();
-        }
-        else if( item->OfKind( ITEM::VIA_T ) && idx > 0 && idx < aLine.Size() - 1 )
-        {
-            int layerPrev = aLine[idx - 1]->Layer();
-            int layerNext = aLine[idx + 1]->Layer();
-
-            if( layerPrev != layerNext )
-                total += m_router->GetInterface()->StackupHeight( layerPrev, layerNext );
-        }
-    }
-
-    return total;
+    ROUTER_IFACE* iface = Router()->GetInterface();
+    return iface->CalculateRoutedPathLength( aLine, aStartPad, aEndPad, m_settings.m_netClass );
 }
 
+
+int64_t MEANDER_PLACER_BASE::lineDelay( const ITEM_SET& aLine, const SOLID* aStartPad, const SOLID* aEndPad ) const
+{
+    if( aLine.Empty() )
+        return 0;
+
+    ROUTER_IFACE* iface = Router()->GetInterface();
+    return iface->CalculateRoutedPathDelay( aLine, aStartPad, aEndPad, m_settings.m_netClass );
+}
 }

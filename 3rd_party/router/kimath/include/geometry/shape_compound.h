@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2016-2020 CERN
- * Copyright (C) 2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -30,6 +30,8 @@
 #include <math/box2.h>
 #include <list>
 #include <vector>
+#include <memory>
+#include "eda_angle.h"
 
 class SHAPE_SIMPLE;
 
@@ -49,7 +51,7 @@ public:
     ~SHAPE_COMPOUND();
 
     SHAPE_COMPOUND*   Clone() const override;
-    const std::string Format() const override;
+    const std::string Format( bool aCplusPlus = true ) const override;
 
     bool Collide( const SEG& aSeg, int aClearance = 0, int* aActual = nullptr,
                   VECTOR2I* aLocation = nullptr ) const override;
@@ -72,6 +74,8 @@ public:
 
     const BOX2I BBox( int aClearance = 0 ) const override;
 
+    using SHAPE::Distance;
+
     int Distance( const SEG& aSeg ) const;
 
     void Move( const VECTOR2I& aVector ) override;
@@ -79,12 +83,12 @@ public:
     void AddShape( SHAPE* aShape )
     {
         // Don't make clients deal with nested SHAPE_COMPOUNDs
-        if( aShape->HasIndexableSubshapes() )
+        if( dynamic_cast<SHAPE_COMPOUND*>( aShape ) )
         {
-            std::vector<SHAPE*> subshapes;
+            std::vector<const SHAPE*> subshapes;
             aShape->GetIndexableSubshapes( subshapes );
 
-            for( SHAPE* subshape : subshapes )
+            for( const SHAPE* subshape : subshapes )
                 m_shapes.push_back( subshape->Clone() );
 
             delete aShape;
@@ -97,6 +101,25 @@ public:
         m_dirty = true;
     }
 
+    void AddShape( std::shared_ptr<SHAPE> aShape )
+    {
+        // Don't make clients deal with nested SHAPE_COMPOUNDs
+        if( dynamic_cast<SHAPE_COMPOUND*>( aShape.get() ) )
+        {
+            std::vector<const SHAPE*> subshapes;
+            aShape->GetIndexableSubshapes( subshapes );
+
+            for( const SHAPE* subshape : subshapes )
+                m_shapes.push_back( subshape->Clone() );
+        }
+        else
+        {
+            m_shapes.push_back( aShape->Clone() );
+        }
+
+        m_dirty = true;
+    }
+
     bool Empty() const
     {
         return m_shapes.empty();
@@ -104,10 +127,10 @@ public:
 
     int Size() const
     {
-        return m_shapes.size();
+        return (int) m_shapes.size();
     }
 
-    void Rotate( double aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override;
+    void Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override;
 
     bool IsSolid() const override;
 
@@ -126,12 +149,15 @@ public:
         return m_shapes.size();
     }
 
-    virtual void GetIndexableSubshapes( std::vector<SHAPE*>& aSubshapes ) override
+    virtual void GetIndexableSubshapes( std::vector<const SHAPE*>& aSubshapes ) const override
     {
-        aSubshapes = m_shapes;
+        aSubshapes.clear();
+        aSubshapes.reserve( m_shapes.size() );
+        std::copy( m_shapes.begin(), m_shapes.end(), std::back_inserter( aSubshapes ) );
     }
 
-    bool ConvertToSimplePolygon( SHAPE_SIMPLE* aOut ) const;
+    void TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aError,
+                             ERROR_LOC aErrorLoc ) const override;
 
 private:
     BOX2I               m_cachedBBox;

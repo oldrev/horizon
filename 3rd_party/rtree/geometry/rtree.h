@@ -16,12 +16,13 @@
 //    * 2013 CERN (www.cern.ch)
 //    * 2020 KiCad Developers - Add std::iterator support for searching
 //    * 2020 KiCad Developers - Add container nearest neighbor based on Hjaltason & Samet
+//    * 2022 KiCad Developers - Slight optimizations in RectSphericalVolume
 //
 
 /*
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
- * Copyright (C) 2020 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Copyright (C) 2013 CERN
  *
  * This program is free software; you can redistribute it and/or
@@ -49,10 +50,10 @@
 
 // NOTE These next few lines may be win32 specific, you may need to modify them to compile on other platform
 #include <cassert>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <climits>
 
 #include <algorithm>
 #include <array>
@@ -1515,8 +1516,7 @@ ELEMTYPEREAL RTREE_QUAL::RectSphericalVolume( const Rect* a_rect ) const
 {
     ASSERT( a_rect );
 
-    ELEMTYPEREAL    sumOfSquares = (ELEMTYPEREAL) 0;
-    ELEMTYPEREAL    radius;
+    ELEMTYPEREAL sumOfSquares = (ELEMTYPEREAL) 0;
 
     for( int index = 0; index < NUMDIMS; ++index )
     {
@@ -1525,19 +1525,21 @@ ELEMTYPEREAL RTREE_QUAL::RectSphericalVolume( const Rect* a_rect ) const
         sumOfSquares += halfExtent * halfExtent;
     }
 
-    radius = (ELEMTYPEREAL) std::sqrt( sumOfSquares );
-
     // Pow maybe slow, so test for common dims like 2,3 and just use x*x, x*x*x.
-    if( NUMDIMS == 3 )
+    if( NUMDIMS == 2 )
     {
-        return radius * radius * radius * m_unitSphereVolume;
+        return sumOfSquares * m_unitSphereVolume;
     }
-    else if( NUMDIMS == 2 )
+    else if( NUMDIMS == 3 )
     {
-        return radius * radius * m_unitSphereVolume;
+        ELEMTYPEREAL radius = (ELEMTYPEREAL) std::sqrt( sumOfSquares );
+
+        return radius * radius * radius * m_unitSphereVolume;
     }
     else
     {
+        ELEMTYPEREAL radius = (ELEMTYPEREAL) std::sqrt( sumOfSquares );
+
         return (ELEMTYPEREAL) (std::pow( radius, NUMDIMS ) * m_unitSphereVolume);
     }
 }
@@ -1959,7 +1961,7 @@ bool RTREE_QUAL::Search( const Node* a_node, const Rect* a_rect, int& a_foundCou
         {
             if( Overlap( a_rect, &a_node->m_branch[index].m_rect ) )
             {
-                DATATYPE& id = a_node->m_branch[index].m_data;
+                const DATATYPE& id = a_node->m_branch[index].m_data;
                 ++a_foundCount;
 
                 if( a_callback && !a_callback( id ) )

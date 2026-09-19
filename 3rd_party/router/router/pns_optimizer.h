@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -116,7 +116,7 @@ public:
     static bool Optimize( LINE* aLine, int aEffortLevel, NODE* aWorld,
                           const VECTOR2I& aV = VECTOR2I(0, 0) );
 
-    bool Optimize( LINE* aLine, LINE* aResult = nullptr, LINE* aRoot = nullptr );
+    bool Optimize( const LINE* aLine, LINE* aResult = nullptr, LINE* aRoot = nullptr );
     bool Optimize( DIFF_PAIR* aPair );
 
 
@@ -151,10 +151,8 @@ public:
     {
         m_restrictArea = aArea;
         m_restrictAreaIsStrict = aStrict;
+        m_effortLevel |= OPTIMIZER::RESTRICT_AREA;
     }
-
-    void ClearConstraints();
-    void AddConstraint ( OPT_CONSTRAINT *aConstraint );
 
 private:
     static const int MaxCachedItems = 256;
@@ -169,6 +167,8 @@ private:
         bool m_isStatic;
     };
 
+
+    void addConstraint ( OPT_CONSTRAINT *aConstraint );
     bool mergeObtuse( LINE* aLine );
     bool mergeFull( LINE* aLine );
     bool mergeColinear( LINE* aLine );
@@ -195,7 +195,7 @@ private:
 
     int smartPadsSingle( LINE* aLine, ITEM* aPad, bool aEnd, int aEndVertex );
 
-    ITEM* findPadOrVia( int aLayer, int aNet, const VECTOR2I& aP ) const;
+    ITEM* findPadOrVia( int aLayer, NET_HANDLE aNet, const VECTOR2I& aP ) const;
 
 private:
     SHAPE_INDEX_LIST<ITEM*>                m_cache;
@@ -265,8 +265,7 @@ class AREA_CONSTRAINT : public OPT_CONSTRAINT
 public:
     AREA_CONSTRAINT( NODE* aWorld, const  BOX2I& aAllowedArea, bool aAllowedAreaStrict ) :
         OPT_CONSTRAINT( aWorld ),
-        m_allowedArea ( aAllowedArea ),
-        m_allowedAreaStrict ( aAllowedAreaStrict )
+        m_allowedArea ( aAllowedArea )
     {
     };
 
@@ -276,7 +275,6 @@ public:
 
 private:
     BOX2I m_allowedArea;
-    bool m_allowedAreaStrict;
 };
 
 
@@ -315,18 +313,13 @@ class RESTRICT_VERTEX_RANGE_CONSTRAINT: public OPT_CONSTRAINT
 {
 public:
     RESTRICT_VERTEX_RANGE_CONSTRAINT( NODE* aWorld, int aStart, int aEnd ) :
-        OPT_CONSTRAINT( aWorld ),
-        m_start( aStart ),
-        m_end( aEnd )
+        OPT_CONSTRAINT( aWorld )
     {
     };
 
     virtual bool Check( int aVertex1, int aVertex2, const LINE* aOriginLine,
                         const SHAPE_LINE_CHAIN& aCurrentPath,
                         const SHAPE_LINE_CHAIN& aReplacement ) override;
-private:
-    int m_start;
-    int m_end;
 };
 
 
@@ -337,7 +330,6 @@ public:
                                    int aAngleMask ) :
         OPT_CONSTRAINT( aWorld ),
         m_minCorners( aMinCorners ),
-        m_maxCorners( aMaxCorners ),
         m_angleMask( aAngleMask )
     {
     };
@@ -348,7 +340,6 @@ public:
 
 private:
     int m_minCorners;
-    int m_maxCorners;
     int m_angleMask;
 };
 

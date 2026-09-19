@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -84,6 +84,8 @@ public:
 
     const LINE Trace() const;
 
+    const DIFF_PAIR& GetOriginPair();
+
     /**
      * Return the most recent world state.
      */
@@ -91,16 +93,26 @@ public:
 
     const ITEM_SET Traces() override;
 
+    const ITEM_SET TunedPath() override;
+
+    /// @copydoc PLACEMENT_ALGO::CurrentStart()
+    const VECTOR2I& CurrentStart() const override;
+
+    /// @copydoc PLACEMENT_ALGO::CurrentEnd()
     const VECTOR2I& CurrentEnd() const override;
 
     /// @copydoc PLACEMENT_ALGO::CurrentNets()
-    const std::vector<int> CurrentNets() const override;
+    const std::vector<NET_HANDLE> CurrentNets() const override;
 
     int CurrentLayer() const override;
 
     long long int totalLength();
 
-    const wxString TuningInfo( EDA_UNITS aUnits ) const override;
+    long long int TuningLengthResult() const override;
+
+    /// @copydoc MEANDER_PLACER_BASE::TuningDelayResult()
+    int64_t TuningDelayResult() const override;
+
     TUNING_STATUS TuningStatus() const override;
 
     bool CheckFit( MEANDER_SHAPE* aShape ) override;
@@ -122,6 +134,10 @@ private:
 
     long long int origPathLength() const;
 
+    int64_t origPathDelay() const;
+
+    void calculateTimeDomainTargets();
+
     ///< Current routing start point (end of tail, beginning of head).
     VECTOR2I m_currentStart;
 
@@ -139,9 +155,14 @@ private:
     LINKED_ITEM* m_initialSegment;
 
     long long int m_lastLength;
-    int           m_padToDieP;
-    int           m_padToDieN;
+    int64_t       m_lastDelay;
+    int           m_padToDieLengthP;
+    int           m_padToDieLengthN;
+    int64_t       m_padToDieDelayP;
+    int64_t       m_padToDieDelayN;
     TUNING_STATUS m_lastStatus;
+
+    NETCLASS* m_netClass;
 };
 
 }

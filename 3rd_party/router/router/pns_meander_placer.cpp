@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2015 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -19,8 +19,6 @@
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "base_units.h" // God forgive me doing this...
-
 #include "pns_debug_decorator.h"
 #include "pns_itemset.h"
 #include "pns_meander_placer.h"
@@ -28,6 +26,7 @@
 #include "pns_router.h"
 #include "pns_solid.h"
 #include "pns_topology.h"
+
 
 namespace PNS {
 
@@ -39,7 +38,11 @@ MEANDER_PLACER::MEANDER_PLACER( ROUTER* aRouter ) :
     // Init temporary variables (do not leave uninitialized members)
     m_initialSegment = nullptr;
     m_lastLength = 0;
+    m_lastDelay = 0;
     m_lastStatus = TOO_SHORT;
+    m_padToDieLength = 0;
+    m_padToDieDelay = 0;
+    m_netClass = nullptr;
 }
 
 
@@ -72,24 +75,32 @@ bool MEANDER_PLACER::Start( const VECTOR2I& aP, ITEM* aStartItem )
     m_world = Router()->GetWorld()->Branch();
     m_originLine = m_world->AssembleLine( m_initialSegment );
 
-    SOLID* padA = nullptr;
-    SOLID* padB = nullptr;
-
     TOPOLOGY topo( m_world );
-    m_tunedPath = topo.AssembleTuningPath( m_initialSegment, &padA, &padB );
+    m_tunedPath = topo.AssembleTuningPath( Router()->GetInterface(), m_initialSegment, &m_startPad_n, &m_endPad_n );
 
     m_padToDieLength = 0;
+    m_padToDieDelay = 0;
 
-    if( padA )
-        m_padToDieLength += padA->GetPadToDie();
+    if( m_startPad_n )
+    {
+        m_padToDieLength += m_startPad_n->GetPadToDie();
+        m_padToDieDelay += m_startPad_n->GetPadToDieDelay();
+    }
 
-    if( padB )
-        m_padToDieLength += padB->GetPadToDie();
+    if( m_endPad_n )
+    {
+        m_padToDieLength += m_endPad_n->GetPadToDie();
+        m_padToDieDelay += m_endPad_n->GetPadToDieDelay();
+    }
 
     m_world->Remove( m_originLine );
 
     m_currentWidth = m_originLine.Width();
     m_currentEnd = VECTOR2I( 0, 0 );
+
+    m_netClass = nullptr;
+
+    calculateTimeDomainTargets();
 
     return true;
 }
@@ -97,26 +108,72 @@ bool MEANDER_PLACER::Start( const VECTOR2I& aP, ITEM* aStartItem )
 
 long long int MEANDER_PLACER::origPathLength() const
 {
-    return m_padToDieLength + lineLength( m_tunedPath );
+    return m_padToDieLength + lineLength( m_tunedPath, m_startPad_n, m_endPad_n );
+}
+
+
+int64_t MEANDER_PLACER::origPathDelay() const
+{
+    return m_padToDieDelay + lineDelay( m_tunedPath, m_startPad_n, m_endPad_n );
+}
+
+
+void MEANDER_PLACER::calculateTimeDomainTargets()
+{
+    // If this is a time domain tuning, calculate the target length for the desired total delay
+    if( m_settings.m_isTimeDomain )
+    {
+        const int64_t curDelay = origPathDelay();
+
+        const int64_t desiredDelayMin = m_settings.m_targetLengthDelay.Min();
+        const int64_t desiredDelayOpt = m_settings.m_targetLengthDelay.Opt();
+        const int64_t desiredDelayMax = m_settings.m_targetLengthDelay.Max();
+
+        const int64_t delayDifferenceOpt = desiredDelayOpt - curDelay;
+
+        const int64_t curLength = origPathLength();
+        const int64_t lengthDiffMin = m_router->GetInterface()->CalculateLengthForDelay(
+                desiredDelayOpt - desiredDelayMin, m_currentWidth, false, m_router->Sizes().DiffPairGap(),
+                m_router->GetCurrentLayer(), m_netClass );
+        int64_t lengthDiffOpt = m_router->GetInterface()->CalculateLengthForDelay(
+                std::abs( delayDifferenceOpt ), m_currentWidth, false, m_router->Sizes().DiffPairGap(),
+                m_router->GetCurrentLayer(), m_netClass );
+        const int64_t lengthDiffMax = m_router->GetInterface()->CalculateLengthForDelay(
+                desiredDelayMax - desiredDelayOpt, m_currentWidth, false, m_router->Sizes().DiffPairGap(),
+                m_router->GetCurrentLayer(), m_netClass );
+
+        lengthDiffOpt = delayDifferenceOpt > 0 ? lengthDiffOpt : -lengthDiffOpt;
+
+        m_settings.m_targetLength.SetMin( curLength + lengthDiffOpt - lengthDiffMin );
+        m_settings.m_targetLength.SetOpt( curLength + lengthDiffOpt );
+        m_settings.m_targetLength.SetMax( curLength + lengthDiffOpt + lengthDiffMax );
+    }
 }
 
 
 bool MEANDER_PLACER::Move( const VECTOR2I& aP, ITEM* aEndItem )
 {
-    return doMove( aP, aEndItem, m_settings.m_targetLength );
+    calculateTimeDomainTargets();
+
+    return doMove( aP, aEndItem, m_settings.m_targetLength.Opt(), m_settings.m_targetLength.Min(),
+                   m_settings.m_targetLength.Max() );
 }
 
 
-bool MEANDER_PLACER::doMove( const VECTOR2I& aP, ITEM* aEndItem, long long int aTargetLength )
+bool MEANDER_PLACER::doMove( const VECTOR2I& aP, ITEM* aEndItem, long long int aTargetLength,
+                             long long int aTargetMin, long long int aTargetMax )
 {
-    SHAPE_LINE_CHAIN pre, tuned, post;
+    if( m_currentStart == aP )
+        return false;
 
     if( m_currentNode )
         delete m_currentNode;
 
     m_currentNode = m_world->Branch();
 
-    cutTunedLine( m_originLine.CLine(), m_currentStart, aP, pre, tuned, post );
+    SHAPE_LINE_CHAIN pre, tuned, post;
+
+    m_originLine.CLine().Split( m_currentStart, aP, pre, tuned, post );
 
     m_result = MEANDERED_LINE( this, false );
     m_result.SetWidth( m_originLine.Width() );
@@ -137,22 +194,42 @@ bool MEANDER_PLACER::doMove( const VECTOR2I& aP, ITEM* aEndItem, long long int a
             continue;
         }
 
+        bool      side = false;
         const SEG s = tuned.CSegment( i );
+
+        if( m_settings.m_initialSide == 0 )
+            side = s.Side( aP ) < 0;
+        else
+            side = m_settings.m_initialSide < 0;
+
         m_result.AddCorner( s.A );
-        m_result.MeanderSegment( s, s.Side( aP ) < 0 );
+        m_result.MeanderSegment( s, side );
         m_result.AddCorner( s.B );
     }
 
     long long int lineLen = origPathLength();
+    int64_t       lineDelay = origPathDelay();
 
     m_lastLength = lineLen;
+    m_lastDelay = lineDelay;
     m_lastStatus = TUNED;
 
-    if( compareWithTolerance( lineLen, aTargetLength, m_settings.m_lengthTolerance ) > 0 )
+    if( lineLen > m_settings.m_targetLength.Max() )
     {
         m_lastStatus = TOO_LONG;
-    } else {
+    }
+    else
+    {
         m_lastLength = lineLen - tuned.Length();
+
+        if( m_settings.m_isTimeDomain )
+        {
+            m_lastDelay = lineDelay
+                          - m_router->GetInterface()->CalculateDelayForShapeLineChain(
+                                  tuned, m_currentWidth, false, m_router->Sizes().DiffPairGap(),
+                                  m_router->GetCurrentLayer(), m_netClass );
+        }
+
         tuneLineLength( m_result, aTargetLength - lineLen );
     }
 
@@ -160,7 +237,9 @@ bool MEANDER_PLACER::doMove( const VECTOR2I& aP, ITEM* aEndItem, long long int a
     {
         if( const LINE* l = dyn_cast<const LINE*>( item ) )
         {
-            PNS_DBG( Dbg(), AddLine, l->CLine(), BLUE, 30000, "tuned-line" );
+            PNS_DBG( Dbg(), AddItem, l, BLUE, 30000, wxT( "tuned-line" ) );
+
+            m_router->GetInterface()->DisplayPathLine( l->CLine(), 1 );
         }
     }
 
@@ -178,22 +257,40 @@ bool MEANDER_PLACER::doMove( const VECTOR2I& aP, ITEM* aEndItem, long long int a
 
         m_lastLength += tuned.Length();
 
-        int comp = compareWithTolerance( m_lastLength - aTargetLength, 0,
-                                         m_settings.m_lengthTolerance );
+        if( m_settings.m_isTimeDomain )
+        {
+            m_lastDelay += m_router->GetInterface()->CalculateDelayForShapeLineChain(
+                    tuned, m_currentWidth, false, m_router->Sizes().DiffPairGap(), m_router->GetCurrentLayer(),
+                    m_netClass );
+        }
 
-        if( comp > 0 )
+        if( m_lastLength > aTargetMax )
             m_lastStatus = TOO_LONG;
-        else if( comp < 0 )
+        else if( m_lastLength < aTargetMin )
             m_lastStatus = TOO_SHORT;
         else
             m_lastStatus = TUNED;
     }
 
     m_finalShape.Clear();
-    m_finalShape.Append( pre );
-    m_finalShape.Append( tuned );
-    m_finalShape.Append( post );
-    m_finalShape.Simplify();
+
+    if( m_settings.m_keepEndpoints )
+    {
+        pre.Simplify();
+        tuned.Simplify();
+        post.Simplify();
+
+        m_finalShape.Append( pre );
+        m_finalShape.Append( tuned );
+        m_finalShape.Append( post );
+    }
+    else
+    {
+        m_finalShape.Append( pre );
+        m_finalShape.Append( tuned );
+        m_finalShape.Append( post );
+        m_finalShape.Simplify();
+    }
 
     return true;
 }
@@ -255,6 +352,15 @@ const ITEM_SET MEANDER_PLACER::Traces()
     return ITEM_SET( &m_currentTrace );
 }
 
+const ITEM_SET MEANDER_PLACER::TunedPath()
+{
+    return m_tunedPath;
+}
+
+const VECTOR2I& MEANDER_PLACER::CurrentStart() const
+{
+    return m_currentStart;
+}
 
 const VECTOR2I& MEANDER_PLACER::CurrentEnd() const
 {
@@ -267,30 +373,21 @@ int MEANDER_PLACER::CurrentLayer() const
 }
 
 
-const wxString MEANDER_PLACER::TuningInfo( EDA_UNITS aUnits ) const
+long long int MEANDER_PLACER::TuningLengthResult() const
 {
-    wxString status;
+    if( m_lastLength )
+        return m_lastLength;
+    else
+        return origPathLength();
+}
 
-    switch ( m_lastStatus )
-    {
-    case TOO_LONG:
-        status = _( "Too long: " );
-        break;
-    case TOO_SHORT:
-        status = _( "Too short: " );
-        break;
-    case TUNED:
-        status = _( "Tuned: " );
-        break;
-    default:
-        return _( "?" );
-    }
 
-    status += ::MessageTextFromValue( aUnits, m_lastLength );
-    status += "/";
-    status += ::MessageTextFromValue( aUnits, m_settings.m_targetLength );
-
-    return status;
+int64_t MEANDER_PLACER::TuningDelayResult() const
+{
+    if( m_lastDelay )
+        return m_lastDelay;
+    else
+        return origPathDelay();
 }
 
 

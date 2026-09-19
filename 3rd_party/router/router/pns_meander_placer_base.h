@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2015 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -31,7 +31,6 @@
 #include "pns_line.h"
 #include "pns_placement_algo.h"
 #include "pns_meander.h"
-#include "eda_units.h"
 
 namespace PNS {
 
@@ -57,9 +56,14 @@ public:
     virtual ~MEANDER_PLACER_BASE();
 
     /**
-     * Return a string describing the status and length of the tuned traces.
+     * Return the resultant length or skew of the tuned traces.
      */
-    virtual const wxString TuningInfo( EDA_UNITS aUnits ) const = 0;
+    virtual long long int TuningLengthResult() const = 0;
+
+    /**
+     * Return the resultant delay or skew of the tuned traces.
+     */
+    virtual int64_t TuningDelayResult() const { return 0; };
 
     /**
      * Return the tuning status (too short, too long, etc.) of the trace(s) being tuned.
@@ -113,35 +117,14 @@ public:
         return false;
     }
 
-    int GetTotalPadToDieLength( const LINE& aLine ) const;
+    virtual const ITEM_SET TunedPath() = 0;
 
 protected:
-    /**
-     * Extract the part of a track to be meandered, depending on the starting point and the
-     * cursor position.
-     *
-     * @param aOrigin the original line.
-     * @param aTuneStart point where we start meandering (start click coordinates).
-     * @param aCursorPos current cursor position.
-     * @param aPre part before the beginning of meanders.
-     * @param aTuned part to be meandered.
-     * @param aPost part after the end of meanders.
-     */
-    void cutTunedLine( const SHAPE_LINE_CHAIN& aOrigin, const VECTOR2I& aTuneStart,
-                       const VECTOR2I& aCursorPos, SHAPE_LINE_CHAIN& aPre, SHAPE_LINE_CHAIN& aTuned,
-                       SHAPE_LINE_CHAIN& aPost );
-
     /**
      * Take a set of meanders in \a aTuned and tunes their length to extend the original line
      * length by \a aElongation.
      */
     void tuneLineLength( MEANDERED_LINE& aTuned, long long int aElongation );
-
-    /**
-     * Compare \a aValue against \a aExpected with given tolerance.
-     */
-    int compareWithTolerance( long long int aValue, long long int aExpected,
-                              long long int aTolerance = 0 ) const;
 
     VECTOR2I getSnappedStartPoint( LINKED_ITEM* aStartItem, VECTOR2I aStartPoint );
 
@@ -150,13 +133,17 @@ protected:
      * @param aLine
      * @return
      */
-    long long int lineLength( const ITEM_SET& aLine ) const;
+    long long int lineLength( const ITEM_SET& aLine, const SOLID* aStartPad, const SOLID* aEndPad ) const;
+
+    /**
+     * Calculate the total delay of the line represented by an item set (tracks and vias)
+     * @param aLine
+     * @return
+     */
+    int64_t lineDelay( const ITEM_SET& aLine, const SOLID* aStartPad, const SOLID* aEndPad ) const;
 
     ///< Pointer to world to search colliding items.
     NODE* m_world;
-
-    ///< Total length added by pad to die size.
-    int m_padToDieLength;
 
     ///< Width of the meandered trace(s).
     int m_currentWidth;
@@ -166,6 +153,11 @@ protected:
 
     ///< The current end point.
     VECTOR2I m_currentEnd;
+
+    SOLID*   m_startPad_p;
+    SOLID*   m_endPad_p;
+    SOLID*   m_startPad_n;
+    SOLID*   m_endPad_n;
 };
 
 }

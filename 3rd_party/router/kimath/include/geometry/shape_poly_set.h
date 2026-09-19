@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2015-2019 CERN
- * Copyright (C) 2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  * @author Alejandro García Montoro <alejandro.garciamontoro@gmail.com>
@@ -28,23 +28,26 @@
 #ifndef __SHAPE_POLY_SET_H
 #define __SHAPE_POLY_SET_H
 
+#include <atomic>
 #include <cstdio>
 #include <deque>                        // for deque
-#include <vector>                       // for vector
 #include <iosfwd>                       // for string, stringstream
 #include <memory>
+#include <mutex>
 #include <set>                          // for set
 #include <stdexcept>                    // for out_of_range
 #include <stdlib.h>                     // for abs
 #include <vector>
 
-#include "router/clipper_kicad/clipper.hpp"                  // for ClipType, PolyTree (ptr only)
+#include <clipper2/clipper.h>
+#include <core/mirror.h>                // for FLIP_DIRECTION
+#include <geometry/corner_strategy.h>
 #include <geometry/seg.h>               // for SEG
 #include <geometry/shape.h>
 #include <geometry/shape_line_chain.h>
 #include <math/box2.h>                  // for BOX2I
 #include <math/vector2d.h>              // for VECTOR2I
-#include <md5_hash.h>
+#include <hash_128.h>
 
 
 /**
@@ -64,9 +67,9 @@
 class SHAPE_POLY_SET : public SHAPE
 {
 public:
-    ///< represents a single polygon outline with holes. The first entry is the outline,
-    ///< the remaining (if any), are the holes
-    ///< N.B. SWIG only supports typedef, so avoid c++ 'using' keyword
+    /// represents a single polygon outline with holes. The first entry is the outline,
+    /// the remaining (if any), are the holes
+    /// N.B. SWIG only supports typedef, so avoid c++ 'using' keyword
     typedef std::vector<SHAPE_LINE_CHAIN> POLYGON;
 
     class TRIANGULATED_POLYGON
@@ -83,7 +86,8 @@ public:
             {
             }
 
-            virtual void Rotate( double aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override {};
+            virtual void Rotate( const EDA_ANGLE& aAngle,
+                                 const VECTOR2I& aCenter = { 0, 0 } ) override {};
 
             virtual void Move( const VECTOR2I& aVector ) override {};
 
@@ -100,9 +104,8 @@ public:
                     case 0: return parent->m_vertices[a];
                     case 1: return parent->m_vertices[b];
                     case 2: return parent->m_vertices[c];
-                    default: assert(false);
+                    default: wxCHECK( false, VECTOR2I() );
                 }
-                return VECTOR2I(0, 0);
             }
 
             virtual const SEG GetSegment( int aIndex ) const override
@@ -112,20 +115,32 @@ public:
                     case 0: return SEG( parent->m_vertices[a], parent->m_vertices[b] );
                     case 1: return SEG( parent->m_vertices[b], parent->m_vertices[c] );
                     case 2: return SEG( parent->m_vertices[c], parent->m_vertices[a] );
-                    default: assert(false);
+                    default: wxCHECK( false, SEG() );
                 }
-                return SEG();
             }
 
             virtual size_t GetPointCount() const override { return 3; }
             virtual size_t GetSegmentCount() const override { return 3; }
 
+            double Area() const
+            {
+                VECTOR2I& aa = parent->m_vertices[a];
+                VECTOR2I& bb = parent->m_vertices[b];
+                VECTOR2I& cc = parent->m_vertices[c];
 
-            int a, b, c;
+                VECTOR2D ba = bb - aa;
+                VECTOR2D cb = cc - bb;
+
+                return std::abs( cb.Cross( ba ) * 0.5 );
+            }
+
+            int                   a;
+            int                   b;
+            int                   c;
             TRIANGULATED_POLYGON* parent;
         };
 
-        TRIANGULATED_POLYGON();
+        TRIANGULATED_POLYGON( int aSourceOutline );
         TRIANGULATED_POLYGON( const TRIANGULATED_POLYGON& aOther );
         ~TRIANGULATED_POLYGON();
 
@@ -137,13 +152,29 @@ public:
 
         void GetTriangle( int index, VECTOR2I& a, VECTOR2I& b, VECTOR2I& c ) const
         {
-            auto tri = m_triangles[ index ];
+            auto& tri = m_triangles[ index ];
             a = m_vertices[ tri.a ];
             b = m_vertices[ tri.b ];
             c = m_vertices[ tri.c ];
         }
 
         TRIANGULATED_POLYGON& operator=( const TRIANGULATED_POLYGON& aOther );
+
+        // Move assignment operator.
+        TRIANGULATED_POLYGON& operator=( TRIANGULATED_POLYGON&& aOther ) noexcept
+        {
+            if( this != &aOther )
+            {
+                m_sourceOutline = aOther.m_sourceOutline;
+                m_triangles = std::move( aOther.m_triangles );
+                m_vertices = std::move( aOther.m_vertices );
+
+                for( TRI& tri : m_triangles )
+                    tri.parent = this;
+            }
+
+            return *this;
+        }
 
         void AddTriangle( int a, int b, int c );
 
@@ -152,14 +183,27 @@ public:
             m_vertices.push_back( aP );
         }
 
-        size_t GetTriangleCount() const
+        size_t GetTriangleCount() const { return m_triangles.size(); }
+
+        int GetSourceOutlineIndex() const { return m_sourceOutline; }
+        void SetSourceOutlineIndex( int aIndex ) { m_sourceOutline = aIndex; }
+
+        const std::deque<TRI>& Triangles() const { return m_triangles; }
+        void SetTriangles( const std::deque<TRI>& aTriangles )
         {
-            return m_triangles.size();
+            m_triangles.resize( aTriangles.size() );
+
+            for( size_t ii = 0; ii < aTriangles.size(); ii++ )
+            {
+                m_triangles[ii] = aTriangles[ii];
+                m_triangles[ii].parent = this;
+            }
         }
 
-        std::deque<TRI>& Triangles()
+        const std::deque<VECTOR2I>& Vertices() const { return m_vertices; }
+        void SetVertices( const std::deque<VECTOR2I>& aVertices )
         {
-            return m_triangles;
+            m_vertices = aVertices;
         }
 
         size_t GetVertexCount() const
@@ -169,11 +213,12 @@ public:
 
         void Move( const VECTOR2I& aVec )
         {
-            for( auto& vertex : m_vertices )
+            for( VECTOR2I& vertex : m_vertices )
                 vertex += aVec;
         }
 
     private:
+        int                  m_sourceOutline;
         std::deque<TRI>      m_triangles;
         std::deque<VECTOR2I> m_vertices;
     };
@@ -211,8 +256,7 @@ public:
          */
         bool IsEndContour() const
         {
-            return m_currentVertex + 1 ==
-                    m_poly->CPolygon( m_currentPolygon )[m_currentContour].PointCount();
+            return m_currentVertex + 1 == m_poly->CPolygon( m_currentPolygon )[m_currentContour].PointCount();
         }
 
         /**
@@ -251,8 +295,7 @@ public:
             if( m_iterateHoles )
             {
                 // If the last vertex of the contour was reached, advance the contour index
-                if( m_currentVertex >=
-                    m_poly->CPolygon( m_currentPolygon )[m_currentContour].PointCount() )
+                if( m_currentVertex >= m_poly->CPolygon( m_currentPolygon )[m_currentContour].PointCount() )
                 {
                     m_currentVertex = 0;
                     m_currentContour++;
@@ -488,6 +531,13 @@ public:
     SHAPE_POLY_SET( const SHAPE_LINE_CHAIN& aOutline );
 
     /**
+     * Construct a SHAPE_POLY_SET with the first polygon given by aPolygon.
+     *
+     * @param aPolygon is a polygon
+     */
+    SHAPE_POLY_SET( const POLYGON& aPolygon );
+
+    /**
      * Copy constructor SHAPE_POLY_SET
      * Performs a deep copy of \p aOther into \p this.
      *
@@ -499,16 +549,48 @@ public:
 
     SHAPE_POLY_SET& operator=( const SHAPE_POLY_SET& aOther );
 
-    void CacheTriangulation( bool aPartition = true );
+    // Move assignment operator
+    SHAPE_POLY_SET& operator=( SHAPE_POLY_SET&& aOther ) noexcept
+    {
+        if (this != &aOther)
+        {
+            SHAPE::operator=( aOther );
+
+            m_polys = std::move( aOther.m_polys );
+            m_triangulatedPolys = std::move( aOther.m_triangulatedPolys );
+
+            m_hash = aOther.m_hash;
+            m_hashValid = aOther.m_hashValid;
+            m_triangulationValid.store( aOther.m_triangulationValid );
+        }
+
+        return *this;
+    }
+
+    /**
+     * Build a polygon triangulation, needed to draw a polygon on OpenGL and in some
+     * other calculations
+     * @param aPartition = true to created a trinagulation in a partition on a grid
+     * false to create a more basic triangulation of the polygons
+     * Note
+     * in partition calculations the grid size is hard coded to 1e7.
+     * This is a good value for Pcbnew: 1cm, in internal units.
+     * But not good for Gerbview (1e7 = 10cm), however using a partition is not useful.
+     * @param aSimplify = force the algorithm to simplify the POLY_SET before triangulating
+     */
+    virtual void CacheTriangulation( bool aPartition = true, bool aSimplify = false )
+    {
+        cacheTriangulation( aPartition, aSimplify, nullptr );
+    }
     bool IsTriangulationUpToDate() const;
 
-    MD5_HASH GetHash() const;
+    HASH_128 GetHash() const;
 
     virtual bool HasIndexableSubshapes() const override;
 
     virtual size_t GetIndexableSubshapeCount() const override;
 
-    virtual void GetIndexableSubshapes( std::vector<SHAPE*>& aSubshapes ) override;
+    virtual void GetIndexableSubshapes( std::vector<const SHAPE*>& aSubshapes ) const override;
 
     /**
      * Convert a global vertex index ---i.e., a number that globally identifies a vertex in a
@@ -537,31 +619,36 @@ public:
     /// @copydoc SHAPE::Clone()
     SHAPE* Clone() const override;
 
-    ///< Creates a new empty polygon in the set and returns its index
+    SHAPE_POLY_SET CloneDropTriangulation() const;
+
+    /// Creates a new empty polygon in the set and returns its index
     int NewOutline();
 
-    ///< Creates a new hole in a given outline
+    /// Creates a new hole in a given outline
     int NewHole( int aOutline = -1 );
 
-    ///< Adds a new outline to the set and returns its index
+    /// Adds a new outline to the set and returns its index
     int AddOutline( const SHAPE_LINE_CHAIN& aOutline );
 
-    ///< Adds a new hole to the given outline (default: last) and returns its index
+    /// Adds a new hole to the given outline (default: last) and returns its index
     int AddHole( const SHAPE_LINE_CHAIN& aHole, int aOutline = -1 );
 
-    ///< Return the area of this poly set
+    /// Adds a polygon to the set
+    int AddPolygon( const POLYGON& apolygon );
+
+    /// Return the area of this poly set
     double Area();
 
-    ///< Count the number of arc shapes present
+    /// Count the number of arc shapes present
     int ArcCount() const;
 
-    ///< Appends all the arcs in this polyset to \a aArcBuffer
+    /// Appends all the arcs in this polyset to \a aArcBuffer
     void GetArcs( std::vector<SHAPE_ARC>& aArcBuffer ) const;
 
-    ///< Removes all arc references from all the outlines and holes in the polyset
+    /// Removes all arc references from all the outlines and holes in the polyset
     void ClearArcs();
 
-    ///< Appends a vertex at the end of the given outline/hole (default: the last outline)
+    /// Appends a vertex at the end of the given outline/hole (default: the last outline)
     /**
      * Add a new vertex to the contour indexed by \p aOutline and \p aHole (defaults to the
      * outline of the last polygon).
@@ -576,10 +663,10 @@ public:
      */
     int Append( int x, int y, int aOutline = -1, int aHole = -1, bool aAllowDuplication = false );
 
-    ///< Merge polygons from two sets.
+    /// Merge polygons from two sets.
     void Append( const SHAPE_POLY_SET& aSet );
 
-    ///< Append a vertex at the end of the given outline/hole (default: the last outline)
+    /// Append a vertex at the end of the given outline/hole (default: the last outline)
     void Append( const VECTOR2I& aP, int aOutline = -1, int aHole = -1 );
 
     /**
@@ -588,9 +675,11 @@ public:
      * @param aArc      The arc to be inserted
      * @param aOutline  Index of the polygon
      * @param aHole     Index of the hole (-1 for the main outline)
+     * @param aMaxError optional; accuracy of the arc representation in IU
      * @return the number of points in the arc (including the interpolated points from the arc)
      */
-    int Append( SHAPE_ARC& aArc, int aOutline = -1, int aHole = -1 );
+    int Append( const SHAPE_ARC& aArc, int aOutline = -1, int aHole = -1,
+                std::optional<int> aMaxError = {} );
 
     /**
      * Adds a vertex in the globally indexed position \a aGlobalIndex.
@@ -601,13 +690,13 @@ public:
      */
     void InsertVertex( int aGlobalIndex, const VECTOR2I& aNewVertex );
 
-    ///< Return the index-th vertex in a given hole outline within a given outline
+    /// Return the index-th vertex in a given hole outline within a given outline
     const VECTOR2I& CVertex( int aIndex, int aOutline, int aHole ) const;
 
-    ///< Return the aGlobalIndex-th vertex in the poly set
+    /// Return the aGlobalIndex-th vertex in the poly set
     const VECTOR2I& CVertex( int aGlobalIndex ) const;
 
-    ///< Return the index-th vertex in a given hole outline within a given outline
+    /// Return the index-th vertex in a given hole outline within a given outline
     const VECTOR2I& CVertex( VERTEX_INDEX aIndex ) const;
 
     /**
@@ -623,7 +712,7 @@ public:
      * @param aNext is the globalIndex of the next corner of the same contour.
      * @return true if OK, false if aGlobalIndex is out of range
      */
-    bool GetNeighbourIndexes( int aGlobalIndex, int* aPrevious, int* aNext );
+    bool GetNeighbourIndexes( int aGlobalIndex, int* aPrevious, int* aNext ) const;
 
     /**
      * Check whether the aPolygonIndex-th polygon in the set is self intersecting.
@@ -640,24 +729,23 @@ public:
      */
     bool IsSelfIntersecting() const;
 
-    ///< Return the number of triangulated polygons
+    /// Return the number of triangulated polygons
     unsigned int TriangulatedPolyCount() const { return m_triangulatedPolys.size(); }
 
-    ///< Return the number of outlines in the set
+    /// Return the number of outlines in the set
     int OutlineCount() const { return m_polys.size(); }
 
-    ///< Return the number of vertices in a given outline/hole
+    /// Return the number of vertices in a given outline/hole
     int VertexCount( int aOutline = -1, int aHole = -1 ) const;
 
-    ///< Return the number of points in the shape poly set.
-    ///< mainly for reports
+    /// Return the number of points in the shape poly set.
+    /// mainly for reports
     int FullPointCount() const;
 
-    ///< Returns the number of holes in a given outline
+    /// Returns the number of holes in a given outline
     int HoleCount( int aOutline ) const
     {
-        if( ( aOutline < 0 ) || ( aOutline >= (int) m_polys.size() )
-          || ( m_polys[aOutline].size() < 2 ) )
+        if( aOutline < 0 || aOutline >= (int) m_polys.size() || m_polys[aOutline].size() < 2 )
             return 0;
 
         // the first polygon in m_polys[aOutline] is the main contour,
@@ -665,7 +753,7 @@ public:
         return m_polys[aOutline].size() - 1;
     }
 
-    ///< Return the reference to aIndex-th outline in the set
+    /// Return the reference to aIndex-th outline in the set
     SHAPE_LINE_CHAIN& Outline( int aIndex )
     {
         return m_polys[aIndex][0];
@@ -692,13 +780,13 @@ public:
         return Subset( aPolygonIndex, aPolygonIndex + 1 );
     }
 
-    ///< Return the reference to aHole-th hole in the aIndex-th outline
+    /// Return the reference to aHole-th hole in the aIndex-th outline
     SHAPE_LINE_CHAIN& Hole( int aOutline, int aHole )
     {
         return m_polys[aOutline][aHole + 1];
     }
 
-    ///< Return the aIndex-th subpolygon in the set
+    /// Return the aIndex-th subpolygon in the set
     POLYGON& Polygon( int aIndex )
     {
         return m_polys[aIndex];
@@ -728,6 +816,8 @@ public:
     {
         return m_polys[aIndex];
     }
+
+    const std::vector<POLYGON>& CPolygons() const { return m_polys; }
 
     /**
      * Return an object to iterate through the points of the polygons between \p aFirst and
@@ -845,8 +935,8 @@ public:
         return iter;
     }
 
-    ///< Return an iterator object, for iterating between aFirst and aLast outline, with or
-    ///< without holes (default: without)
+    /// Return an iterator object, for iterating between aFirst and aLast outline, with or
+    /// without holes (default: without)
     SEGMENT_ITERATOR IterateSegments( int aFirst, int aLast, bool aIterateHoles = false )
     {
         SEGMENT_ITERATOR iter;
@@ -861,8 +951,8 @@ public:
         return iter;
     }
 
-    ///< Return an iterator object, for iterating between aFirst and aLast outline, with or
-    ///< without holes (default: without)
+    /// Return an iterator object, for iterating between aFirst and aLast outline, with or
+    /// without holes (default: without)
     CONST_SEGMENT_ITERATOR CIterateSegments( int aFirst, int aLast,
                                              bool aIterateHoles = false ) const
     {
@@ -878,106 +968,84 @@ public:
         return iter;
     }
 
-    ///< Return an iterator object, for iterating aPolygonIdx-th polygon edges.
+    /// Return an iterator object, for iterating aPolygonIdx-th polygon edges.
     SEGMENT_ITERATOR IterateSegments( int aPolygonIdx )
     {
         return IterateSegments( aPolygonIdx, aPolygonIdx );
     }
 
-    ///< Return an iterator object, for iterating aPolygonIdx-th polygon edges.
+    /// Return an iterator object, for iterating aPolygonIdx-th polygon edges.
     CONST_SEGMENT_ITERATOR CIterateSegments( int aPolygonIdx ) const
     {
         return CIterateSegments( aPolygonIdx, aPolygonIdx );
     }
 
-    ///< Return an iterator object, for all outlines in the set (no holes).
+    /// Return an iterator object, for all outlines in the set (no holes).
     SEGMENT_ITERATOR IterateSegments()
     {
         return IterateSegments( 0, OutlineCount() - 1 );
     }
 
-    ///< Returns an iterator object, for all outlines in the set (no holes)
+    /// Returns an iterator object, for all outlines in the set (no holes)
     CONST_SEGMENT_ITERATOR CIterateSegments() const
     {
         return CIterateSegments( 0, OutlineCount() - 1 );
     }
 
-    ///< Returns an iterator object, for all outlines in the set (with holes)
+    /// Returns an iterator object, for all outlines in the set (with holes)
     SEGMENT_ITERATOR IterateSegmentsWithHoles()
     {
         return IterateSegments( 0, OutlineCount() - 1, true );
     }
 
-    ///< Return an iterator object, for the \a aOutline-th outline in the set (with holes).
+    /// Return an iterator object, for the \a aOutline-th outline in the set (with holes).
     SEGMENT_ITERATOR IterateSegmentsWithHoles( int aOutline )
     {
         return IterateSegments( aOutline, aOutline, true );
     }
 
-    ///< Return an iterator object, for the \a aOutline-th outline in the set (with holes).
+    /// Return an iterator object, for the \a aOutline-th outline in the set (with holes).
     CONST_SEGMENT_ITERATOR CIterateSegmentsWithHoles() const
     {
         return CIterateSegments( 0, OutlineCount() - 1, true );
     }
 
-    ///< Return an iterator object, for the \a aOutline-th outline in the set (with holes).
+    /// Return an iterator object, for the \a aOutline-th outline in the set (with holes).
     CONST_SEGMENT_ITERATOR CIterateSegmentsWithHoles( int aOutline ) const
     {
         return CIterateSegments( aOutline, aOutline, true );
     }
 
+
+    /// Perform boolean polyset union
+    void BooleanAdd( const SHAPE_POLY_SET& b );
+
+    /// Perform boolean polyset difference
+    void BooleanSubtract( const SHAPE_POLY_SET& b );
+
+    /// Perform boolean polyset intersection
+    void BooleanIntersection( const SHAPE_POLY_SET& b );
+
+    /// Perform boolean polyset exclusive or
+    void BooleanXor( const SHAPE_POLY_SET& b );
+
+    /// Perform boolean polyset union between a and b, store the result in it self
+    void BooleanAdd( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b );
+
+    /// Perform boolean polyset difference between a and b, store the result in it self
+    void BooleanSubtract( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b );
+
+    /// Perform boolean polyset intersection between a and b, store the result in it self
+    void BooleanIntersection( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b );
+
+    /// Perform boolean polyset exclusive or between a and b, store the result in it self
+    void BooleanXor( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b );
+
     /**
-     * Operations on polygons use a \a aFastMode param
-     * if aFastMode is #PM_FAST (true) the result can be a weak polygon
-     * if aFastMode is #PM_STRICTLY_SIMPLE (false) (default) the result is (theoretically) a
-     * strictly simple polygon, but calculations can be really significantly time consuming
-     * Most of time #PM_FAST is preferable.
-     * #PM_STRICTLY_SIMPLE can be used in critical cases (Gerber output for instance)
-     */
-    enum POLYGON_MODE
-    {
-        PM_FAST = true,
-        PM_STRICTLY_SIMPLE = false
-    };
-
-    ///< Perform boolean polyset union
-    ///< For \a aFastMode meaning, see function booleanOp
-    void BooleanAdd( const SHAPE_POLY_SET& b, POLYGON_MODE aFastMode );
-
-    ///< Perform boolean polyset difference
-    ///< For \a aFastMode meaning, see function booleanOp
-    void BooleanSubtract( const SHAPE_POLY_SET& b, POLYGON_MODE aFastMode );
-
-    ///< Perform boolean polyset intersection
-    ///< For \a aFastMode meaning, see function booleanOp
-    void BooleanIntersection( const SHAPE_POLY_SET& b, POLYGON_MODE aFastMode );
-
-    ///< Perform boolean polyset union between a and b, store the result in it self
-    ///< For \a aFastMode meaning, see function booleanOp
-    void BooleanAdd( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b,
-                     POLYGON_MODE aFastMode );
-
-    ///< Perform boolean polyset difference between a and b, store the result in it self
-    ///< For \a aFastMode meaning, see function booleanOp
-    void BooleanSubtract( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b,
-                          POLYGON_MODE aFastMode );
-
-    ///< Perform boolean polyset intersection between a and b, store the result in it self
-    ///< For \a aFastMode meaning, see function booleanOp
-    void BooleanIntersection( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b,
-                              POLYGON_MODE aFastMode );
-
-    enum CORNER_STRATEGY        ///< define how inflate transform build inflated polygon
-    {
-        ALLOW_ACUTE_CORNERS,    ///< just inflate the polygon. Acute angles create spikes
-        CHAMFER_ACUTE_CORNERS,  ///< Acute angles are chamfered
-        ROUND_ACUTE_CORNERS,    ///< Acute angles are rounded
-        CHAMFER_ALL_CORNERS,    ///< All angles are chamfered.
-                                ///< The distance between new and old polygon edges is not
-                                ///< constant, but do not change a lot
-        ROUND_ALL_CORNERS       ///< All angles are rounded.
-                                ///< The distance between new and old polygon edges is constant
-    };
+    * Extract all contours from this polygon set, then recreate polygons with holes.
+    * Essentially XOR'ing, but faster. Self-intersecting polygons are not supported.
+    */
+    void RebuildHolesFromContours();
 
     /**
      * Perform outline inflation/deflation.
@@ -987,49 +1055,75 @@ public:
      * the outline.
      *
      * @param aAmount is the number of units to offset edges.
-     * @param aCircleSegCount is the number of segments per 360 degrees to use in curve approx
      * @param aCornerStrategy #ALLOW_ACUTE_CORNERS to preserve all angles,
      *                        #CHAMFER_ACUTE_CORNERS to chop angles less than 90°,
      *                        #ROUND_ACUTE_CORNERS to round off angles less than 90°,
      *                        #ROUND_ALL_CORNERS to round regardless of angles
+     * @param aMaxError is the allowable deviation when rounding corners with an approximated
+     *                  polygon
      */
-    void Inflate( int aAmount, int aCircleSegCount,
-                  CORNER_STRATEGY aCornerStrategy = ROUND_ALL_CORNERS );
+    void Inflate( int aAmount, CORNER_STRATEGY aCornerStrategy, int aMaxError,
+                  bool aSimplify = false );
 
-    void Deflate( int aAmount, int aCircleSegmentsCount,
-                  CORNER_STRATEGY aCornerStrategy = ROUND_ALL_CORNERS )
+    void Deflate( int aAmount, CORNER_STRATEGY aCornerStrategy, int aMaxError )
     {
-        Inflate( -aAmount, aCircleSegmentsCount, aCornerStrategy );
+        Inflate( -aAmount, aCornerStrategy, aMaxError );
     }
+
+    /**
+     * Perform offsetting of a line chain. Replaces this polygon set with the result.
+     *
+     * @param aLine is the line to perform offsetting on.
+     * @param aAmount is the number of units to offset the line chain.
+     * @param aCornerStrategy #ALLOW_ACUTE_CORNERS to preserve all angles,
+     *                        #CHAMFER_ACUTE_CORNERS to chop angles less than 90°,
+     *                        #ROUND_ACUTE_CORNERS to round off angles less than 90°,
+     *                        #ROUND_ALL_CORNERS to round regardless of angles
+     * @param aMaxError is the allowable deviation when rounding corners with an approximated
+     *                  polygon
+     * @param aSimplify set to simplify the output polygon.
+     */
+    void OffsetLineChain( const SHAPE_LINE_CHAIN& aLine, int aAmount,
+                          CORNER_STRATEGY aCornerStrategy, int aMaxError, bool aSimplify );
 
     /**
      * Perform outline inflation/deflation, using round corners.
      *
      * Polygons can have holes and/or linked holes with main outlines.  The resulting
-     * polygons are also polygons with linked holes to main outlines.  For \a aFastMode
-     * meaning, see function booleanOp  .
+     * polygons are also polygons with linked holes to main outlines.
      */
-    void InflateWithLinkedHoles( int aFactor, int aCircleSegmentsCount, POLYGON_MODE aFastMode );
+    void InflateWithLinkedHoles( int aFactor, CORNER_STRATEGY aCornerStrategy, int aMaxError );
 
-    ///< Convert a set of polygons with holes to a single outline with "slits"/"fractures"
-    ///< connecting the outer ring to the inner holes
-    ///< For \a aFastMode meaning, see function booleanOp
-    void Fracture( POLYGON_MODE aFastMode );
+    /// Convert a set of polygons with holes to a single outline with "slits"/"fractures"
+    /// connecting the outer ring to the inner holes.
+    ///
+    /// @param aSimplify when true (default), run Simplify() first to remove overlapping
+    ///                  holes and degenerate geometry via Clipper2 Union. Set to false when
+    ///                  the input is known to be well-formed (e.g. imported fill data) to
+    ///                  avoid the expensive boolean operation.
+    void Fracture( bool aSimplify = true );
 
-    ///< Convert a single outline slitted ("fractured") polygon into a set ouf outlines
-    ///< with holes.
-    void Unfracture( POLYGON_MODE aFastMode );
+    /// Convert a single outline slitted ("fractured") polygon into a set ouf outlines
+    /// with holes.
+    void Unfracture();
 
-    ///< Return true if the polygon set has any holes.
+    /// Return true if the polygon set has any holes.
     bool HasHoles() const;
 
-    ///< Return true if the polygon set has any holes that share a vertex.
+    /// Return true if the polygon set has any holes that share a vertex.
     bool HasTouchingHoles() const;
 
 
-    ///< Simplify the polyset (merges overlapping polys, eliminates degeneracy/self-intersections)
-    ///< For \a aFastMode meaning, see function booleanOp
-    void Simplify( POLYGON_MODE aFastMode );
+    /// Simplify the polyset (merges overlapping polys, eliminates degeneracy/self-intersections)
+    void Simplify();
+
+    /**
+     * Simplifies the lines in the polyset.  This checks intermediate points to see if they are
+     * collinear with their neighbors, and removes them if they are.
+     *
+     * @param aMaxError is the maximum error to allow when simplifying the lines.
+     */
+    void SimplifyOutlines( int aMaxError = 0 );
 
     /**
      * Convert a self-intersecting polygon to one (or more) non self-intersecting polygon(s).
@@ -1042,7 +1136,7 @@ public:
     int NormalizeAreaOutlines();
 
     /// @copydoc SHAPE::Format()
-    const std::string Format() const override;
+    const std::string Format( bool aCplusPlus = true ) const override;
 
     /// @copydoc SHAPE::Parse()
     bool Parse( std::stringstream& aStream ) override;
@@ -1053,19 +1147,18 @@ public:
     /**
      * Mirror the line points about y or x (or both)
      *
-     * @param aX If true, mirror about the y axis (flip x coordinate)
-     * @param aY If true, mirror about the x axis
      * @param aRef sets the reference point about which to mirror
+     * @param aFlipDirection is the direction to mirror the points.
      */
-    void Mirror( bool aX = true, bool aY = false, const VECTOR2I& aRef = { 0, 0 } );
+    void Mirror( const VECTOR2I& aRef, FLIP_DIRECTION aFlipDirection );
 
     /**
      * Rotate all vertices by a given angle.
      *
      * @param aCenter is the rotation center.
-     * @param aAngle is the rotation angle in radians.
+     * @param aAngle is the rotation angle.
      */
-    void Rotate( double aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override;
+    void Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override;
 
     /// @copydoc SHAPE::IsSolid()
     bool IsSolid() const override
@@ -1081,7 +1174,7 @@ public:
      * @param aP is the point to check.
      * @return true if the point lies on the edge of any polygon.
      */
-    bool PointOnEdge( const VECTOR2I& aP ) const;
+    bool PointOnEdge( const VECTOR2I& aP, int aAccuracy = 0 ) const;
 
     /**
      * Check if the boundary of shape (this) lies closer to the shape \a aShape than \a aClearance,
@@ -1150,7 +1243,7 @@ public:
      * @param aClosestVertex is the index of the closes vertex to \p aPoint.
      * @return bool - true if there is a collision, false in any other case.
      */
-    bool CollideVertex( const VECTOR2I& aPoint, VERTEX_INDEX& aClosestVertex,
+    bool CollideVertex( const VECTOR2I& aPoint, VERTEX_INDEX* aClosestVertex = nullptr,
                         int aClearance = 0 ) const;
 
     /**
@@ -1163,8 +1256,11 @@ public:
      * @param aClosestVertex is the index of the closes vertex to \p aPoint.
      * @return bool - true if there is a collision, false in any other case.
      */
-    bool CollideEdge( const VECTOR2I& aPoint, VERTEX_INDEX& aClosestVertex,
+    bool CollideEdge( const VECTOR2I& aPoint, VERTEX_INDEX* aClosestVertex = nullptr,
                       int aClearance = 0 ) const;
+
+    bool PointInside( const VECTOR2I& aPt, int aAccuracy = 0,
+                      bool aUseBBoxCache = false ) const override;
 
     /**
      * Construct BBoxCaches for Contains(), below.
@@ -1189,7 +1285,7 @@ public:
     bool Contains( const VECTOR2I& aP, int aSubpolyIndex = -1, int aAccuracy = 0,
                    bool aUseBBoxCaches = false ) const;
 
-    ///< Return true if the set is empty (no polygons at all)
+    /// Return true if the set is empty (no polygons at all)
     bool IsEmpty() const
     {
         return m_polys.empty();
@@ -1209,7 +1305,7 @@ public:
      */
     void RemoveVertex( VERTEX_INDEX aRelativeIndices );
 
-    ///< Remove all outlines & holes (clears) the polygon set.
+    /// Remove all outlines & holes (clears) the polygon set.
     void RemoveAllContours();
 
     /**
@@ -1221,6 +1317,14 @@ public:
      *                    Defaults to the last polygon in the set.
      */
     void RemoveContour( int aContourIdx, int aPolygonIdx = -1 );
+
+
+    /**
+     * Delete the \a aOutlineIdx-th outline of the set including its contours and holes.
+     *
+     * @param aOutlineIdx is the index of the outline to be removed.
+     */
+    void RemoveOutline( int aOutlineIdx );
 
     /**
      * Look for null segments; ie, segments whose ends are exactly the same and deletes them.
@@ -1247,11 +1351,17 @@ public:
      */
     void SetVertex( int aGlobalIndex, const VECTOR2I& aPos );
 
-    ///< Return total number of vertices stored in the set.
+    /// Return total number of vertices stored in the set.
     int TotalVertices() const;
 
-    ///< Delete \a aIdx-th polygon from the set.
+    /// Delete \a aIdx-th polygon from the set.
     void DeletePolygon( int aIdx );
+
+    /// Delete \a aIdx-th polygon and its triangulation data from the set.
+    /// If called with \a aUpdateHash false, caller must call UpdateTriangulationDataHash().
+    void DeletePolygonAndTriangulationData( int aIdx, bool aUpdateHash = true );
+
+    void UpdateTriangulationDataHash();
 
     /**
      * Return a chamfered version of the \a aIndex-th polygon.
@@ -1327,7 +1437,13 @@ public:
      * @return The minimum distance squared between aPoint and all the polygons in the set.
      *         If the point is contained in any of the polygons, the distance is zero.
      */
-    SEG::ecoord SquaredDistance( VECTOR2I aPoint, VECTOR2I* aNearest = nullptr ) const;
+    SEG::ecoord SquaredDistance( const VECTOR2I& aPoint, bool aOutlineOnly,
+                                 VECTOR2I* aNearest ) const;
+
+    SEG::ecoord SquaredDistance( const VECTOR2I& aPoint, bool aOutlineOnly = false ) const override
+    {
+        return SquaredDistance( aPoint, aOutlineOnly, nullptr );
+    }
 
     /**
      * Compute the minimum distance squared between aSegment and all the polygons in the set.
@@ -1340,7 +1456,7 @@ public:
      * @return  The minimum distance squared between aSegment and all the polygons in the set.
      *          If the point is contained in the polygon, the distance is zero.
      */
-    SEG::ecoord SquaredDistance( const SEG& aSegment, VECTOR2I* aNearest = nullptr ) const;
+    SEG::ecoord SquaredDistanceToSeg( const SEG& aSegment, VECTOR2I* aNearest = nullptr ) const;
 
     /**
      * Check whether the \a aGlobalIndex-th vertex belongs to a hole.
@@ -1352,38 +1468,83 @@ public:
 
     /**
      * Build a SHAPE_POLY_SET from a bunch of outlines in provided in random order.
-     * 
-     * @param aPath set of closed outlines forming the polygon. Positive orientation = outline, negative = hole
-     * @param aReverseOrientation inverts the sign of the orientation of aPaths (so negative = outline)
+     *
+     * @param aPath set of closed outlines forming the polygon.
+     *              Positive orientation = outline, negative = hole
      * @param aEvenOdd forces the even-off fill rule (default is non zero)
-     * @return the constructed poly set
      */
-    static const SHAPE_POLY_SET BuildPolysetFromOrientedPaths( const std::vector<SHAPE_LINE_CHAIN>& aPaths, bool aReverseOrientation = false, bool aEvenOdd = false );
+    void BuildPolysetFromOrientedPaths( const std::vector<SHAPE_LINE_CHAIN>& aPaths,
+                                        bool aEvenOdd = false );
+
+    void TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aError,
+                             ERROR_LOC aErrorLoc ) const override
+    {
+        aBuffer.Append( *this );
+    }
+
+    const std::vector<SEG> GenerateHatchLines( const std::vector<double>& aSlopes, int aSpacing,
+                                               int aLineLength ) const;
+
+    void Scale( double aScaleFactorX, double aScaleFactorY, const VECTOR2I& aCenter );
+
+protected:
+    void cacheTriangulation( bool aPartition, bool aSimplify,
+                             std::vector<std::unique_ptr<TRIANGULATED_POLYGON>>* aHintData );
 
 private:
+    enum DROP_TRIANGULATION_FLAG { SINGLETON };
+
+    SHAPE_POLY_SET( const SHAPE_POLY_SET& aOther, DROP_TRIANGULATION_FLAG );
+
     void fractureSingle( POLYGON& paths );
     void unfractureSingle ( POLYGON& path );
-    void importTree( ClipperLibKiCad::PolyTree*               tree,
+    void importTree( Clipper2Lib::PolyTree64&            tree,
                      const std::vector<CLIPPER_Z_VALUE>& aZValueBuffer,
                      const std::vector<SHAPE_ARC>&       aArcBuffe );
+    void importPaths( Clipper2Lib::Paths64&               paths,
+                     const std::vector<CLIPPER_Z_VALUE>& aZValueBuffer,
+                     const std::vector<SHAPE_ARC>&       aArcBuffe );
+    void importPolyPath( const std::unique_ptr<Clipper2Lib::PolyPath64>& aPolyPath,
+                     const std::vector<CLIPPER_Z_VALUE>&                 aZValueBuffer,
+                     const std::vector<SHAPE_ARC>&                       aArcBuffer );
+
+    void inflate2( int aAmount, int aCircleSegCount, CORNER_STRATEGY aCornerStrategy, bool aSimplify = false );
+
+    void inflateLine2( const SHAPE_LINE_CHAIN& aLine, int aAmount, int aCircleSegCount,
+                       CORNER_STRATEGY aCornerStrategy, bool aSimplify = false );
+
+    void splitCollinearOutlines();
+
+    /**
+     * Split outline segments at vertices that lie on them (self-touching polygons).
+     *
+     * This handles the case where a polygon vertex lies on a non-adjacent segment,
+     * creating a "pinch point" where the polygon touches itself. By inserting the
+     * vertex into the segment, the polygon can be properly processed by boolean
+     * operations.
+     */
+    void splitSelfTouchingOutlines();
+
+    /**
+     * Check if two line segments are collinear and overlap.
+     *
+     * @param aSegA First line segment
+     * @param aSegB Second line segment
+     * @return true if segments are collinear and overlap
+     */
+    bool isExteriorWaist( const SEG& aSegA, const SEG& aSegB ) const;
 
     /**
      * This is the engine to execute all polygon boolean transforms (AND, OR, ... and polygon
      * simplification (merging overlapping  polygons).
      *
-     * @param aType is the transform type ( see ClipperLibKiCad::ClipType )
+     * @param aType is the transform type ( see Clipper2Lib::ClipType )
      * @param aOtherShape is the SHAPE_LINE_CHAIN to combine with me.
-     * @param aFastMode is an option to choose if the result can be a weak polygon
-     * or a strictly simple polygon.
-     * if aFastMode is PM_FAST the result can be a weak polygon
-     * if aFastMode is PM_STRICTLY_SIMPLE (default) the result is (theoretically) a strictly
-     * simple polygon, but calculations can be really significantly time consuming
      */
-    void booleanOp( ClipperLibKiCad::ClipType aType, const SHAPE_POLY_SET& aOtherShape,
-                    POLYGON_MODE aFastMode );
+    void booleanOp( Clipper2Lib::ClipType aType, const SHAPE_POLY_SET& aOtherShape );
 
-    void booleanOp( ClipperLibKiCad::ClipType aType, const SHAPE_POLY_SET& aShape,
-                    const SHAPE_POLY_SET& aOtherShape, POLYGON_MODE aFastMode );
+    void booleanOp( Clipper2Lib::ClipType aType, const SHAPE_POLY_SET& aShape,
+                    const SHAPE_POLY_SET& aOtherShape );
 
     /**
      * Check whether the point \a aP is inside the \a aSubpolyIndex-th polygon of the polyset. If
@@ -1429,20 +1590,21 @@ private:
     POLYGON chamferFilletPolygon( CORNER_MODE aMode, unsigned int aDistance,
                                   int aIndex, int aErrorMax );
 
-    ///< Return true if the polygon set has any holes that touch share a vertex.
+    /// Return true if the polygon set has any holes that touch share a vertex.
     bool hasTouchingHoles( const POLYGON& aPoly ) const;
 
-    MD5_HASH checksum() const;
+    HASH_128 checksum() const;
 
-private:
-    typedef std::vector<POLYGON> POLYSET;
-
-    POLYSET  m_polys;
-
+protected:
+    std::vector<POLYGON>                               m_polys;
     std::vector<std::unique_ptr<TRIANGULATED_POLYGON>> m_triangulatedPolys;
 
-    bool     m_triangulationValid = false;
-    MD5_HASH m_hash;
+    std::atomic<bool> m_triangulationValid = false;
+    std::mutex  m_triangulationMutex;
+
+private:
+    HASH_128 m_hash;
+    bool     m_hashValid = false;
 };
 
 #endif // __SHAPE_POLY_SET_H

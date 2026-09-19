@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2015 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -23,6 +23,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <limits>
+
+#include <algorithm>
 
 #include <geometry/shape_rect.h>
 
@@ -78,6 +80,7 @@ DP_PRIMITIVE_PAIR& DP_PRIMITIVE_PAIR::operator=( const DP_PRIMITIVE_PAIR& aOther
 {
     if( aOther.m_primP )
         m_primP = aOther.m_primP->Clone();
+
     if( aOther.m_primN )
         m_primN = aOther.m_primN->Clone();
 
@@ -100,7 +103,7 @@ bool DP_PRIMITIVE_PAIR::Directional() const
     if( !m_primP )
         return false;
 
-    return m_primP->OfKind( ITEM::SEGMENT_T );
+    return m_primP->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T );
 }
 
 
@@ -176,17 +179,38 @@ static DIRECTION_45::AngleType angle( const VECTOR2I &a, const VECTOR2I &b )
 }
 
 
-static bool checkGap( const SHAPE_LINE_CHAIN &p, const SHAPE_LINE_CHAIN &n, int gap )
+static bool checkGap( const SHAPE_LINE_CHAIN& p, const SHAPE_LINE_CHAIN& n, int gap, int aEntryGap = -1,
+                      const VECTOR2I& aEntryMid = VECTOR2I( 0, 0 ), int aTransitionRadius = 0 )
 {
-    int i, j;
+    SEG::ecoord gap_sq = SEG::Square( gap - 100 );
 
-    for( i = 0; i < p.SegmentCount(); i++ )
+    // Inside the entry transition window the pair may legitimately hold a gap as small as the
+    // existing anchor pair (e.g. starting in a neckdown area) while it widens out to the configured
+    // gap. Outside the window the full configured gap is enforced.
+    bool        relaxEntry = aEntryGap >= 0 && aEntryGap < gap;
+    SEG::ecoord entryGap_sq = relaxEntry ? SEG::Square( aEntryGap - 100 ) : gap_sq;
+    SEG::ecoord radius_sq = SEG::Square( aTransitionRadius );
+
+    for( int i = 0; i < p.SegmentCount(); i++ )
     {
-        for( j = 0; j < n.SegmentCount() ; j++ )
-        {
-            int dist = p.CSegment( i ).Distance( n.CSegment( j ) );
+        const SEG& sp = p.CSegment( i );
+        bool pNearEntry = relaxEntry
+                          && ( ( sp.A + sp.B ) / 2 - aEntryMid ).SquaredEuclideanNorm() <= radius_sq;
 
-            if( dist < gap - 100 )
+        for( int j = 0; j < n.SegmentCount(); j++ )
+        {
+            const SEG& sn = n.CSegment( j );
+
+            SEG::ecoord dist_sq = sp.SquaredDistance( sn );
+            SEG::ecoord limit_sq = gap_sq;
+
+            if( pNearEntry
+                && ( ( sn.A + sn.B ) / 2 - aEntryMid ).SquaredEuclideanNorm() <= radius_sq )
+            {
+                limit_sq = entryGap_sq;
+            }
+
+            if( dist_sq < limit_sq )
                 return false;
         }
     }
@@ -205,14 +229,13 @@ void DP_GATEWAY::Reverse()
 bool DIFF_PAIR::BuildInitial( const DP_GATEWAY& aEntry, const DP_GATEWAY &aTarget,
                               bool aPrefDiagonal )
 {
-    SHAPE_LINE_CHAIN p = DIRECTION_45().BuildInitialTrace ( aEntry.AnchorP(), aTarget.AnchorP(),
-                                                            aPrefDiagonal );
-    SHAPE_LINE_CHAIN n = DIRECTION_45().BuildInitialTrace ( aEntry.AnchorN(), aTarget.AnchorN(),
-                                                            aPrefDiagonal );
+    SHAPE_LINE_CHAIN p = DIRECTION_45().BuildInitialTrace( aEntry.AnchorP(), aTarget.AnchorP(),
+                                                           aPrefDiagonal );
+    SHAPE_LINE_CHAIN n = DIRECTION_45().BuildInitialTrace( aEntry.AnchorN(), aTarget.AnchorN(),
+                                                           aPrefDiagonal );
 
     int mask = aEntry.AllowedAngles() | DIRECTION_45::ANG_STRAIGHT | DIRECTION_45::ANG_OBTUSE;
 
-    SHAPE_LINE_CHAIN sum_n, sum_p;
     m_p = p;
     m_n = n;
 
@@ -221,38 +244,46 @@ bool DIFF_PAIR::BuildInitial( const DP_GATEWAY& aEntry, const DP_GATEWAY &aTarge
         if( !aEntry.Entry().CheckConnectionAngle( *this, mask ) )
             return false;
 
-        sum_p = aEntry.Entry().CP();
-        sum_n = aEntry.Entry().CN();
-        sum_p.Append( p );
-        sum_n.Append( n );
+        m_p = aEntry.Entry().CP();
+        m_n = aEntry.Entry().CN();
+        m_p.Append( p );
+        m_n.Append( n );
     }
     else
     {
-        sum_p = p;
-        sum_n = n;
+        m_p = p;
+        m_n = n;
     }
 
     mask = aTarget.AllowedAngles() | DIRECTION_45::ANG_STRAIGHT | DIRECTION_45::ANG_OBTUSE;
 
-    m_p = sum_p;
-    m_n = sum_n;
-
     if( aTarget.HasEntryLines() )
     {
-        DP_GATEWAY t(aTarget) ;
+        DP_GATEWAY t( aTarget );
         t.Reverse();
 
         if( !CheckConnectionAngle( t.Entry(), mask ) )
             return false;
 
-        sum_p.Append( t.Entry().CP() );
-        sum_n.Append( t.Entry().CN() );
+        m_p.Append( t.Entry().CP() );
+        m_n.Append( t.Entry().CN() );
     }
 
-    m_p = sum_p;
-    m_n = sum_n;
+    // The trace may start from an existing anchor pair that is narrower than the configured gap
+    // (e.g. a neckdown area inside a BGA). In that case the entry region legitimately holds a
+    // smaller gap than the netclass value while the pair widens out towards the target. Allow the
+    // narrower gap only within a transition window around the entry anchor; the rest of the trace
+    // must still satisfy the configured gap.
 
-    if( !checkGap ( p, n, m_gapConstraint ) )
+    int      configuredGap = m_gapConstraint;
+    int      entryGap = ( aEntry.AnchorP() - aEntry.AnchorN() ).EuclideanNorm();
+    VECTOR2I entryMid = ( aEntry.AnchorP() + aEntry.AnchorN() ) / 2;
+
+    // A 45-degree widening from the entry gap to the configured gap completes within roughly the
+    // difference of the two gaps; allow a generous window so the transition segments are accepted.
+    int transitionRadius = 4 * configuredGap;
+
+    if( !checkGap( p, n, configuredGap, entryGap, entryMid, transitionRadius ) )
         return false;
 
     if( p.SelfIntersecting() || n.SelfIntersecting() )
@@ -270,7 +301,9 @@ bool DIFF_PAIR::CheckConnectionAngle( const DIFF_PAIR& aOther, int aAllowedAngle
     bool checkP, checkN;
 
     if( m_p.SegmentCount() == 0 || aOther.m_p.SegmentCount() == 0 )
+    {
         checkP = true;
+    }
     else
     {
         DIRECTION_45 p0( m_p.CSegment( -1 ) );
@@ -340,7 +373,6 @@ bool DP_GATEWAYS::FitGateways( DP_GATEWAYS& aEntry, DP_GATEWAYS& aTarget, bool a
 {
     DP_CANDIDATE best;
 
-    int n = 0;
     int bestScore = -1000;
     bool found = false;
 
@@ -348,26 +380,24 @@ bool DP_GATEWAYS::FitGateways( DP_GATEWAYS& aEntry, DP_GATEWAYS& aTarget, bool a
     {
         for( const DP_GATEWAY& g_target : aTarget.Gateways() )
         {
-            n++;
-
-            for( int attempt = 0; attempt < 2; attempt++ )
+            for( bool preferred : { false, true } )
             {
-                int score = ( attempt == 1 ? -3 : 0 );
+                int score = preferred ? 0 : -3;
                 score += g_entry.Priority();
                 score += g_target.Priority();
 
-                if( score < bestScore )
-                    continue;
-
-                DIFF_PAIR l( m_gap );
-
-                if( l.BuildInitial( g_entry, g_target,
-                                    aPrefDiagonal ^ ( attempt ? true : false ) ) )
+                if( score >= bestScore )
                 {
-                    best.p = l.CP();
-                    best.n = l.CN();
-                    bestScore = score;
-                    found = true;
+                    DIFF_PAIR l( m_gap );
+
+                    if( l.BuildInitial( g_entry, g_target, preferred ? aPrefDiagonal
+                                                                     : !aPrefDiagonal ) )
+                    {
+                        best.p = l.CP();
+                        best.n = l.CN();
+                        bestScore = score;
+                        found = true;
+                    }
                 }
             }
         }
@@ -393,16 +423,14 @@ bool DP_GATEWAYS::checkDiagonalAlignment( const VECTOR2I& a, const VECTOR2I& b )
 }
 
 
-void DP_GATEWAYS::FilterByOrientation ( int aAngleMask, DIRECTION_45 aRefOrientation )
+void DP_GATEWAYS::FilterByOrientation( int aAngleMask, DIRECTION_45 aRefOrientation )
 {
-    m_gateways.erase(
-        std::remove_if( m_gateways.begin(), m_gateways.end(),
-                        [aAngleMask, aRefOrientation]( const DP_GATEWAY& dp)
-                        {
-                            DIRECTION_45 orient( dp.AnchorP() - dp.AnchorN() );
-                            return ( orient.Angle( aRefOrientation ) & aAngleMask );
-                        } ), m_gateways.end()
-        );
+    std::erase_if( m_gateways,
+                    [aAngleMask, aRefOrientation]( const DP_GATEWAY& dp )
+                    {
+                        DIRECTION_45 orient( dp.AnchorP() - dp.AnchorN() );
+                        return ( orient.Angle( aRefOrientation ) & aAngleMask );
+                    } );
 }
 
 static VECTOR2I makeGapVector( VECTOR2I dir, int length )
@@ -426,8 +454,8 @@ void DP_GATEWAYS::BuildFromPrimitivePair( const DP_PRIMITIVE_PAIR& aPair, bool a
 {
     VECTOR2I majorDirection;
     VECTOR2I p0_p, p0_n;
-    int orthoFanDistance;
-    int diagFanDistance;
+    int orthoFanDistance = 0;
+    int diagFanDistance = 0;
     const SHAPE* shP = nullptr;
 
     if( aPair.PrimP() == nullptr )
@@ -438,14 +466,16 @@ void DP_GATEWAYS::BuildFromPrimitivePair( const DP_PRIMITIVE_PAIR& aPair, bool a
 
     const int pvMask = ITEM::SOLID_T | ITEM::VIA_T;
 
-    if( aPair.PrimP()->OfKind( pvMask ) && aPair.PrimN()->OfKind(  pvMask ) )
+    if( aPair.PrimP()->OfKind( pvMask ) && aPair.PrimN()->OfKind( pvMask ) )
     {
         p0_p = aPair.AnchorP();
         p0_n = aPair.AnchorN();
 
-        shP = aPair.PrimP()->Shape();
+        // TODO(JE) padstacks
+        shP = aPair.PrimP()->Shape( -1 );
     }
-    else if( aPair.PrimP()->OfKind( ITEM::SEGMENT_T ) && aPair.PrimN()->OfKind( ITEM::SEGMENT_T ) )
+    else if( aPair.PrimP()->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T )
+             && aPair.PrimN()->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
     {
         buildDpContinuation( aPair, aPreferDiagonal );
 
@@ -459,6 +489,10 @@ void DP_GATEWAYS::BuildFromPrimitivePair( const DP_PRIMITIVE_PAIR& aPair, bool a
 
     switch( shP->Type() )
     {
+    case SH_CIRCLE:
+        BuildGeneric ( p0_p, p0_n, true );
+        return;
+
     case SH_RECT:
     {
         int w = static_cast<const SHAPE_RECT*>( shP )->GetWidth();
@@ -482,9 +516,26 @@ void DP_GATEWAYS::BuildFromPrimitivePair( const DP_PRIMITIVE_PAIR& aPair, bool a
         break;
     }
 
+    case SH_SIMPLE:
+    case SH_COMPOUND:
+    {
+        BOX2I bbox = shP->BBox();
+        int   w = bbox.GetWidth();
+        int   h = bbox.GetHeight();
+
+        if( w < h )
+            std::swap( w, h );
+
+        orthoFanDistance = ( w + 1 )* 3 / 2;
+        diagFanDistance = ( w - h );
+        break;
+    }
+
     default:
-        BuildGeneric ( p0_p, p0_n, true );
-        return;
+        wxFAIL_MSG( wxString::Format( wxT( "Unsupported starting primitive: %d (%s)." ),
+                                      shP->Type(),
+                                      SHAPE_TYPE_asString( shP->Type() ) ) );
+        break;
     }
 
     if( checkDiagonalAlignment( p0_p, p0_n ) )
@@ -531,13 +582,13 @@ void DP_GATEWAYS::BuildForCursor( const VECTOR2I& aCursorPos )
 {
     int gap = m_fitVias ? m_viaGap + m_viaDiameter : m_gap;
 
-    for( int attempt = 0; attempt < 2; attempt++ )
+    for( bool diagonal : { false, true } )
     {
         for( int i = 0; i < 4; i++ )
         {
             VECTOR2I dir;
 
-            if( !attempt )
+            if( !diagonal )
             {
                 dir = makeGapVector( VECTOR2I( gap, gap ), gap );
 
@@ -552,15 +603,13 @@ void DP_GATEWAYS::BuildForCursor( const VECTOR2I& aCursorPos )
                 if( i /2 == 0 )
                     dir = VECTOR2I( (gap + 1) / 2 * ( ( i % 2 ) ? -1 : 1 ), 0 );
                 else
-                    dir = VECTOR2I( 0, (gap + 1) / 2 * ( ( i % 2 ) ? -1 : 1) );
+                    dir = VECTOR2I( 0, (gap + 1) / 2 * ( ( i % 2 ) ? -1 : 1 ) );
             }
 
             if( m_fitVias )
                 BuildGeneric( aCursorPos + dir, aCursorPos - dir, true, true );
             else
-                m_gateways.emplace_back( aCursorPos + dir, aCursorPos - dir,
-                                         attempt ? true : false );
-
+                m_gateways.emplace_back( aCursorPos + dir, aCursorPos - dir, diagonal );
         }
     }
 }
@@ -591,45 +640,44 @@ void DP_GATEWAYS::buildDpContinuation( const DP_PRIMITIVE_PAIR& aPair, bool aIsD
     if( !aPair.Directional() )
         return;
 
-    DIRECTION_45 dP = aPair.DirP();
-    DIRECTION_45 dN = aPair.DirN();
+    // If we're at a "normal" angle (cardinal or 45-degree-diagonal), then add gateways that angle
+    // the anchor points by 22.5-degrees for connection to tracks which are at +/- 45 degrees from
+    // the existing direction.
 
-    int gap = ( aPair.AnchorP() - aPair.AnchorN() ).EuclideanNorm();
+    int    EPSILON  = 5;         // 0.005um
+    double SIN_22_5 = 0.38268;   // sin(22.5)
+    double SIN_23_5 = 0.39875;   // sin(23.5)
 
-    VECTOR2I vdP = aPair.AnchorP() + dP.Left().ToVector();
-    VECTOR2I vdN = aPair.AnchorN() + dN.Left().ToVector();
+    auto addAngledGateways =
+            [&]( int length, int priority )
+            {
+                SHAPE_LINE_CHAIN entryLineP;
+                entryLineP.Append( aPair.AnchorP() );
+                entryLineP.Append( aPair.AnchorP() + aPair.DirP().ToVector().Resize( length ) );
+                DP_GATEWAY gwExtendP( entryLineP.CLastPoint(), aPair.AnchorN(), aIsDiagonal );
+                gwExtendP.SetPriority( priority );
+                gwExtendP.SetEntryLines( entryLineP, SHAPE_LINE_CHAIN() );
+                m_gateways.push_back( gwExtendP );
 
-    SEGMENT* sP = static_cast<SEGMENT*>( aPair.PrimP() );
+                SHAPE_LINE_CHAIN entryLineN;
+                entryLineN.Append( aPair.AnchorN() );
+                entryLineN.Append( aPair.AnchorN() + aPair.DirN().ToVector().Resize( length ) );
+                DP_GATEWAY gwExtendN( aPair.AnchorP(), entryLineN.CLastPoint(), aIsDiagonal );
+                gwExtendN.SetPriority( priority );
+                gwExtendN.SetEntryLines( SHAPE_LINE_CHAIN(), entryLineN );
+                m_gateways.push_back( gwExtendN );
+            };
 
-    VECTOR2I t1, t2;
+    VECTOR2I delta = aPair.AnchorP() - aPair.AnchorN();
 
-    auto vL = makeGapVector( dP.Left().ToVector(), ( gap + 1 ) / 2 );
-    auto vR = makeGapVector( dP.Right().ToVector(), ( gap + 1 ) / 2 );
-
-    if( sP->Seg().Side( vdP ) == sP->Seg().Side( vdN ) )
+    if( abs( delta.x ) < EPSILON || abs( delta.y ) < EPSILON || abs( delta.x - delta.y ) < EPSILON )
     {
-        t1 = aPair.AnchorP() + vL;
-        t2 = aPair.AnchorN() + vR;
+        addAngledGateways( KiROUND( (double) m_gap * SIN_22_5 ), 20 );
+
+        // fixme; sin(22.5) doesn't always work, so we also add some lower priority ones with a
+        // bit of wiggle room.  See https://gitlab.com/kicad/code/kicad/-/issues/12459.
+        addAngledGateways( KiROUND( (double) m_gap * SIN_23_5 ), 5 );
     }
-    else
-    {
-        t1 = aPair.AnchorP() + vR;
-        t2 = aPair.AnchorN() + vL;
-    }
-
-    DP_GATEWAY gwL( t2, aPair.AnchorN(), !aIsDiagonal );
-    SHAPE_LINE_CHAIN ep = dP.BuildInitialTrace( aPair.AnchorP(), t2, !aIsDiagonal );
-    gwL.SetPriority( 10 );
-    gwL.SetEntryLines( ep , SHAPE_LINE_CHAIN() );
-
-    m_gateways.push_back( gwL );
-
-    DP_GATEWAY gwR( aPair.AnchorP(), t1, !aIsDiagonal );
-    SHAPE_LINE_CHAIN en = dP.BuildInitialTrace( aPair.AnchorN(), t1, !aIsDiagonal );
-    gwR.SetPriority( 10) ;
-    gwR.SetEntryLines( SHAPE_LINE_CHAIN(), en );
-
-    m_gateways.push_back( gwR );
 }
 
 
@@ -661,7 +709,7 @@ void DP_GATEWAYS::BuildGeneric( const VECTOR2I& p0_p, const VECTOR2I& p0_n, bool
         {
             VECTOR2I dir = makeGapVector( p0_n - p0_p, m_gap / 2 );
             VECTOR2I m = ( p0_p + p0_n ) / 2;
-            int prio = ( padDist > padToGapThreshold * m_gap ? 2 : 1);
+            int prio = ( padDist > padToGapThreshold * m_gap ) ? 2 : 1;
 
             if( !aViaMode )
             {
@@ -715,7 +763,7 @@ void DP_GATEWAYS::BuildGeneric( const VECTOR2I& p0_p, const VECTOR2I& p0_n, bool
             ips[0] = st_n[i].IntersectLines( d_p[j] );
             ips[1] = st_p[i].IntersectLines( d_n[j] );
 
-//          diagonal-straight cases: 8 possibilities of "weirder" exists
+            // diagonal-straight cases: 8 possibilities of "weirder" exists
             for( int k = 0; k < 2; k++ )
             {
                 if( ips[k] )
@@ -820,16 +868,20 @@ double DIFF_PAIR::Skew() const
 
 void DIFF_PAIR::CoupledSegmentPairs( COUPLED_SEGMENTS_VEC& aPairs ) const
 {
-    SHAPE_LINE_CHAIN p( m_p );
-    SHAPE_LINE_CHAIN n( m_n );
-
-    p.Simplify();
-    n.Simplify();
+    const SHAPE_LINE_CHAIN& p = m_p;
+    const SHAPE_LINE_CHAIN& n = m_n;
+    // Do not simplify the line chains here, otherwise the indices will be invalid
 
     for( int i = 0; i < p.SegmentCount(); i++ )
     {
+        if( p.IsArcSegment( i ) )
+            continue;
+
         for( int j = 0; j < n.SegmentCount(); j++ )
         {
+            if( n.IsArcSegment( j ) )
+                continue;
+            
             SEG sp = p.Segment( i );
             SEG sn = n.Segment( j );
 
@@ -881,8 +933,8 @@ double DIFF_PAIR::CoupledLength() const
 
     double l = 0.0;
 
-    for( unsigned int i = 0; i < pairs.size(); i++ )
-        l += pairs[i].coupledP.Length();
+    for( const COUPLED_SEGMENTS& pair : pairs )
+        l += pair.coupledP.Length();
 
     return l;
 }
@@ -913,9 +965,11 @@ int DIFF_PAIR::CoupledLength ( const SEG& aP, const SEG& aN ) const
     SEG p_clip, n_clip;
     int64_t dist = std::abs( aP.Distance( aN ) - m_width );
 
-    if( aP.ApproxParallel( aN ) && m_gapConstraint.Matches( dist ) &&
-        commonParallelProjection ( aP, aN, p_clip, n_clip ) )
+    if( aP.ApproxParallel( aN ) && m_gapConstraint.Matches( dist )
+            && commonParallelProjection ( aP, aN, p_clip, n_clip ) )
+    {
         return p_clip.Length();
+    }
 
     return 0;
 }

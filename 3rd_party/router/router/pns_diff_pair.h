@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2015 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -261,8 +261,8 @@ public:
         m_hasVias( false )
     {
         // Initialize some members, to avoid uninitialized variables.
-        m_net_p = 0;
-        m_net_n = 0;;
+        m_net_p = nullptr;
+        m_net_n = nullptr;
         m_width = 0;
         m_gap = 0;
         m_viaGap = 0;
@@ -277,8 +277,8 @@ public:
         m_gapConstraint = aGap;
 
         // Initialize other members, to avoid uninitialized variables.
-        m_net_p = 0;
-        m_net_n = 0;;
+        m_net_p = nullptr;
+        m_net_n = nullptr;
         m_width = 0;
         m_gap = 0;
         m_viaGap = 0;
@@ -295,8 +295,8 @@ public:
         m_gapConstraint = aGap;
 
         // Initialize other members, to avoid uninitialized variables.
-        m_net_p = 0;
-        m_net_n = 0;;
+        m_net_p = nullptr;
+        m_net_n = nullptr;
         m_width = 0;
         m_gap = 0;
         m_viaGap = 0;
@@ -324,6 +324,12 @@ public:
         m_chamferLimit  = 0;
     }
 
+    DIFF_PAIR( const DIFF_PAIR& aOther ) :
+        LINK_HOLDER( ITEM::DIFF_PAIR_T )
+    {
+        *this = aOther;
+    }
+
     static inline bool ClassOf( const ITEM* aItem )
     {
         return aItem && ITEM::DIFF_PAIR_T == aItem->Kind();
@@ -335,14 +341,60 @@ public:
         return nullptr;
     }
 
+    // Copy operator
+    DIFF_PAIR& operator=( const DIFF_PAIR& aOther )
+    {
+        m_n = aOther.m_n;
+        m_p = aOther.m_p;
+        m_line_n = aOther.m_line_n;
+        m_line_p = aOther.m_line_p;
+        m_via_n = aOther.m_via_n;
+        m_via_p = aOther.m_via_p;
+        m_layers = aOther.m_layers;
+        m_hasVias = aOther.m_hasVias;
+        m_net_n = aOther.m_net_n;
+        m_net_p = aOther.m_net_p;
+        m_width = aOther.m_width;
+        m_gap = aOther.m_gap;
+        m_viaGap = aOther.m_viaGap;
+        m_maxUncoupledLength = aOther.m_maxUncoupledLength;
+        m_chamferLimit = aOther.m_chamferLimit;
+        m_gapConstraint = aOther.m_gapConstraint;
+        return *this;
+    }
+
+    // Move assignment operator
+    DIFF_PAIR& operator=( DIFF_PAIR&& aOther ) noexcept
+    {
+        if (this != &aOther)
+        {
+            m_n = std::move( aOther.m_n );
+            m_p = std::move( aOther.m_p );
+            m_line_n = std::move( aOther.m_line_n );
+            m_line_p = std::move( aOther.m_line_p );
+            m_via_n = aOther.m_via_n;
+            m_via_p = aOther.m_via_p;
+            m_layers = aOther.m_layers;
+            m_hasVias = aOther.m_hasVias;
+            m_net_n = aOther.m_net_n;
+            m_net_p = aOther.m_net_p;
+            m_width = aOther.m_width;
+            m_gap = aOther.m_gap;
+            m_viaGap = aOther.m_viaGap;
+            m_maxUncoupledLength = aOther.m_maxUncoupledLength;
+            m_chamferLimit = aOther.m_chamferLimit;
+            m_gapConstraint = aOther.m_gapConstraint;
+        }
+
+        return *this;
+    }
+
     virtual void ClearLinks() override
     {
         m_links.clear();
         m_line_p.ClearLinks();
         m_line_n.ClearLinks();
     }
-
-    static DIFF_PAIR* AssembleDp( LINE *aLine );
 
     void SetShape( const SHAPE_LINE_CHAIN &aP, const SHAPE_LINE_CHAIN& aN, bool aSwapLanes = false )
     {
@@ -364,7 +416,7 @@ public:
         m_n = aPair.m_n;
     }
 
-    void SetNets( int aP, int aN )
+    void SetNets( NET_HANDLE aP, NET_HANDLE aN )
     {
         m_net_p = aP;
         m_net_n = aN;
@@ -394,12 +446,16 @@ public:
     {
         m_hasVias = true;
         m_via_p = aViaP;
+        m_via_p.SetHole( aViaP.Hole()->Clone() );
         m_via_n = aViaN;
+        m_via_n.SetHole( aViaN.Hole()->Clone() );
     }
 
     void RemoveVias()
     {
         m_hasVias = false;
+        m_line_n.RemoveVia();
+        m_line_p.RemoveVia();
     }
 
     bool EndsWithVias() const
@@ -409,8 +465,8 @@ public:
 
     void SetViaDiameter( int aDiameter )
     {
-        m_via_p.SetDiameter( aDiameter );
-        m_via_n.SetDiameter( aDiameter );
+        m_via_p.SetDiameter( VIA::ALL_LAYERS, aDiameter );
+        m_via_n.SetDiameter( VIA::ALL_LAYERS, aDiameter );
     }
 
     void SetViaDrill( int aDrill )
@@ -419,12 +475,12 @@ public:
         m_via_n.SetDrill( aDrill );
     }
 
-    int NetP() const
+    NET_HANDLE NetP() const
     {
         return m_net_p;
     }
 
-    int NetN() const
+    NET_HANDLE NetN() const
     {
         return m_net_n;
     }
@@ -486,17 +542,17 @@ public:
     }
 
 private:
-    void updateLine( LINE &aLine, const SHAPE_LINE_CHAIN& aShape, int aNet, const VIA& aVia )
+    void updateLine( LINE &aLine, const SHAPE_LINE_CHAIN& aShape, NET_HANDLE aNet, const VIA& aVia )
     {
         aLine.SetShape( aShape );
         aLine.SetWidth( m_width );
         aLine.SetNet( aNet );
         aLine.SetLayer( Layers().Start() );
+        aLine.SetParent( m_parent );
+        aLine.SetSourceItem( m_sourceItem );
 
         if( m_hasVias )
             aLine.AppendVia( aVia );
-        else
-            aLine.RemoveVia();
     }
 
     SHAPE_LINE_CHAIN m_n, m_p;
@@ -504,7 +560,7 @@ private:
     VIA m_via_p, m_via_n;
 
     bool m_hasVias;
-    int m_net_p, m_net_n;
+    NET_HANDLE m_net_p, m_net_n;
     int m_width;
     int m_gap;
     int m_viaGap;

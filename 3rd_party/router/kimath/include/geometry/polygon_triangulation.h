@@ -1,11 +1,11 @@
 /*
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
- * Modifications Copyright (C) 2018-2021 KiCad Developers
+ * Copyright The KiCad Developers, see AUTHORS.TXT for contributors.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
+ * as published by the Free Software Foundation; either version 3
  * of the License, or (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful,
@@ -15,8 +15,8 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, you may find one here:
- * http://www.gnu.org/licenses/old-licenses/gpl-2.0.html
- * or you may search the http://www.gnu.org website for the version 2 license,
+ * http://www.gnu.org/licenses/gpl-3.0.html
+ * or you may search the http://www.gnu.org website for the version 3 license,
  * or you may write to the Free Software Foundation, Inc.,
  * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
  *
@@ -50,233 +50,184 @@
 #include <deque>
 #include <cmath>
 
-#include "router/clipper_kicad/clipper.hpp"
+#include <advanced_config.h>
 #include <geometry/shape_line_chain.h>
 #include <geometry/shape_poly_set.h>
+#include <geometry/vertex_set.h>
 #include <math/box2.h>
 #include <math/vector2d.h>
 
-class PolygonTriangulation
+#include <wx/log.h>
+
+// ADVANCED_CFG::GetCfg() cannot be used on msys2/mingw builds (link failure)
+// So we use the ADVANCED_CFG default values
+#if defined( __MINGW32__ )
+    #define TRIANGULATESIMPLIFICATIONLEVEL 50
+    #define TRIANGULATEMINIMUMAREA 1000
+#else
+    #define TRIANGULATESIMPLIFICATIONLEVEL ADVANCED_CFG::GetCfg().m_TriangulateSimplificationLevel
+    #define TRIANGULATEMINIMUMAREA ADVANCED_CFG::GetCfg().m_TriangulateMinimumArea
+#endif
+
+#define TRIANGULATE_TRACE "triangulate"
+
+class POLYGON_TRIANGULATION : public VERTEX_SET
 {
 public:
-    PolygonTriangulation( SHAPE_POLY_SET::TRIANGULATED_POLYGON& aResult ) :
-        m_result( aResult )
+    POLYGON_TRIANGULATION( SHAPE_POLY_SET::TRIANGULATED_POLYGON& aResult ) :
+        VERTEX_SET( TRIANGULATESIMPLIFICATIONLEVEL ),
+        m_vertices_original_size( 0 ), m_result( aResult )
     {};
 
-    bool TesselatePolygon( const SHAPE_LINE_CHAIN& aPoly )
+    bool TesselatePolygon( const SHAPE_LINE_CHAIN& aPoly,
+                           SHAPE_POLY_SET::TRIANGULATED_POLYGON* aHintData )
     {
         m_bbox = aPoly.BBox();
         m_result.Clear();
 
         if( !m_bbox.GetWidth() || !m_bbox.GetHeight() )
-            return false;
+            return true;
 
         /// Place the polygon Vertices into a circular linked list
         /// and check for lists that have only 0, 1 or 2 elements and
         /// therefore cannot be polygons
-        Vertex* firstVertex = createList( aPoly );
-        if( !firstVertex || firstVertex->prev == firstVertex->next )
-            return false;
+        VERTEX* firstVertex = createList( aPoly );
 
+        for( const VECTOR2I& pt : aPoly.CPoints() )
+            m_result.AddVertex( pt );
+
+        if( !firstVertex || firstVertex->prev == firstVertex->next )
+            return true;
+
+        wxLogTrace( TRIANGULATE_TRACE, "Created list with %f area", firstVertex->area() );
+
+        m_vertices_original_size = m_vertices.size();
         firstVertex->updateList();
 
-        auto retval = earcutList( firstVertex );
-        m_vertices.clear();
-        return retval;
+        /**
+         * If we have a hint data, we can skip the tesselation process as long as the
+         * the hint source did not need to subdivide the polygon.
+        */
+        if( aHintData && aHintData->Vertices().size() == m_vertices.size() )
+        {
+            m_result.SetTriangles( aHintData->Triangles() );
+            return true;
+        }
+        else
+        {
+            auto retval = earcutList( firstVertex );
+
+            if( !retval )
+            {
+                wxLogTrace( TRIANGULATE_TRACE, "Tesselation failed, logging remaining vertices" );
+                logRemaining();
+            }
+
+            m_vertices.clear();
+            return retval;
+        }
     }
 
 private:
-    struct Vertex
-    {
-        Vertex( size_t aIndex, double aX, double aY, PolygonTriangulation* aParent ) :
-                i( aIndex ),
-                x( aX ),
-                y( aY ),
-                parent( aParent )
-        {
-        }
-
-        Vertex& operator=( const Vertex& ) = delete;
-        Vertex& operator=( Vertex&& ) = delete;
-
-        bool operator==( const Vertex& rhs ) const
-        {
-            return this->x == rhs.x && this->y == rhs.y;
-        }
-        bool operator!=( const Vertex& rhs ) const { return !( *this == rhs ); }
-
-
-        /**
-         * Split the referenced polygon between the reference point and
-         * vertex b, assuming they are in the same polygon.  Notes that while we
-         * create a new vertex pointer for the linked list, we maintain the same
-         * vertex index value from the original polygon.  In this way, we have
-         * two polygons that both share the same vertices.
-         *
-         * @return the newly created vertex in the polygon that does not include the
-         *         reference vertex.
-         */
-        Vertex* split( Vertex* b )
-        {
-            parent->m_vertices.emplace_back( i, x, y, parent );
-            Vertex* a2 = &parent->m_vertices.back();
-            parent->m_vertices.emplace_back( b->i, b->x, b->y, parent );
-            Vertex* b2 = &parent->m_vertices.back();
-            Vertex* an = next;
-            Vertex* bp = b->prev;
-
-            next = b;
-            b->prev = this;
-
-            a2->next = an;
-            an->prev = a2;
-
-            b2->next = a2;
-            a2->prev = b2;
-
-            bp->next = b2;
-            b2->prev = bp;
-
-            return b2;
-        }
-
-        /**
-         * Remove the node from the linked list and z-ordered linked list.
-         */
-        void remove()
-        {
-            next->prev = prev;
-            prev->next = next;
-
-            if( prevZ )
-                prevZ->nextZ = nextZ;
-
-            if( nextZ )
-                nextZ->prevZ = prevZ;
-
-            next = nullptr;
-            prev = nullptr;
-            nextZ = nullptr;
-            prevZ = nullptr;
-        }
-
-        void updateOrder()
-        {
-            if( !z )
-                z = parent->zOrder( x, y );
-        }
-
-        /**
-         * After inserting or changing nodes, this function should be called to
-         * remove duplicate vertices and ensure z-ordering is correct.
-         */
-        void updateList()
-        {
-            Vertex* p = next;
-
-            while( p != this )
-            {
-                /**
-                 * Remove duplicates
-                 */
-                if( *p == *p->next )
-                {
-                    p = p->prev;
-                    p->next->remove();
-
-                    if( p == p->next )
-                        break;
-                }
-
-                p->updateOrder();
-                p = p->next;
-            };
-
-            updateOrder();
-            zSort();
-        }
-
-        /**
-         * Sort all vertices in this vertex's list by their Morton code.
-         */
-        void zSort()
-        {
-            std::deque<Vertex*> queue;
-
-            queue.push_back( this );
-
-            for( auto p = next; p && p != this; p = p->next )
-                queue.push_back( p );
-
-            std::sort( queue.begin(), queue.end(), []( const Vertex* a, const Vertex* b )
-            {
-                return a->z < b->z;
-            } );
-
-            Vertex* prev_elem = nullptr;
-
-            for( auto elem : queue )
-            {
-                if( prev_elem )
-                    prev_elem->nextZ = elem;
-
-                elem->prevZ = prev_elem;
-                prev_elem = elem;
-            }
-
-            prev_elem->nextZ = nullptr;
-        }
-
-
-        /**
-         * Check to see if triangle surrounds our current vertex
-         */
-        bool inTriangle( const Vertex& a, const Vertex& b, const Vertex& c )
-        {
-            return     ( c.x - x ) * ( a.y - y ) - ( a.x - x ) * ( c.y - y ) >= 0
-                    && ( a.x - x ) * ( b.y - y ) - ( b.x - x ) * ( a.y - y ) >= 0
-                    && ( b.x - x ) * ( c.y - y ) - ( c.x - x ) * ( b.y - y ) >= 0;
-        }
-
-        const size_t i;
-        const double x;
-        const double y;
-        PolygonTriangulation* parent;
-
-        // previous and next vertices nodes in a polygon ring
-        Vertex* prev = nullptr;
-        Vertex* next = nullptr;
-
-        // z-order curve value
-        int32_t z = 0;
-
-        // previous and next nodes in z-order
-        Vertex* prevZ = nullptr;
-        Vertex* nextZ = nullptr;
-    };
 
     /**
-     * Calculate the Morton code of the Vertex
-     * http://www.graphics.stanford.edu/~seander/bithacks.html#InterleaveBMN
-     *
-     */
-    int32_t zOrder( const double aX, const double aY ) const
+     * Outputs a list of vertices that have not yet been triangulated.
+    */
+    void logRemaining()
     {
-        int32_t x = static_cast<int32_t>( 32767.0 * ( aX - m_bbox.GetX() ) / m_bbox.GetWidth() );
-        int32_t y = static_cast<int32_t>( 32767.0 * ( aY - m_bbox.GetY() ) / m_bbox.GetHeight() );
+        std::set<VERTEX*> seen;
+        wxLog::EnableLogging();
+        for( VERTEX& p : m_vertices )
+        {
+            if( !p.next || p.next == &p || seen.find( &p ) != seen.end() )
+                continue;
 
-        x = ( x | ( x << 8 ) ) & 0x00FF00FF;
-        x = ( x | ( x << 4 ) ) & 0x0F0F0F0F;
-        x = ( x | ( x << 2 ) ) & 0x33333333;
-        x = ( x | ( x << 1 ) ) & 0x55555555;
-
-        y = ( y | ( y << 8 ) ) & 0x00FF00FF;
-        y = ( y | ( y << 4 ) ) & 0x0F0F0F0F;
-        y = ( y | ( y << 2 ) ) & 0x33333333;
-        y = ( y | ( y << 1 ) ) & 0x55555555;
-
-        return x | ( y << 1 );
+            logVertices( &p, &seen );
+        }
     }
+
+    void logVertices( VERTEX* aStart, std::set<VERTEX*>* aSeen )
+    {
+        if( aSeen && aSeen->count( aStart ) )
+            return;
+
+        if( aSeen )
+            aSeen->insert( aStart );
+
+        int count = 1;
+        VERTEX* p = aStart->next;
+        wxString msg = wxString::Format( "Vertices: %d,%d,", static_cast<int>( aStart->x ),
+                                         static_cast<int>( aStart->y ) );
+
+        do
+        {
+            msg += wxString::Format( "%d,%d,", static_cast<int>( p->x ), static_cast<int>( p->y ) );
+
+            if( aSeen )
+                aSeen->insert( p );
+
+            p = p->next;
+            count++;
+        } while( p != aStart );
+
+        if( count < 3 )   // Don't log anything that only has 2 or fewer points
+            return;
+
+        msg.RemoveLast();
+        wxLogTrace( TRIANGULATE_TRACE, msg );
+    }
+
+    /**
+     * Simplify the line chain by removing points that are too close to each other.
+     * If no points are removed, it returns nullptr.
+     */
+    VERTEX* simplifyList( VERTEX* aStart )
+    {
+        if( !aStart || aStart->next == aStart->prev )
+            return aStart;
+
+        VERTEX* p = aStart;
+        VERTEX* next = p->next;
+        VERTEX* retval = aStart;
+        int     count = 0;
+
+        double sq_dist = TRIANGULATESIMPLIFICATIONLEVEL;
+        sq_dist *= sq_dist;
+
+        do
+        {
+            VECTOR2D diff = VECTOR2D( next->x - p->x, next->y - p->y );
+
+            if( diff.SquaredEuclideanNorm() < sq_dist )
+            {
+                if( next == aStart )
+                {
+                    retval = p;
+                    aStart->remove();
+                    count++;
+                    break;
+                }
+
+                next = next->next;
+                p->next->remove();
+                count++;
+                retval = p;
+            }
+            else
+            {
+                p = next;
+                next = next->next;
+            }
+        } while( p != aStart && next && p );
+
+        wxLogTrace( TRIANGULATE_TRACE, "Removed %d points in simplifyList", count );
+
+        if( count )
+            return retval;
+
+        return nullptr;
+    }
+
 
     /**
      * Iterate through the list to remove NULL triangles if they exist.
@@ -285,107 +236,71 @@ private:
      * as the NULL triangles are inserted as Steiner points to improve the
      * triangulation regularity of polygons
      */
-    Vertex* removeNullTriangles( Vertex* aStart )
+    VERTEX* removeNullTriangles( VERTEX* aStart )
     {
-        Vertex* retval = nullptr;
-        Vertex* p = aStart->next;
+        VERTEX* retval = nullptr;
+        size_t count = 0;
 
-        while( p != aStart )
+        if( ( retval = simplifyList( aStart ) ) )
+            aStart = retval;
+
+        wxASSERT( aStart->next && aStart->prev );
+
+        VERTEX* p = aStart->next;
+
+        while( p != aStart && p->next && p->prev )
         {
-            if( area( p->prev, p, p->next ) == 0.0 )
+            // We make a dummy triangle that is actually part of the existing line segment
+            // and measure its area.  This will not be exactly zero due to floating point
+            // errors.  We then look for areas that are less than 4 times the area of the
+            // dummy triangle.  For small triangles, this is a small number
+            VERTEX tmp( 0, 0.5 * ( p->prev->x + p->next->x ), 0.5 * ( p->prev->y + p->next->y ), this );
+            double null_area = 4.0 * std::abs( area( p->prev, &tmp, p->next ) );
+
+            if( *p == *( p->next ) || std::abs( area( p->prev, p, p->next ) ) <= null_area )
             {
+                // This is a spike, remove it, leaving only one point
+                if( *( p->next ) == *( p->prev ) )
+                    p->next->remove();
+
                 p = p->prev;
                 p->next->remove();
-                retval = aStart;
+                retval = p;
+                ++count;
 
                 if( p == p->next )
                     break;
+
+                // aStart was removed above, so we need to reset it
+                if( !aStart->next )
+                    aStart = p->prev;
+
+                continue;
             }
+
             p = p->next;
         };
 
+        /// We've removed all possible triangles
+        if( !p->next || p->next == p || p->next == p->prev )
+            return p;
+
         // We needed an end point above that wouldn't be removed, so
         // here we do the final check for this as a Steiner point
-        if( area( aStart->prev, aStart, aStart->next ) == 0.0 )
+        VERTEX tmp( 0, 0.5 * ( p->prev->x + p->next->x ),
+                       0.5 * ( p->prev->y + p->next->y ), this );
+        double null_area = 4.0 * std::abs( area( p->prev, &tmp, p->next ) );
+
+        if( std::abs( area( p->prev, p, p->next ) ) <= null_area )
         {
             retval = p->next;
             p->remove();
+            ++count;
         }
+
+        wxLogTrace( TRIANGULATE_TRACE, "Removed %zu NULL triangles", count );
 
         return retval;
-    }
-
-    /**
-     * Take a Clipper path and converts it into a circular, doubly-linked list for triangulation.
-     */
-    Vertex* createList( const ClipperLibKiCad::Path& aPath )
-    {
-        Vertex* tail = nullptr;
-        double sum = 0.0;
-        auto len = aPath.size();
-
-        // Check for winding order
-        for( size_t i = 0; i < len; i++ )
-        {
-            auto p1 = aPath.at( i );
-            auto p2 = aPath.at( ( i + 1 ) < len ? i + 1 : 0 );
-
-            sum += ( ( p2.X - p1.X ) * ( p2.Y + p1.Y ) );
-        }
-
-        if( sum <= 0.0 )
-        {
-            for( auto point : aPath )
-                tail = insertVertex( VECTOR2I( point.X, point.Y ), tail );
-        }
-        else
-        {
-            for( size_t i = 0; i < len; i++ )
-            {
-                auto p = aPath.at( len - i - 1 );
-                tail = insertVertex( VECTOR2I( p.X, p.Y ), tail );
-            }
-        }
-
-        if( tail && ( *tail == *tail->next ) )
-        {
-            tail->next->remove();
-        }
-
-        return tail;
-
-    }
-
-    /**
-     * Take a #SHAPE_LINE_CHAIN and links each point into a circular, doubly-linked list.
-     */
-    Vertex* createList( const SHAPE_LINE_CHAIN& points )
-    {
-        Vertex* tail = nullptr;
-        double sum = 0.0;
-
-        // Check for winding order
-        for( int i = 0; i < points.PointCount(); i++ )
-        {
-            VECTOR2D p1 = points.CPoint( i );
-            VECTOR2D p2 = points.CPoint( i + 1 );
-
-            sum += ( ( p2.x - p1.x ) * ( p2.y + p1.y ) );
-        }
-
-        if( sum > 0.0 )
-            for( int i = points.PointCount() - 1; i >= 0; i--)
-                tail = insertVertex( points.CPoint( i ), tail );
-        else
-            for( int i = 0; i < points.PointCount(); i++ )
-                tail = insertVertex( points.CPoint( i ), tail );
-
-        if( tail && ( *tail == *tail->next ) )
-        {
-            tail->next->remove();
-        }
-
-        return tail;
     }
 
     /**
@@ -401,23 +316,36 @@ private:
      * an edited file), we create a single triangle and remove both vertices before attempting
      * to.
      */
-    bool earcutList( Vertex* aPoint, int pass = 0 )
+    bool earcutList( VERTEX* aPoint, int pass = 0 )
     {
+        wxLogTrace( TRIANGULATE_TRACE, "earcutList starting at %p for pass %d", aPoint, pass );
+
         if( !aPoint )
             return true;
 
-        Vertex* stop = aPoint;
-        Vertex* prev;
-        Vertex* next;
+        VERTEX* stop = aPoint;
+        VERTEX* prev;
+        VERTEX* next;
+        int internal_pass = 1;
 
         while( aPoint->prev != aPoint->next )
         {
             prev = aPoint->prev;
             next = aPoint->next;
 
-            if( isEar( aPoint ) )
+            if( aPoint->isEar() )
             {
-                m_result.AddTriangle( prev->i, aPoint->i, next->i );
+                // Tiny ears cannot be seen on the screen
+                if( !isTooSmall( aPoint ) )
+                {
+                    m_result.AddTriangle( prev->i, aPoint->i, next->i );
+                }
+                else
+                {
+                    wxLogTrace( TRIANGULATE_TRACE, "Ignoring tiny ear with area %f",
+                                area( prev, aPoint, next ) );
+                }
+
                 aPoint->remove();
 
                 // Skip one vertex as the triangle will account for the prev node
@@ -427,12 +355,15 @@ private:
                 continue;
             }
 
-            Vertex* nextNext = next->next;
+            VERTEX* nextNext = next->next;
 
             if( *prev != *nextNext && intersects( prev, aPoint, next, nextNext ) &&
                     locallyInside( prev, nextNext ) &&
                     locallyInside( nextNext, prev ) )
             {
+                wxLogTrace( TRIANGULATE_TRACE,
+                            "Local intersection detected.  Merging minor triangle with area %f",
+                            area( prev, aPoint, nextNext ) );
                 m_result.AddTriangle( prev->i, aPoint->i, nextNext->i );
 
                 // remove two nodes involved
@@ -451,19 +382,44 @@ private:
              * We've searched the entire polygon for available ears and there are still
              * un-sliced nodes remaining.
              */
-            if( aPoint == stop )
+            if( aPoint == stop && aPoint->prev != aPoint->next )
             {
-                // First, try to remove the remaining steiner points
-                // If aPoint is a steiner, we need to re-assign both the start and stop points
-                if( auto newPoint = removeNullTriangles( aPoint ) )
+                VERTEX* newPoint;
+
+                // Removing null triangles will remove steiner points as well as colinear points
+                // that are three in a row.  Because our next step is to subdivide the polygon,
+                // we need to allow it to add the subdivided points first.  This is why we only
+                // run the RemoveNullTriangles function after the first pass.
+                if( ( internal_pass == 2 ) && ( newPoint = removeNullTriangles( aPoint ) ) )
                 {
+                    // There are no remaining triangles in the list
+                    if( newPoint->next == newPoint->prev )
+                        break;
+
                     aPoint = newPoint;
                     stop = newPoint;
                     continue;
                 }
 
+                ++internal_pass;
+
+                // This will subdivide the polygon 2 times.  The first pass will add enough points
+                // such that each edge is less than the average edge length.  If this doesn't work
+                // The next pass will remove the null triangles (above) and subdivide the polygon
+                // again, this time adding one point to each long edge (and thereby changing the locations)
+                if( internal_pass < 4 )
+                {
+                    wxLogTrace( TRIANGULATE_TRACE, "Subdividing polygon" );
+                    subdividePolygon( aPoint, internal_pass );
+                    continue;
+                }
+
                 // If we don't have any NULL triangles left, cut the polygon in two and try again
-                splitPolygon( aPoint );
+                wxLogTrace( TRIANGULATE_TRACE, "Splitting polygon" );
+
+                if( !splitPolygon( aPoint ) )
+                    return false;
+
                 break;
             }
         }
@@ -480,66 +436,81 @@ private:
         /*
          * At this point, our polygon should be fully tessellated.
          */
-        return( aPoint->prev == aPoint->next );
+        if( aPoint->prev != aPoint->next )
+            return std::abs( aPoint->area() ) > TRIANGULATEMINIMUMAREA;
+
+        return true;
+    }
+
+
+    /**
+     * Check whether a given vertex is too small to matter.
+     */
+
+    bool isTooSmall( const VERTEX* aPoint ) const
+    {
+        double min_area = TRIANGULATEMINIMUMAREA;
+        double prev_sq_len = ( aPoint->prev->x - aPoint->x ) * ( aPoint->prev->x - aPoint->x ) +
+                             ( aPoint->prev->y - aPoint->y ) * ( aPoint->prev->y - aPoint->y );
+        double next_sq_len = ( aPoint->next->x - aPoint->x ) * ( aPoint->next->x - aPoint->x ) +
+                             ( aPoint->next->y - aPoint->y ) * ( aPoint->next->y - aPoint->y );
+        double opp_sq_len = ( aPoint->next->x - aPoint->prev->x ) * ( aPoint->next->x - aPoint->prev->x ) +
+                            ( aPoint->next->y - aPoint->prev->y ) * ( aPoint->next->y - aPoint->prev->y );
+
+        return ( prev_sq_len < min_area || next_sq_len < min_area || opp_sq_len < min_area );
     }
 
     /**
-     * Check whether the given vertex is in the middle of an ear.
-     *
-     * This works by walking forward and backward in zOrder to the limits of the minimal
-     * bounding box formed around the triangle, checking whether any points are located
-     * inside the given triangle.
-     *
-     * @return true if aEar is the apex point of a ear in the polygon.
+     * Inserts a new vertex halfway between each existing pair of vertices.
      */
-    bool isEar( Vertex* aEar ) const
+    void subdividePolygon( VERTEX* aStart, int pass = 0 )
     {
-        const Vertex* a = aEar->prev;
-        const Vertex* b = aEar;
-        const Vertex* c = aEar->next;
+        VERTEX* p = aStart;
 
-        // If the area >=0, then the three points for a concave sequence
-        // with b as the reflex point
-        if( area( a, b, c ) >= 0 )
-            return false;
+        struct VertexComparator {
+            bool operator()(const std::pair<VERTEX*,double>& a, const std::pair<VERTEX*,double>& b) const {
+                return a.second > b.second;
+            }
+        };
 
-        // triangle bbox
-        const double minTX = std::min( a->x, std::min( b->x, c->x ) );
-        const double minTY = std::min( a->y, std::min( b->y, c->y ) );
-        const double maxTX = std::max( a->x, std::max( b->x, c->x ) );
-        const double maxTY = std::max( a->y, std::max( b->y, c->y ) );
+        std::set<std::pair<VERTEX*,double>, VertexComparator> longest;
+        double avg = 0.0;
 
-        // z-order range for the current triangle bounding box
-        const int32_t minZ = zOrder( minTX, minTY );
-        const int32_t maxZ = zOrder( maxTX, maxTY );
-
-        // first look for points inside the triangle in increasing z-order
-        Vertex* p = aEar->nextZ;
-
-        while( p && p->z <= maxZ )
+        do
         {
-            if( p != a && p != c
-                    && p->inTriangle( *a, *b, *c )
-                    && area( p->prev, p, p->next ) >= 0 )
-                return false;
+            double len = ( p->x - p->next->x ) * ( p->x - p->next->x ) +
+                         ( p->y - p->next->y ) * ( p->y - p->next->y );
+            longest.emplace( p, len );
 
-            p = p->nextZ;
+            avg += len;
+            p = p->next;
+        } while (p != aStart);
+
+        avg /= longest.size();
+        wxLogTrace( TRIANGULATE_TRACE, "Average length: %f", avg );
+
+        for( auto it = longest.begin(); it != longest.end() && it->second > avg; ++it )
+        {
+            wxLogTrace( TRIANGULATE_TRACE, "Subdividing edge with length %f", it->second );
+            VERTEX* a = it->first;
+            VERTEX* b = a->next;
+            VERTEX* last = a;
+
+            // We adjust the number of divisions based on the pass in order to progressively
+            // subdivide the polygon when triangulation fails
+            int divisions = avg / it->second + 2 + pass;
+            double step = 1.0 / divisions;
+
+            for( int i = 1; i < divisions; i++ )
+            {
+                double x = a->x * ( 1.0 - step * i ) + b->x * ( step * i );
+                double y = a->y * ( 1.0 - step * i ) + b->y * ( step * i );
+                last = insertTriVertex( VECTOR2I( x, y ), last );
+            }
         }
 
-        // then look for points in decreasing z-order
-        p = aEar->prevZ;
-
-        while( p && p->z >= minZ )
-        {
-            if( p != a && p != c
-                    && p->inTriangle( *a, *b, *c )
-                    && area( p->prev, p, p->next ) >= 0 )
-                return false;
-
-            p = p->prevZ;
-        }
-
-        return true;
+        // update z-order of the vertices
+        aStart->updateList();
     }
 
     /**
@@ -548,27 +519,90 @@ private:
      * independently.  This is assured to generate at least one new ear if the
      * split is successful
      */
-    void splitPolygon( Vertex* start )
+    bool splitPolygon( VERTEX* start )
     {
-        Vertex* origPoly = start;
+        VERTEX* origPoly = start;
 
+        // If we have fewer than 4 points, we cannot split the polygon
+        if( !start || !start->next || start->next == start->prev
+            || start->next->next == start->prev )
+        {
+            return true;
+        }
+
+        // Our first attempts to split the polygon will be at overlapping points.
+        // These are natural split points and we only need to switch the loop directions
+        // to generate two new loops.  Since they are overlapping, we are do not
+        // need to create a new segment to disconnect the two loops.
         do
         {
-            Vertex* marker = origPoly->next->next;
+            std::vector<VERTEX*> overlapPoints;
+            VERTEX* z_pt = origPoly;
+
+            while ( z_pt->prevZ && *z_pt->prevZ == *origPoly )
+                z_pt = z_pt->prevZ;
+
+            overlapPoints.push_back( z_pt );
+
+            while( z_pt->nextZ && *z_pt->nextZ == *origPoly )
+            {
+                z_pt = z_pt->nextZ;
+                overlapPoints.push_back( z_pt );
+            }
+
+            if( overlapPoints.size() != 2 || overlapPoints[0]->next == overlapPoints[1]
+                || overlapPoints[0]->prev == overlapPoints[1] )
+            {
+                origPoly = origPoly->next;
+                continue;
+            }
+
+            if( overlapPoints[0]->area( overlapPoints[1] ) < 0 || overlapPoints[1]->area( overlapPoints[0] ) < 0 )
+            {
+                wxLogTrace( TRIANGULATE_TRACE, "Split generated a hole, skipping" );
+                origPoly = origPoly->next;
+                continue;
+            }
+
+            wxLogTrace( TRIANGULATE_TRACE, "Splitting at overlap point %f, %f", overlapPoints[0]->x, overlapPoints[0]->y );
+            std::swap( overlapPoints[0]->next, overlapPoints[1]->next );
+            overlapPoints[0]->next->prev = overlapPoints[0];
+            overlapPoints[1]->next->prev = overlapPoints[1];
+
+            overlapPoints[0]->updateList();
+            overlapPoints[1]->updateList();
+            logVertices( overlapPoints[0], nullptr );
+            logVertices( overlapPoints[1], nullptr );
+            bool retval = earcutList( overlapPoints[0] ) && earcutList( overlapPoints[1] );
+
+            wxLogTrace( TRIANGULATE_TRACE, "%s at first overlap split", retval ? "Success" : "Failed" );
+            return retval;
+
+
+        } while ( origPoly != start );
+
+        // If we've made it through the split algorithm and we still haven't found a
+        // set of overlapping points, we need to create a new segment to split the polygon
+        // into two separate polygons.  We do this by finding the two vertices that form
+        // a valid line (does not cross the existing polygon)
+        do
+        {
+            VERTEX* marker = origPoly->next->next;
 
             while( marker != origPoly->prev )
             {
                 // Find a diagonal line that is wholly enclosed by the polygon interior
-                if( origPoly->i != marker->i && goodSplit( origPoly, marker ) )
+                if( origPoly->next && origPoly->i != marker->i && goodSplit( origPoly, marker ) )
                 {
-                    Vertex* newPoly = origPoly->split( marker );
+                    VERTEX* newPoly = origPoly->split( marker );
 
                     origPoly->updateList();
                     newPoly->updateList();
 
-                    earcutList( origPoly );
-                    earcutList( newPoly );
-                    return;
+                    bool retval = earcutList( origPoly ) && earcutList( newPoly );
+
+                    wxLogTrace( TRIANGULATE_TRACE, "%s at split", retval ? "Success" : "Failed" );
+                    return retval;
                 }
 
                 marker = marker->next;
@@ -576,30 +610,49 @@ private:
 
             origPoly = origPoly->next;
         } while( origPoly != start );
+
+        wxLogTrace( TRIANGULATE_TRACE, "Could not find a valid split point" );
+        return false;
     }
 
     /**
      * Check if a segment joining two vertices lies fully inside the polygon.
      * To do this, we first ensure that the line isn't along the polygon edge.
      * Next, we know that if the line doesn't intersect the polygon, then it is
-     * either fully inside or fully outside the polygon.  Finally, by checking whether
-     * the segment is enclosed by the local triangles, we distinguish between
-     * these two cases and no further checks are needed.
+     * either fully inside or fully outside the polygon.  Next, we ensure that
+     * the proposed split is inside the local area of the polygon at both ends
+     * and the midpoint. Finally, we check to split creates two new polygons,
+     * each with positive area.
      */
-    bool goodSplit( const Vertex* a, const Vertex* b ) const
+    bool goodSplit( const VERTEX* a, const VERTEX* b ) const
     {
-        return a->next->i != b->i &&
-               a->prev->i != b->i &&
-               !intersectsPolygon( a, b ) &&
-               locallyInside( a, b );
+        bool a_on_edge = ( a->nextZ && *a == *a->nextZ ) || ( a->prevZ && *a == *a->prevZ );
+        bool b_on_edge = ( b->nextZ && *b == *b->nextZ ) || ( b->prevZ && *b == *b->prevZ );
+        bool no_intersect = a->next->i != b->i && a->prev->i != b->i && !intersectsPolygon( a, b );
+        bool local_split = locallyInside( a, b ) && locallyInside( b, a ) && middleInside( a, b );
+        bool same_dir = area( a->prev, a, b->prev ) != 0.0 || area( a, b->prev, b ) != 0.0;
+        bool has_len = ( *a == *b ) && area( a->prev, a, a->next ) > 0 && area( b->prev, b, b->next ) > 0;
+        bool pos_area = a->area( b ) > 0 && b->area( a ) > 0;
+
+        return no_intersect && local_split && ( same_dir || has_len ) && !a_on_edge && !b_on_edge && pos_area;
+
+    }
+
+
+    constexpr int sign( double aVal ) const
+    {
+        return ( aVal > 0 ) - ( aVal < 0 );
     }
 
     /**
-     * Return the twice the signed area of the triangle formed by vertices p, q, and r.
-     */
-    double area( const Vertex* p, const Vertex* q, const Vertex* r ) const
+     * If p, q, and r are collinear and r lies between p and q, then return true.
+    */
+    constexpr bool overlapping( const VERTEX* p, const VERTEX* q, const VERTEX* r ) const
     {
-        return ( q->y - p->y ) * ( r->x - q->x ) - ( q->x - p->x ) * ( r->y - q->y );
+        return q->x <= std::max( p->x, r->x ) &&
+               q->x >= std::min( p->x, r->x ) &&
+               q->y <= std::max( p->y, r->y ) &&
+               q->y >= std::min( p->y, r->y );
     }
 
     /**
@@ -607,13 +660,30 @@ private:
      *
      * @return true if p1-p2 intersects q1-q2.
      */
-    bool intersects( const Vertex* p1, const Vertex* q1, const Vertex* p2, const Vertex* q2 ) const
+    bool intersects( const VERTEX* p1, const VERTEX* q1, const VERTEX* p2, const VERTEX* q2 ) const
     {
-        if( ( *p1 == *q1 && *p2 == *q2 ) || ( *p1 == *q2 && *p2 == *q1 ) )
+        int sign1 = sign( area( p1, q1, p2 ) );
+        int sign2 = sign( area( p1, q1, q2 ) );
+        int sign3 = sign( area( p2, q2, p1 ) );
+        int sign4 = sign( area( p2, q2, q1 ) );
+
+        if( sign1 != sign2 && sign3 != sign4 )
             return true;
 
-        return ( area( p1, q1, p2 ) > 0 ) != ( area( p1, q1, q2 ) > 0 )
-                && ( area( p2, q2, p1 ) > 0 ) != ( area( p2, q2, q1 ) > 0 );
+        if( sign1 == 0 && overlapping( p1, p2, q1 ) )
+            return true;
+
+        if( sign2 == 0 && overlapping( p1, q2, q1 ) )
+            return true;
+
+        if( sign3 == 0 && overlapping( p2, p1, q2 ) )
+            return true;
+
+        if( sign4 == 0 && overlapping( p2, q1, q2 ) )
+            return true;
+
+
+        return false;
     }
 
     /**
@@ -622,39 +692,21 @@ private:
      *
      * @return true if the segment intersects the edge of the polygon.
      */
-    bool intersectsPolygon( const Vertex* a, const Vertex* b ) const
+    bool intersectsPolygon( const VERTEX* a, const VERTEX* b ) const
     {
-        const Vertex* p = a->next;
-
-        do
+        for( size_t ii = 0; ii < m_vertices_original_size; ii++ )
         {
-            if( p->i != a->i &&
-                p->next->i != a->i &&
-                p->i != b->i &&
-                p->next->i != b->i && intersects( p, p->next, a, b ) )
-                return true;
+            const VERTEX* p = &m_vertices[ii];
+            const VERTEX* q = &m_vertices[( ii + 1 ) % m_vertices_original_size];
 
-            p = p->next;
-        } while( p != a );
+            if( p->i == a->i || p->i == b->i || q->i == a->i || q->i == b->i )
+                continue;
+
+            if( intersects( p, q, a, b ) )
+                return true;
+        }
 
         return false;
-    }
-
-    /**
-     * Check whether the segment from vertex a -> vertex b is inside the polygon
-     * around the immediate area of vertex a.
-     *
-     * We don't define the exact area over which the segment is inside but it is guaranteed to
-     * be inside the polygon immediately adjacent to vertex a.
-     *
-     * @return true if the segment from a->b is inside a's polygon next to vertex a.
-     */
-    bool locallyInside( const Vertex* a, const Vertex* b ) const
-    {
-        if( area( a->prev, a, a->next ) < 0 )
-            return area( a, b, a->next ) >= 0 && area( a, a->prev, b ) >= 0;
-        else
-            return area( a, b, a->prev ) < 0 || area( a, a->next, b ) < 0;
     }
 
     /**
@@ -663,31 +715,14 @@ private:
      *
      * @return a pointer to the newly created vertex.
      */
-    Vertex* insertVertex( const VECTOR2I& pt, Vertex* last )
+    VERTEX* insertTriVertex( const VECTOR2I& pt, VERTEX* last )
     {
         m_result.AddVertex( pt );
-        m_vertices.emplace_back( m_result.GetVertexCount() - 1, pt.x, pt.y, this );
-
-        Vertex* p = &m_vertices.back();
-
-        if( !last )
-        {
-            p->prev = p;
-            p->next = p;
-        }
-        else
-        {
-            p->next = last->next;
-            p->prev = last;
-            last->next->prev = p;
-            last->next = p;
-        }
-        return p;
+        return insertVertex( m_result.GetVertexCount() - 1, pt, nullptr );
     }
 
 private:
-    BOX2I                                 m_bbox;
-    std::deque<Vertex>                    m_vertices;
+    size_t                                m_vertices_original_size;
     SHAPE_POLY_SET::TRIANGULATED_POLYGON& m_result;
 };
 

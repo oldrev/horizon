@@ -267,7 +267,7 @@ ToolResponse ToolRouteTrackInteractive::begin(const ToolArgs &args)
         highlights.emplace(ObjectType::NET, net->uuid);
         imp->update_highlights();
 
-        wrapper->m_startItem = router->GetWorld()->FindItemByParent(parent, iface->get_net_code(net->uuid));
+        wrapper->m_startItem = router->GetWorld()->FindItemByParent(parent);
 
         wrapper->settings.SetMode(PNS::RM_Shove);
         router->LoadSettings(&wrapper->settings);
@@ -283,14 +283,14 @@ ToolResponse ToolRouteTrackInteractive::begin(const ToolArgs &args)
             return ToolResponse::end();
         }
         auto parent = iface->get_parent(track);
-        wrapper->m_startItem = router->GetWorld()->FindItemByParent(parent, iface->get_net_code(track->net.uuid));
+        wrapper->m_startItem = router->GetWorld()->FindItemByParent(parent);
         VECTOR2I p0(args.coords.x, args.coords.y);
         if (!router->StartRouting(p0, wrapper->m_startItem, 0))
             return ToolResponse::end();
         meander_placer = dynamic_cast<PNS::MEANDER_PLACER_BASE *>(router->Placer());
         if (auto ref = imp->get_length_tuning_ref()) {
             PNS::MEANDER_SETTINGS meander_settings = meander_placer->MeanderSettings();
-            meander_settings.m_targetLength = ref;
+            meander_settings.m_targetLength.SetOpt(ref);
             meander_placer->UpdateSettings(meander_settings);
         }
         router->Move(p0, NULL);
@@ -333,12 +333,12 @@ PNS::ITEM *ToolWrapper::pickSingleItem(const VECTOR2I &aWhere, int aNet, int aLa
                 continue;
         }
 
-        if (aNet <= 0 || item->Net() == aNet) {
+        if (aNet <= 0 || tool->iface->GetNetCode(item->Net()) == aNet) {
             if (item->OfKind(PNS::ITEM::VIA_T | PNS::ITEM::SOLID_T)) {
                 // if (item->OfKind(PNS::ITEM::SOLID_T) && aIgnorePads)
                 //     continue;
 
-                SEG::ecoord d = (item->Shape()->Centre() - aWhere).SquaredEuclideanNorm();
+                SEG::ecoord d = (item->Shape(tl)->Centre() - aWhere).SquaredEuclideanNorm();
 
                 if (d < dist[2]) {
                     prioritized[2] = item;
@@ -490,7 +490,7 @@ const VECTOR2I ToolWrapper::snapToItem(bool aEnabled, PNS::ITEM *aItem, VECTOR2I
         }
         else if (aItem->Kind() == PNS::ITEM::ARC_T) {
             PNS::ARC *arc = static_cast<PNS::ARC *>(li);
-            return AlignToArc(snapped_v, *static_cast<const SHAPE_ARC *>(arc->Shape()));
+            return AlignToArc(snapped_v, *static_cast<const SHAPE_ARC *>(arc->Shape(arc->Layer())));
         }
 
         break;
@@ -538,7 +538,7 @@ int ToolWrapper::getStartLayer()
     int tl = PNS::PNS_HORIZON_IFACE::layer_to_router(wl);
 
     if (m_startItem) {
-        const LAYER_RANGE &ls = m_startItem->Layers();
+        const PNS_LAYER_RANGE &ls = m_startItem->Layers();
 
         if (ls.Overlaps(tl))
             return tl;
@@ -566,22 +566,22 @@ const PNS::PNS_HORIZON_PARENT_ITEM *inheritTrackWidth(PNS::ITEM *aItem)
         break;
 
     case ITEM::SEGMENT_T:
-        return static_cast<SEGMENT *>(aItem)->Parent();
+        return static_cast<const PNS::PNS_HORIZON_PARENT_ITEM *>(static_cast<SEGMENT *>(aItem)->Parent());
 
     case ITEM::ARC_T:
-        return static_cast<ARC *>(aItem)->Parent();
+        return static_cast<const PNS::PNS_HORIZON_PARENT_ITEM *>(static_cast<ARC *>(aItem)->Parent());
 
     default:
         return 0;
     }
 
-    JOINT *jt = static_cast<NODE *>(aItem->Owner())->FindJoint(p, aItem);
+    const JOINT *jt = static_cast<const NODE *>(aItem->Owner())->FindJoint(p, aItem);
 
     assert(jt != NULL);
 
     int mval = INT_MAX;
 
-    ITEM_SET linkedSegs = jt->Links();
+    ITEM_SET linkedSegs = jt->CLinks();
     linkedSegs.ExcludeItem(aItem).FilterKinds(ITEM::SEGMENT_T);
 
     const PNS::PNS_HORIZON_PARENT_ITEM *parent = 0;
@@ -589,7 +589,7 @@ const PNS::PNS_HORIZON_PARENT_ITEM *inheritTrackWidth(PNS::ITEM *aItem)
     for (ITEM *item : linkedSegs.Items()) {
         int w = static_cast<SEGMENT *>(item)->Width();
         if (w < mval) {
-            parent = item->Parent();
+            parent = static_cast<const PNS::PNS_HORIZON_PARENT_ITEM *>(item->Parent());
             mval = w;
         }
         mval = std::min(w, mval);
@@ -734,10 +734,10 @@ void ToolWrapper::updateEndItem(const ToolArgs &args)
 
     PNS::ITEM *endItem = nullptr;
 
-    std::vector<int> nets = tool->router->GetCurrentNets();
+    auto nets = tool->router->GetCurrentNets();
 
-    for (int net : nets) {
-        endItem = pickSingleItem(p, net, layer);
+    for (auto net : nets) {
+        endItem = pickSingleItem(p, tool->iface->GetNetCode(net), layer);
 
         if (endItem)
             break;
@@ -781,7 +781,7 @@ ToolResponse ToolRouteTrackInteractive::update(const ToolArgs &args)
         else if (args.type == ToolEventType::ACTION) {
             if ((args.action == InToolActionID::LMB) || (is_transient && args.action == InToolActionID::LMB_RELEASE)) {
                 wrapper->updateEndItem(args);
-                if (router->FixRoute(wrapper->m_endSnapPoint, wrapper->m_endItem)) {
+                if (router->FixRoute(wrapper->m_endSnapPoint, wrapper->m_endItem, false, false)) {
                     router->StopRouting();
                     imp->canvas_update();
                     return ToolResponse::commit();
@@ -802,7 +802,7 @@ ToolResponse ToolRouteTrackInteractive::update(const ToolArgs &args)
 
             switch (args.action) {
             case InToolActionID::LMB:
-                if (router->FixRoute(VECTOR2I(args.coords.x, args.coords.y), NULL)) {
+                if (router->FixRoute(VECTOR2I(args.coords.x, args.coords.y), NULL, false, false)) {
                     router->StopRouting();
                     return ToolResponse::commit();
                 }
@@ -813,8 +813,8 @@ ToolResponse ToolRouteTrackInteractive::update(const ToolArgs &args)
                 return ToolResponse::revert();
 
             case InToolActionID::LENGTH_TUNING_LENGTH: {
-                if (auto r = imp->dialogs.ask_datum("Target length", meander_settings.m_targetLength)) {
-                    meander_settings.m_targetLength = *r;
+                if (auto r = imp->dialogs.ask_datum("Target length", meander_settings.m_targetLength.Opt())) {
+                    meander_settings.m_targetLength.SetOpt(*r);
                     meander_placer->UpdateSettings(meander_settings);
                     router->Move(VECTOR2I(args.coords.x, args.coords.y), NULL);
                 }
@@ -831,8 +831,7 @@ ToolResponse ToolRouteTrackInteractive::update(const ToolArgs &args)
                 }
                 meander_placer->SpacingStep(dir);
                 imp->tool_bar_flash_replace("Meander spacing: "
-                                            + dim_to_string(meander_placer->MeanderSettings().m_spacing) + " <i>"
-                                            + meander_placer->TuningInfo(EDA_UNITS::MILLIMETRES) + "</i>");
+                                            + dim_to_string(meander_placer->MeanderSettings().m_spacing));
                 router->Move(VECTOR2I(args.coords.x, args.coords.y), NULL);
             } break;
 
@@ -847,8 +846,7 @@ ToolResponse ToolRouteTrackInteractive::update(const ToolArgs &args)
                 }
                 meander_placer->AmplitudeStep(dir);
                 imp->tool_bar_flash_replace("Meander amplitude: "
-                                            + dim_to_string(meander_placer->MeanderSettings().m_maxAmplitude) + " <i>"
-                                            + meander_placer->TuningInfo(EDA_UNITS::MILLIMETRES) + "</i>");
+                                            + dim_to_string(meander_placer->MeanderSettings().m_maxAmplitude));
                 router->Move(VECTOR2I(args.coords.x, args.coords.y), NULL);
             } break;
 
@@ -924,7 +922,7 @@ ToolResponse ToolRouteTrackInteractive::update(const ToolArgs &args)
                     const bool was_placing_via = router->IsPlacingVia();
                     const bool force_finish = args.action == InToolActionID::LMB_DOUBLE;
 
-                    if (router->FixRoute(wrapper->m_endSnapPoint, wrapper->m_endItem, force_finish) || force_finish) {
+                    if (router->FixRoute(wrapper->m_endSnapPoint, wrapper->m_endItem, force_finish, false) || force_finish) {
                         router->CommitRouting();
                         router->StopRouting();
                         imp->canvas_update();
@@ -1142,7 +1140,7 @@ void ToolRouteTrackInteractive::update_via_settings()
         vps = via_def.parameters;
         auto defcode = iface->get_via_definition_code(via_definition_uuid);
         sizes.SetViaDefinition(defcode);
-        sizes.SetViaType(VIATYPE::BLIND_BURIED);
+        sizes.SetViaType(VIATYPE::BLIND);
         sizes.ClearLayerPairs();
         sizes.AddLayerPair(PNS::PNS_HORIZON_IFACE::layer_to_router(via_def.span.start()),
                            PNS::PNS_HORIZON_IFACE::layer_to_router(via_def.span.end()));
@@ -1188,7 +1186,7 @@ void ToolRouteTrackInteractive::update_tip()
                      "amplitude"},
                     {InToolActionID::LENGTH_TUNING_SPACING_DEC, InToolActionID::LENGTH_TUNING_SPACING_INC, "spacing"},
             });
-            imp->tool_bar_set_tip(meander_placer->TuningInfo(EDA_UNITS::MILLIMETRES));
+            imp->tool_bar_set_tip("");
         }
         return;
     }

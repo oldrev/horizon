@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -33,7 +33,7 @@ ROUTING_SETTINGS& ALGO_BASE::Settings() const
 
 LOGGER* ALGO_BASE::Logger()
 {
-    return nullptr;
+    return m_logger;
 }
 
 

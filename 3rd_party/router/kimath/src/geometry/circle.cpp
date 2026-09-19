@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2021 Roberto Fernandez Bautista <roberto.fer.bau@gmail.com>
- * Copyright (C) 2021-2022 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * This program is free software: you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -113,7 +113,7 @@ CIRCLE& CIRCLE::ConstructFromTanTanPt( const SEG& aLineA, const SEG& aLineB, con
         // In this code, the prefix "h" denotes "the homothetic image"
         OPT_VECTOR2I intersectCalc = aLineA.IntersectLines( aLineB );
         wxCHECK_MSG( intersectCalc, *this, wxT( "Lines do not intersect but are not parallel?" ) );
-        intersectPoint = intersectCalc.value();
+        intersectPoint = *intersectCalc;
 
         if( aP == intersectPoint )
         {
@@ -149,7 +149,7 @@ CIRCLE& CIRCLE::ConstructFromTanTanPt( const SEG& aLineA, const SEG& aLineB, con
         VECTOR2I hTanLineB = aLineB.LineProject( hSolution.Center );
 
         // To minimise errors, use the furthest away tangent point from aP
-        if( ( hTanLineA - aP ).EuclideanNorm() > ( hTanLineB - aP ).EuclideanNorm() )
+        if( ( hTanLineA - aP ).SquaredEuclideanNorm() > ( hTanLineB - aP ).SquaredEuclideanNorm() )
         {
             // Find the tangent at line A by homothetic inversion
             SEG          hT( hTanLineA, hSelected );
@@ -157,11 +157,11 @@ CIRCLE& CIRCLE::ConstructFromTanTanPt( const SEG& aLineA, const SEG& aLineB, con
             wxCHECK_MSG( actTanA, *this, wxT( "No solutions exist!" ) );
 
             // Find circle center by perpendicular intersection with the angle bisector
-            SEG          perpendicularToTanA = aLineA.PerpendicularSeg( actTanA.value() );
+            SEG          perpendicularToTanA = aLineA.PerpendicularSeg( *actTanA );
             OPT_VECTOR2I actCenter = perpendicularToTanA.IntersectLines( anglebisector );
             wxCHECK_MSG( actCenter, *this, wxT( "No solutions exist!" ) );
 
-            Center = actCenter.value();
+            Center = *actCenter;
             Radius = aLineA.LineDistance( Center );
         }
         else
@@ -172,11 +172,11 @@ CIRCLE& CIRCLE::ConstructFromTanTanPt( const SEG& aLineA, const SEG& aLineB, con
             wxCHECK_MSG( actTanB, *this, wxT( "No solutions exist!" ) );
 
             // Find circle center by perpendicular intersection with the angle bisector
-            SEG          perpendicularToTanB = aLineB.PerpendicularSeg( actTanB.value() );
+            SEG          perpendicularToTanB = aLineB.PerpendicularSeg( *actTanB );
             OPT_VECTOR2I actCenter = perpendicularToTanB.IntersectLines( anglebisector );
             wxCHECK_MSG( actCenter, *this, wxT( "No solutions exist!" ) );
 
-            Center = actCenter.value();
+            Center = *actCenter;
             Radius = aLineB.LineDistance( Center );
         }
     }
@@ -187,7 +187,7 @@ CIRCLE& CIRCLE::ConstructFromTanTanPt( const SEG& aLineA, const SEG& aLineB, con
 
 bool CIRCLE::Contains( const VECTOR2I& aP ) const
 {
-    int distance = ( aP - Center ).EuclideanNorm();
+    int64_t distance = ( VECTOR2L( aP ) - Center ).EuclideanNorm();
 
     return distance <= ( (int64_t) Radius + SHAPE::MIN_PRECISION_IU )
            && distance >= ( (int64_t) Radius - SHAPE::MIN_PRECISION_IU );
@@ -201,6 +201,40 @@ VECTOR2I CIRCLE::NearestPoint( const VECTOR2I& aP ) const
     // Handle special case where aP is equal to this circle's center
     if( vec.x == 0 && vec.y == 0 )
         vec.x = 1; // Arbitrary, to ensure the return value is always on the circumference
+
+    return vec.Resize( Radius ) + Center;
+}
+
+
+VECTOR2D CIRCLE::NearestPoint( const VECTOR2D& aP ) const
+{
+    VECTOR2D vec = aP - Center;
+
+    // Handle special case where aP is equal to this circle's center
+    if( vec.x == 0 && vec.y == 0 )
+        vec.x = 1; // Arbitrary, to ensure the return value is always on the circumference
+
+    return vec.Resize( Radius ) + Center;
+}
+
+
+VECTOR2I CIRCLE::FurthestPoint( const VECTOR2I& aP ) const
+{
+    VECTOR2I vec = Center - aP;
+
+    if( vec.x == 0 && vec.y == 0 )
+        vec.x = 1;
+
+    return vec.Resize( Radius ) + Center;
+}
+
+
+VECTOR2D CIRCLE::FurthestPoint( const VECTOR2D& aP ) const
+{
+    VECTOR2D vec = Center - aP;
+
+    if( vec.x == 0 && vec.y == 0 )
+        vec.x = 1;
 
     return vec.Resize( Radius ) + Center;
 }
@@ -231,7 +265,7 @@ std::vector<VECTOR2I> CIRCLE::Intersect( const CIRCLE& aCircle ) const
 
     std::vector<VECTOR2I> retval;
 
-    VECTOR2I vecCtoC = aCircle.Center - Center;
+    VECTOR2L vecCtoC = VECTOR2L( aCircle.Center ) - Center;
     int64_t  d = vecCtoC.EuclideanNorm();
     int64_t  r1 = Radius;
     int64_t  r2 = aCircle.Radius;
@@ -253,16 +287,16 @@ std::vector<VECTOR2I> CIRCLE::Intersect( const CIRCLE& aCircle ) const
     int64_t y = KiROUND( sqrt( r1sqMinusXsq ) );
 
     // Now correct back to original coordinates
-    double   rotAngle = vecCtoC.Angle();
-    VECTOR2I solution1( x, y );
-    solution1 = solution1.Rotate( rotAngle );
+    EDA_ANGLE rotAngle( vecCtoC );
+    VECTOR2I  solution1( x, y );
+    RotatePoint( solution1, -rotAngle );
     solution1 += Center;
     retval.push_back( solution1 );
 
     if( y != 0 )
     {
         VECTOR2I solution2( x, -y );
-        solution2 = solution2.Rotate( rotAngle );
+        RotatePoint( solution2, -rotAngle );
         solution2 += Center;
         retval.push_back( solution2 );
     }
@@ -312,7 +346,7 @@ std::vector<VECTOR2I> CIRCLE::IntersectLine( const SEG& aLine ) const
     //
 
     VECTOR2I m = aLine.LineProject( Center );    // O projected perpendicularly to the line
-    int64_t  omDist = ( m - Center ).EuclideanNorm();
+    int64_t  omDist = ( VECTOR2L( m ) - Center ).EuclideanNorm();
 
     if( omDist > ( (int64_t) Radius + SHAPE::MIN_PRECISION_IU ) )
     {

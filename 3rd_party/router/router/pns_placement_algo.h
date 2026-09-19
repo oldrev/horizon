@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -78,7 +78,7 @@ public:
      */
     virtual bool FixRoute( const VECTOR2I& aP, ITEM* aEndItem, bool aForceFinish = false ) = 0;
 
-    virtual bool UnfixRoute() { return false; };
+    virtual std::optional<VECTOR2I> UnfixRoute() { return std::nullopt; };
 
     virtual bool CommitPlacement() { return false; };
 
@@ -124,6 +124,13 @@ public:
     virtual const ITEM_SET Traces() = 0;
 
     /**
+     * Function CurrentStart()
+     *
+     * Returns the current start of the line(s) being placed/tuned.
+     */
+    virtual const VECTOR2I& CurrentStart() const = 0;
+
+    /**
      * Function CurrentEnd()
      *
      * Returns the current end of the line(s) being placed/tuned. It may not be equal
@@ -134,9 +141,9 @@ public:
     /**
      * Function CurrentNets()
      *
-     * Returns the net code(s) of currently routed track(s).
+     * Returns the net(s) of currently routed track(s).
      */
-    virtual const std::vector<int> CurrentNets() const = 0;
+    virtual const std::vector<NET_HANDLE> CurrentNets() const = 0;
 
     /**
      * Function CurrentLayer()
@@ -186,13 +193,11 @@ public:
     /**
      * Function GetModifiedNets
      *
-     * Returns the net codes of all currently routed trace(s)
+     * Returns the nets of all currently routed trace(s)
      */
-    virtual void GetModifiedNets( std::vector<int> &aNets ) const
+    virtual void GetModifiedNets( std::vector<NET_HANDLE> &aNets ) const
     {
     }
-
-    
 };
 
 }

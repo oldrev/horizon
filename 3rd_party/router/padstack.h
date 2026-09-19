@@ -1,0 +1,16 @@
+#pragma once
+
+enum class UNCONNECTED_LAYER_MODE
+{
+    KEEP_ALL,
+    REMOVE_ALL,
+    START_END_ONLY
+};
+
+enum class PAD_DRILL_POST_MACHINING_MODE
+{
+    UNKNOWN,
+    NOT_POST_MACHINED,
+    COUNTERBORE,
+    COUNTERSINK
+};

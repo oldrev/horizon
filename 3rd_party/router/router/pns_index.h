@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2020 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -31,6 +31,7 @@
 #include <geometry/shape_index.h>
 
 #include "pns_item.h"
+#include "pns_node.h"
 
 namespace PNS {
 
@@ -97,7 +98,7 @@ public:
     /**
      * Returns list of all items in a given net.
      */
-    NET_ITEMS_LIST* GetItemsForNet( int aNet );
+    NET_ITEMS_LIST* GetItemsForNet( NET_HANDLE aNet );
 
     /**
      * Function Contains()
@@ -122,9 +123,9 @@ private:
     int querySingle( std::size_t aIndex, const SHAPE* aShape, int aMinDistance, Visitor& aVisitor ) const;
 
 private:
-    std::deque<ITEM_SHAPE_INDEX>  m_subIndices;
-    std::map<int, NET_ITEMS_LIST> m_netMap;
-    ITEM_SET                      m_allItems;
+    std::deque<std::unique_ptr<ITEM_SHAPE_INDEX>> m_subIndices;
+    std::map<NET_HANDLE, NET_ITEMS_LIST> m_netMap;
+    ITEM_SET                             m_allItems;
 };
 
 
@@ -134,7 +135,8 @@ int INDEX::querySingle( std::size_t aIndex, const SHAPE* aShape, int aMinDistanc
     if( aIndex >= m_subIndices.size() )
         return 0;
 
-    return m_subIndices[aIndex].Query( aShape, aMinDistance, aVisitor);
+    LAYER_CONTEXT_SETTER layerContext( aVisitor, aIndex );
+    return m_subIndices[aIndex]->Query( aShape, aMinDistance, aVisitor);
 }
 
 template<class Visitor>
@@ -142,10 +144,17 @@ int INDEX::Query( const ITEM* aItem, int aMinDistance, Visitor& aVisitor ) const
 {
     int total = 0;
 
-    const LAYER_RANGE& layers = aItem->Layers();
+    wxCHECK( aItem->Kind() != ITEM::INVALID_T, 0 );
+
+    const PNS_LAYER_RANGE& layers = aItem->Layers();
 
     for( int i = layers.Start(); i <= layers.End(); ++i )
-        total += querySingle( i, aItem->Shape(), aMinDistance, aVisitor );
+    {
+        const SHAPE* shape = aItem->Shape( i );
+
+        if( shape )
+            total += querySingle( i, shape, aMinDistance, aVisitor );
+    }
 
     return total;
 }

@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -19,8 +19,8 @@
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef __PNS_SEGMENT_H
-#define __PNS_SEGMENT_H
+#ifndef PNS_SEGMENT_H
+#define PNS_SEGMENT_H
 
 #include <math/vector2d.h>
 
@@ -42,7 +42,7 @@ public:
         LINKED_ITEM( SEGMENT_T )
     {}
 
-    SEGMENT( const SEG& aSeg, int aNet ) :
+    SEGMENT( const SEG& aSeg, NET_HANDLE aNet ) :
         LINKED_ITEM( SEGMENT_T ),
         m_seg( aSeg, 0 )
     {
@@ -53,10 +53,19 @@ public:
         LINKED_ITEM( SEGMENT_T ),
         m_seg( aSeg, aParentLine.Width() )
     {
+        m_parent = nullptr;
+        m_sourceItem = aParentLine.GetSourceItem();
+
         m_net = aParentLine.Net();
         m_layers = aParentLine.Layers();
         m_marker = aParentLine.Marker();
         m_rank = aParentLine.Rank();
+    }
+
+    explicit SEGMENT( const LINKED_ITEM& aParent ) :
+        LINKED_ITEM( aParent )
+    {
+        assert( aParent.Kind() == SEGMENT_T );
     }
 
     static inline bool ClassOf( const ITEM* aItem )
@@ -66,7 +75,7 @@ public:
 
     SEGMENT* Clone() const override;
 
-    const SHAPE* Shape() const override
+    const SHAPE* Shape( int aLayer ) const override
     {
         return static_cast<const SHAPE*>( &m_seg );
     }
@@ -102,7 +111,8 @@ public:
         m_seg.SetSeg( SEG (tmp.B , tmp.A ) );
     }
 
-    const SHAPE_LINE_CHAIN Hull( int aClearance, int aWalkaroundThickness, int aLayer = -1 ) const override;
+    const SHAPE_LINE_CHAIN Hull( int aClearance, int aWalkaroundThickness,
+                                 int aLayer = -1 ) const override;
 
     virtual VECTOR2I Anchor( int n ) const override
     {
@@ -115,6 +125,13 @@ public:
     virtual int AnchorCount() const override
     {
         return 2;
+    }
+
+    virtual const std::string Format() const override;
+
+    void SetShape( const SHAPE_SEGMENT& aShape )
+    {
+        m_seg = aShape;
     }
 
 private:

@@ -1,7 +1,7 @@
 /*
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
- * Copyright (C) 2020 KiCad Developers, see change_log.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -45,10 +45,10 @@ public:
     bool IsNull() const { return m_isNull; }
 
 private:
-    bool m_isNull;
-    T m_min;
-    T m_opt;
-    T m_max;
+    bool m_isNull = true;
+    T    m_min{};
+    T    m_opt{};
+    T    m_max{};
     bool m_hasMin = false;
     bool m_hasOpt = false;
     bool m_hasMax = false;

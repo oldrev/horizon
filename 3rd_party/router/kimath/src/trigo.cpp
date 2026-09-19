@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2014 Jean-Pierre Charras, jp.charras at wanadoo.fr
- * Copyright (C) 2014-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -27,8 +27,9 @@
  * @brief Trigonometric and geometric basic functions.
  */
 
+#include <algorithm>        // for std::clamp
 #include <limits>           // for numeric_limits
-#include <stdlib.h>         // for abs
+#include <cstdlib>         // for abs
 #include <type_traits>      // for swap
 
 #include <geometry/seg.h>
@@ -36,18 +37,64 @@
 #include <math/vector2d.h>  // for VECTOR2I
 #include <trigo.h>
 
-// Returns true if the point P is on the segment S.
-// faster than TestSegmentHit() because P should be exactly on S
-// therefore works fine only for H, V and 45 deg segm (suitable for wires in eeschema)
-bool IsPointOnSegment( const wxPoint& aSegStart, const wxPoint& aSegEnd,
-                       const wxPoint& aTestPoint )
+
+/*
+CircleCenterFrom3Points calculate the center of a circle defined by 3 points
+It is similar to CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, const VECTOR2D& aEnd )
+but it was needed to debug CalcArcCenter, so I keep it available for other issues in CalcArcCenter
+
+The perpendicular bisector of the segment between two points is the
+set of all points equidistant from both.  So if you take the
+perpendicular bisector of (x1,y1) and (x2,y2) and the perpendicular
+bisector of the segment from (x2,y2) to (x3,y3) and find the
+intersection of those lines, that point will be the center.
+
+To find the equation of the perpendicular bisector of (x1,y1) to (x2,y2),
+you know that it passes through the midpoint of the segment:
+((x1+x2)/2,(y1+y2)/2), and if the slope of the line
+connecting (x1,y1) to (x2,y2) is m, the slope of the perpendicular
+bisector is -1/m.  Work out the equations for the two lines, find
+their intersection, and bingo!  You've got the coordinates of the center.
+
+An error should occur if the three points lie on a line, and you'll
+need special code to check for the case where one of the slopes is zero.
+
+see https://web.archive.org/web/20171223103555/http://mathforum.org/library/drmath/view/54323.html
+*/
+
+//#define USE_ALTERNATE_CENTER_ALGO
+
+#ifdef USE_ALTERNATE_CENTER_ALGO
+bool CircleCenterFrom3Points( const VECTOR2D& p1, const VECTOR2D& p2,  const VECTOR2D& p3, VECTOR2D* aCenter )
 {
-    wxPoint vectSeg   = aSegEnd - aSegStart;    // Vector from S1 to S2
-    wxPoint vectPoint = aTestPoint - aSegStart; // Vector from S1 to P
+    // Move coordinate origin to p2, to simplify calculations
+    VECTOR2D b = p1 - p2;
+    VECTOR2D d = p3 - p2;
+    double bc = ( b.x*b.x + b.y*b.y ) / 2.0;
+    double cd = ( -d.x*d.x - d.y*d.y ) / 2.0;
+    double det = -b.x*d.y + d.x*b.y;
+
+    if( fabs(det) < 1.0e-6 )     // arbitrary limit to avoid divide by 0
+        return false;
+
+    det = 1/det;
+    aCenter->x = ( -bc*d.y - cd*b.y ) * det;
+    aCenter->y = ( b.x*cd + d.x*bc ) * det;
+    *aCenter += p2;
+
+    return true;
+}
+#endif
+
+bool IsPointOnSegment( const VECTOR2I& aSegStart, const VECTOR2I& aSegEnd,
+                       const VECTOR2I& aTestPoint )
+{
+    VECTOR2I vectSeg = aSegEnd - aSegStart;      // Vector from S1 to S2
+    VECTOR2I vectPoint = aTestPoint - aSegStart; // Vector from S1 to P
 
     // Use long long here to avoid overflow in calculations
     if( (long long) vectSeg.x * vectPoint.y - (long long) vectSeg.y * vectPoint.x )
-        return false;        /* Cross product non-zero, vectors not parallel */
+        return false;         /* Cross product non-zero, vectors not parallel */
 
     if( ( (long long) vectSeg.x * vectPoint.x + (long long) vectSeg.y * vectPoint.y ) <
         ( (long long) vectPoint.x * vectPoint.x + (long long) vectPoint.y * vectPoint.y ) )
@@ -57,19 +104,18 @@ bool IsPointOnSegment( const wxPoint& aSegStart, const wxPoint& aSegEnd,
 }
 
 
-// Returns true if the segment 1 intersected the segment 2.
-bool SegmentIntersectsSegment( const wxPoint& a_p1_l1, const wxPoint& a_p2_l1,
-                               const wxPoint& a_p1_l2, const wxPoint& a_p2_l2,
-                               wxPoint* aIntersectionPoint )
+bool SegmentIntersectsSegment( const VECTOR2I& a_p1_l1, const VECTOR2I& a_p2_l1,
+                               const VECTOR2I& a_p1_l2, const VECTOR2I& a_p2_l2,
+                               VECTOR2I* aIntersectionPoint )
 {
 
-    //We are forced to use 64bit ints because the internal units can overflow 32bit ints when
+    // We are forced to use 64bit ints because the internal units can overflow 32bit ints when
     // multiplied with each other, the alternative would be to scale the units down (i.e. divide
     // by a fixed number).
     int64_t dX_a, dY_a, dX_b, dY_b, dX_ab, dY_ab;
     int64_t num_a, num_b, den;
 
-    //Test for intersection within the bounds of both line segments using line equations of the
+    // Test for intersection within the bounds of both line segments using line equations of the
     // form:
     // x_k(u_k) = u_k * dX_k + x_k(0)
     // y_k(u_k) = u_k * dY_k + y_k(0)
@@ -84,14 +130,14 @@ bool SegmentIntersectsSegment( const wxPoint& a_p1_l1, const wxPoint& a_p2_l1,
 
     den   = dY_a  * dX_b - dY_b * dX_a ;
 
-    //Check if lines are parallel
+    // Check if lines are parallel.
     if( den == 0 )
         return false;
 
     num_a = dY_ab * dX_b - dY_b * dX_ab;
     num_b = dY_ab * dX_a - dY_a * dX_ab;
 
-    // Only compute the intersection point if requested
+    // Only compute the intersection point if requested.
     if( aIntersectionPoint )
     {
         *aIntersectionPoint = a_p1_l1;
@@ -106,19 +152,19 @@ bool SegmentIntersectsSegment( const wxPoint& a_p1_l1, const wxPoint& a_p2_l1,
         num_b = -num_b;
     }
 
-    //Test sign( u_a ) and return false if negative
+    // Test sign( u_a ) and return false if negative.
     if( num_a < 0 )
         return false;
 
-    //Test sign( u_b ) and return false if negative
+    // Test sign( u_b ) and return false if negative.
     if( num_b < 0 )
         return false;
 
-    //Test to ensure (u_a <= 1)
+    // Test to ensure (u_a <= 1).
     if( num_a > den )
         return false;
 
-    //Test to ensure (u_b <= 1)
+    // Test to ensure (u_b <= 1).
     if( num_b > den )
         return false;
 
@@ -126,14 +172,14 @@ bool SegmentIntersectsSegment( const wxPoint& a_p1_l1, const wxPoint& a_p2_l1,
 }
 
 
-bool TestSegmentHit( const wxPoint& aRefPoint, const wxPoint& aStart, const wxPoint& aEnd,
+bool TestSegmentHit( const VECTOR2I& aRefPoint, const VECTOR2I& aStart, const VECTOR2I& aEnd,
                      int aDist )
 {
     int xmin = aStart.x;
     int xmax = aEnd.x;
     int ymin = aStart.y;
     int ymax = aEnd.y;
-    wxPoint delta = aStart - aRefPoint;
+    VECTOR2I delta = aStart - aRefPoint;
 
     if( xmax < xmin )
         std::swap( xmax, xmin );
@@ -141,14 +187,14 @@ bool TestSegmentHit( const wxPoint& aRefPoint, const wxPoint& aStart, const wxPo
     if( ymax < ymin )
         std::swap( ymax, ymin );
 
-    // First, check if we are outside of the bounding box
+    // Check if we are outside of the bounding box.
     if( ( ymin - aRefPoint.y > aDist ) || ( aRefPoint.y - ymax > aDist ) )
         return false;
 
     if( ( xmin - aRefPoint.x > aDist ) || ( aRefPoint.x - xmax > aDist ) )
         return false;
 
-    // Next, eliminate easy cases
+    // Eliminate easy cases.
     if( aStart.x == aEnd.x && aRefPoint.y > ymin && aRefPoint.y < ymax )
         return std::abs( delta.x ) <= aDist;
 
@@ -166,107 +212,59 @@ const VECTOR2I CalcArcMid( const VECTOR2I& aStart, const VECTOR2I& aEnd, const V
     VECTOR2I startVector = aStart - aCenter;
     VECTOR2I endVector = aEnd - aCenter;
 
-    double startAngle = ArcTangente( startVector.y, startVector.x );
-    double endAngle = ArcTangente( endVector.y, endVector.x );
-    double midPointRotAngleDeciDeg = NormalizeAngle180( startAngle - endAngle ) / 2;
+    EDA_ANGLE startAngle( startVector );
+    EDA_ANGLE endAngle( endVector );
+    EDA_ANGLE midPointRotAngle = ( startAngle - endAngle ).Normalize180() / 2;
 
     if( !aMinArcAngle )
-        midPointRotAngleDeciDeg += 1800.0;
+        midPointRotAngle += ANGLE_180;
 
     VECTOR2I newMid = aStart;
-    RotatePoint( newMid, aCenter, midPointRotAngleDeciDeg );
+    RotatePoint( newMid, aCenter, midPointRotAngle );
 
     return newMid;
 }
 
 
-double ArcTangente( int dy, int dx )
+void RotatePoint( int* pX, int* pY, const EDA_ANGLE& aAngle )
 {
+    VECTOR2I  pt;
+    EDA_ANGLE angle = aAngle;
 
-    /* gcc is surprisingly smart in optimizing these conditions in
-       a tree! */
-
-    if( dx == 0 && dy == 0 )
-        return 0;
-
-    if( dy == 0 )
-    {
-        if( dx >= 0 )
-            return 0;
-        else
-            return -1800;
-    }
-
-    if( dx == 0 )
-    {
-        if( dy >= 0 )
-            return 900;
-        else
-            return -900;
-    }
-
-    if( dx == dy )
-    {
-        if( dx >= 0 )
-            return 450;
-        else
-            return -1800 + 450;
-    }
-
-    if( dx == -dy )
-    {
-        if( dx >= 0 )
-            return -450;
-        else
-            return 1800 - 450;
-    }
-
-    // Of course dy and dx are treated as double
-    return RAD2DECIDEG( std::atan2( (double) dy, (double) dx ) );
-}
-
-
-void RotatePoint( int* pX, int* pY, double angle )
-{
-    int tmp;
-
-    NORMALIZE_ANGLE_POS( angle );
+    angle.Normalize();
 
     // Cheap and dirty optimizations for 0, 90, 180, and 270 degrees.
-    if( angle == 0 )
-        return;
-
-    if( angle == 900 )          /* sin = 1, cos = 0 */
+    if( angle == ANGLE_0 )
     {
-        tmp = *pX;
-        *pX = *pY;
-        *pY = -tmp;
+        pt = VECTOR2I( *pX, *pY );
     }
-    else if( angle == 1800 )    /* sin = 0, cos = -1 */
+    else if( angle == ANGLE_90 )          /* sin = 1, cos = 0 */
     {
-        *pX = -*pX;
-        *pY = -*pY;
+        pt = VECTOR2I( *pY, -*pX );
     }
-    else if( angle == 2700 )    /* sin = -1, cos = 0 */
+    else if( angle == ANGLE_180 )    /* sin = 0, cos = -1 */
     {
-        tmp = *pX;
-        *pX = -*pY;
-        *pY = tmp;
+        pt = VECTOR2I( -*pX, -*pY );
+    }
+    else if( angle == ANGLE_270 )    /* sin = -1, cos = 0 */
+    {
+        pt = VECTOR2I( -*pY, *pX );
     }
     else
     {
-        double fangle = DECIDEG2RAD( angle );
-        double sinus = sin( fangle );
-        double cosinus = cos( fangle );
-        double fpx = (*pY * sinus ) + (*pX * cosinus );
-        double fpy = (*pY * cosinus ) - (*pX * sinus );
-        *pX = KiROUND( fpx );
-        *pY = KiROUND( fpy );
+        double sinus = angle.Sin();
+        double cosinus = angle.Cos();
+
+        pt.x = KiROUND( ( *pY * sinus ) + ( *pX * cosinus ) );
+        pt.y = KiROUND( ( *pY * cosinus ) - ( *pX * sinus ) );
     }
+
+    *pX = pt.x;
+    *pY = pt.y;
 }
 
 
-void RotatePoint( int* pX, int* pY, int cx, int cy, double angle )
+void RotatePoint( int* pX, int* pY, int cx, int cy, const EDA_ANGLE& angle )
 {
     int ox, oy;
 
@@ -280,31 +278,7 @@ void RotatePoint( int* pX, int* pY, int cx, int cy, double angle )
 }
 
 
-void RotatePoint( wxPoint* point, const wxPoint& centre, double angle )
-{
-    int ox, oy;
-
-    ox = point->x - centre.x;
-    oy = point->y - centre.y;
-
-    RotatePoint( &ox, &oy, angle );
-    point->x = ox + centre.x;
-    point->y = oy + centre.y;
-}
-
-void RotatePoint( VECTOR2I& point, const VECTOR2I& centre, double angle )
-{
-    wxPoint c( centre.x, centre.y );
-    wxPoint p( point.x, point.y );
-
-    RotatePoint(&p, c, angle);
-
-    point.x = p.x;
-    point.y = p.y;
-}
-
-
-void RotatePoint( double* pX, double* pY, double cx, double cy, double angle )
+void RotatePoint( double* pX, double* pY, double cx, double cy, const EDA_ANGLE& angle )
 {
     double ox, oy;
 
@@ -318,78 +292,97 @@ void RotatePoint( double* pX, double* pY, double cx, double cy, double angle )
 }
 
 
-void RotatePoint( double* pX, double* pY, double angle )
+void RotatePoint( double* pX, double* pY, const EDA_ANGLE& aAngle )
 {
-    double tmp;
+    EDA_ANGLE angle = aAngle;
+    VECTOR2D  pt;
 
-    NORMALIZE_ANGLE_POS( angle );
+    angle.Normalize();
 
     // Cheap and dirty optimizations for 0, 90, 180, and 270 degrees.
-    if( angle == 0 )
-        return;
-
-    if( angle == 900 )          /* sin = 1, cos = 0 */
+    if( angle == ANGLE_0 )
     {
-        tmp = *pX;
-        *pX = *pY;
-        *pY = -tmp;
+        pt = VECTOR2D( *pX, *pY );
     }
-    else if( angle == 1800 )    /* sin = 0, cos = -1 */
+    else if( angle == ANGLE_90 )          /* sin = 1, cos = 0 */
     {
-        *pX = -*pX;
-        *pY = -*pY;
+        pt = VECTOR2D( *pY, -*pX );
     }
-    else if( angle == 2700 )    /* sin = -1, cos = 0 */
+    else if( angle == ANGLE_180 )    /* sin = 0, cos = -1 */
     {
-        tmp = *pX;
-        *pX = -*pY;
-        *pY = tmp;
+        pt = VECTOR2D( -*pX, -*pY );
+    }
+    else if( angle == ANGLE_270 )    /* sin = -1, cos = 0 */
+    {
+        pt = VECTOR2D( -*pY, *pX );
     }
     else
     {
-        double fangle = DECIDEG2RAD( angle );
-        double sinus = sin( fangle );
-        double cosinus = cos( fangle );
+        double sinus = angle.Sin();
+        double cosinus = angle.Cos();
 
-        double fpx = (*pY * sinus ) + (*pX * cosinus );
-        double fpy = (*pY * cosinus ) - (*pX * sinus );
-        *pX = fpx;
-        *pY = fpy;
+        pt.x = ( *pY * sinus ) + ( *pX * cosinus );
+        pt.y = ( *pY * cosinus ) - ( *pX * sinus );
     }
+
+    *pX = pt.x;
+    *pY = pt.y;
 }
 
 
-const wxPoint CalcArcCenter( const VECTOR2I& aStart, const VECTOR2I& aEnd, double aAngle )
+const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aEnd,
+                              const EDA_ANGLE& aAngle )
 {
-    VECTOR2I start = aStart;
-    VECTOR2I end = aEnd;
+    EDA_ANGLE angle( aAngle );
+    VECTOR2D  start = aStart;
+    VECTOR2D  end = aEnd;
 
-    if( aAngle < 0 )
+    if( angle < ANGLE_0 )
     {
         std::swap( start, end );
-        aAngle = abs( aAngle );
+        angle = -angle;
     }
 
-    if( aAngle > 180 )
+    if( angle > ANGLE_180 )
     {
         std::swap( start, end );
-        aAngle = 360 - aAngle;
+        angle = ANGLE_360 - angle;
     }
 
-    int chord = ( start - end ).EuclideanNorm();
-    int r = ( chord / 2 ) / sin( aAngle * M_PI / 360.0 );
+    double chord = ( start - end ).EuclideanNorm();
+    double r = ( chord / 2.0 ) / ( angle / 2.0 ).Sin();
+    double d_squared = r * r - chord*  chord / 4.0;
+    double d = 0.0;
 
-    VECTOR2I vec = end - start;
-    vec = vec.Resize( r );
-    vec = vec.Rotate( ( 180.0 - aAngle ) * M_PI / 360.0 );
+    if( d_squared > 0.0 )
+        d = sqrt( d_squared );
 
-    return (wxPoint) ( start + vec );
+    VECTOR2D vec2 = VECTOR2D(end - start).Resize( d );
+    VECTOR2D vc = VECTOR2D(end - start).Resize( chord / 2 );
+
+    RotatePoint( vec2, -ANGLE_90 );
+
+    return VECTOR2D( start + vc + vec2 );
 }
 
 
 const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, const VECTOR2D& aEnd )
 {
+    // If the three input points are clustered within a 10 IU bounding box, no
+    // meaningful circumcircle exists so return the centroid
+    constexpr double kCoincidentRadius = 5.0;
+
+    auto [minX, maxX] = std::minmax( { aStart.x, aMid.x, aEnd.x } );
+    auto [minY, maxY] = std::minmax( { aStart.y, aMid.y, aEnd.y } );
+
+    if( maxX - minX < kCoincidentRadius && maxY - minY < kCoincidentRadius )
+    {
+        return VECTOR2D( ( aStart.x + aMid.x + aEnd.x ) / 3.0,
+                        ( aStart.y + aMid.y + aEnd.y ) / 3.0 );
+    }
+
     VECTOR2D center;
+
     double yDelta_21 = aMid.y - aStart.y;
     double xDelta_21 = aMid.x - aStart.x;
     double yDelta_32 = aEnd.y - aMid.y;
@@ -406,7 +399,7 @@ const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, cons
         return center;
     }
 
-    // Prevent div=0 errors
+    // Prevent div-by-0 errors
     if( xDelta_21 == 0.0 )
         xDelta_21 = std::numeric_limits<double>::epsilon();
 
@@ -423,8 +416,8 @@ const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, cons
     {
         if( aStart == aEnd )
         {
-            // This is a special case for a 360 degrees arc.  In this case, the center is halfway between
-            // the midpoint and either end point
+            // This is a special case for a 360 degrees arc.  In this case, the center is
+            // halfway between the midpoint and either end point.
             center.x = ( aStart.x + aMid.x ) / 2.0;
             center.y = ( aStart.y + aMid.y ) / 2.0 ;
             return center;
@@ -438,10 +431,19 @@ const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, cons
             bSlope -= std::numeric_limits<double>::epsilon();
         }
     }
+#ifdef USE_ALTERNATE_CENTER_ALGO
+    // We can call ArcCenterFrom3Points from here because special cases are filtered.
+    CircleCenterFrom3Points( aStart, aMid, aEnd, &center );
+    return center;
+#endif
 
     // Prevent divide by zero error
+    // a small value is used. std::numeric_limits<double>::epsilon() is too small and
+    // generate false results
     if( aSlope == 0.0 )
-        aSlope = std::numeric_limits<double>::epsilon();
+        aSlope = 1e-10;
+    if( bSlope == 0.0 )
+        bSlope = 1e-10;
 
     // What follows is the calculation of the center using the slope of the two lines as well as
     // the propagated error that occurs when rounding to the nearest nanometer.  The error can be
@@ -450,22 +452,24 @@ const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, cons
     // to the standard deviation.
     // We ignore the possible covariance between variables.  We also truncate our series expansion
     // at the first term.  These are reasonable assumptions as the worst-case scenario is that we
-    // underestimate the potential uncertainty, which would potentially put us back at the status quo
+    // underestimate the potential uncertainty, which would potentially put us back at the status
+    // quo.
     double abSlopeStartEndY = aSlope * bSlope * ( aStart.y - aEnd.y );
-    double dabSlopeStartEndY = abSlopeStartEndY * std::sqrt( ( daSlope / aSlope * daSlope / aSlope )
-                                                           + ( dbSlope / bSlope * dbSlope / bSlope )
-                                                           + ( M_SQRT1_2 / ( aStart.y - aEnd.y )
-                                                               * M_SQRT1_2 / ( aStart.y - aEnd.y ) ) );
+    double dabSlopeStartEndY = abSlopeStartEndY *
+                               std::sqrt( ( daSlope / aSlope * daSlope / aSlope )
+                                        + ( dbSlope / bSlope * dbSlope / bSlope )
+                                        + ( M_SQRT1_2 / ( aStart.y - aEnd.y )
+                                          * M_SQRT1_2 / ( aStart.y - aEnd.y ) ) );
 
     double bSlopeStartMidX = bSlope * ( aStart.x + aMid.x );
     double dbSlopeStartMidX = bSlopeStartMidX * std::sqrt( ( dbSlope / bSlope * dbSlope / bSlope )
                                                          + ( M_SQRT1_2 / ( aStart.x + aMid.x )
-                                                                 * M_SQRT1_2 / ( aStart.x + aMid.x ) ) );
+                                                           * M_SQRT1_2 / ( aStart.x + aMid.x ) ) );
 
     double aSlopeMidEndX = aSlope * ( aMid.x + aEnd.x );
     double daSlopeMidEndX = aSlopeMidEndX * std::sqrt( ( daSlope / aSlope * daSlope / aSlope )
                                                      + ( M_SQRT1_2 / ( aMid.x + aEnd.x )
-                                                             * M_SQRT1_2 / ( aMid.x + aEnd.x ) ) );
+                                                       * M_SQRT1_2 / ( aMid.x + aEnd.x ) ) );
 
     double twiceBASlopeDiff = 2 * ( bSlope - aSlope );
     double dtwiceBASlopeDiff = 2 * std::sqrt( dbSlope * dbSlope + daSlope * daSlope );
@@ -476,9 +480,10 @@ const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, cons
                                        + daSlopeMidEndX * daSlopeMidEndX );
 
     double centerX = ( abSlopeStartEndY + bSlopeStartMidX - aSlopeMidEndX ) / twiceBASlopeDiff;
-
-    double dCenterX = centerX * std::sqrt( ( dCenterNumeratorX / centerNumeratorX * dCenterNumeratorX / centerNumeratorX )
-                                         + ( dtwiceBASlopeDiff / twiceBASlopeDiff * dtwiceBASlopeDiff / twiceBASlopeDiff ) );
+    double dCenterX = centerX * std::sqrt( ( dCenterNumeratorX / centerNumeratorX *
+                                             dCenterNumeratorX / centerNumeratorX )
+                                         + ( dtwiceBASlopeDiff / twiceBASlopeDiff *
+                                             dtwiceBASlopeDiff / twiceBASlopeDiff ) );
 
 
     double centerNumeratorY = ( ( aStart.x + aMid.x ) / 2.0 - centerX );
@@ -486,7 +491,8 @@ const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, cons
 
     double centerFirstTerm = centerNumeratorY / aSlope;
     double dcenterFirstTermY = centerFirstTerm * std::sqrt(
-                                          ( dCenterNumeratorY/ centerNumeratorY * dCenterNumeratorY / centerNumeratorY )
+                                          ( dCenterNumeratorY/ centerNumeratorY *
+                                            dCenterNumeratorY / centerNumeratorY )
                                         + ( daSlope / aSlope * daSlope / aSlope ) );
 
     double centerY = centerFirstTerm + ( aStart.y + aMid.y ) / 2.0;
@@ -497,16 +503,19 @@ const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, cons
     double rounded10CenterX = std::floor( ( centerX + 5.0 ) / 10.0 ) * 10.0;
     double rounded10CenterY = std::floor( ( centerY + 5.0 ) / 10.0 ) * 10.0;
 
-    // The last step is to find the nice, round numbers near our baseline estimate and see if they are within our uncertainty
-    // range.  If they are, then we use this round value as the true value.  This is justified because ALL values within the
-    // uncertainty range are equally true.  Using a round number will make sure that we are on a multiple of 1mil or 100nm
+    // The last step is to find the nice, round numbers near our baseline estimate and see if
+    // they are within our uncertainty range.  If they are, then we use this round value as the
+    // true value.  This is justified because ALL values within the uncertainty range are equally
+    // true.  Using a round number will make sure that we are on a multiple of 1mil or 100nm
     // when calculating centers.
-    if( std::abs( rounded100CenterX - centerX ) < dCenterX && std::abs( rounded100CenterY - centerY ) < dCenterY )
+    if( std::abs( rounded100CenterX - centerX ) < dCenterX &&
+        std::abs( rounded100CenterY - centerY ) < dCenterY )
     {
         center.x = rounded100CenterX;
         center.y = rounded100CenterY;
     }
-    else if( std::abs( rounded10CenterX - centerX ) < dCenterX && std::abs( rounded10CenterY - centerY ) < dCenterY )
+    else if( std::abs( rounded10CenterX - centerX ) < dCenterX &&
+             std::abs( rounded10CenterY - centerY ) < dCenterY )
     {
         center.x = rounded10CenterX;
         center.y = rounded10CenterY;
@@ -531,63 +540,13 @@ const VECTOR2I CalcArcCenter( const VECTOR2I& aStart, const VECTOR2I& aMid, cons
 
     VECTOR2I iCenter;
 
-    iCenter.x = KiROUND( Clamp<double>( double( std::numeric_limits<int>::min() / 2.0 ),
-                                        dCenter.x,
-                                        double( std::numeric_limits<int>::max() / 2.0 ) ) );
+    iCenter.x = KiROUND( std::clamp( dCenter.x,
+                                    double( std::numeric_limits<int>::min() + 100 ),
+                                    double( std::numeric_limits<int>::max() - 100 ) ) );
 
-    iCenter.y = KiROUND( Clamp<double>( double( std::numeric_limits<int>::min() / 2.0 ),
-                                        dCenter.y,
-                                        double( std::numeric_limits<int>::max() / 2.0 ) ) );
-
-    return iCenter;
-}
-
-
-const wxPoint CalcArcCenter( const wxPoint& aStart, const wxPoint& aMid, const wxPoint& aEnd )
-{
-    VECTOR2D dStart( static_cast<double>( aStart.x ), static_cast<double>( aStart.y ) );
-    VECTOR2D dMid( static_cast<double>( aMid.x ), static_cast<double>( aMid.y ) );
-    VECTOR2D dEnd( static_cast<double>( aEnd.x ), static_cast<double>( aEnd.y ) );
-    VECTOR2D dCenter = CalcArcCenter( dStart, dMid, dEnd );
-
-    wxPoint iCenter;
-
-    iCenter.x = KiROUND( Clamp<double>( double( std::numeric_limits<int>::min() / 2.0 ),
-                                        dCenter.x,
-                                        double( std::numeric_limits<int>::max() / 2.0 ) ) );
-
-    iCenter.y = KiROUND( Clamp<double>( double( std::numeric_limits<int>::min() / 2.0 ),
-                                        dCenter.y,
-                                        double( std::numeric_limits<int>::max() / 2.0 ) ) );
+    iCenter.y = KiROUND( std::clamp( dCenter.y,
+                                    double( std::numeric_limits<int>::min() + 100 ),
+                                    double( std::numeric_limits<int>::max() - 100 ) ) );
 
     return iCenter;
-}
-
-
-double CalcArcAngle( const VECTOR2I& aStart, const VECTOR2I& aMid, const VECTOR2I& aEnd )
-{
-    VECTOR2I center = CalcArcCenter( aStart, aMid, aEnd );
-
-    // Check if the new arc is CW or CCW
-    VECTOR2D startLine = aStart - center;
-    VECTOR2D endLine   = aEnd - center;
-    double angle       = RAD2DECIDEG( endLine.Angle() - startLine.Angle() );
-
-    VECTOR2D v1, v2;
-    v1           = aStart - aMid;
-    v2           = aEnd - aMid;
-    double theta = RAD2DECIDEG( v1.Angle() );
-
-    RotatePoint( &( v1.x ), &( v1.y ), theta );
-    RotatePoint( &( v2.x ), &( v2.y ), theta );
-
-    bool clockwise = ( ( v1.Angle() - v2.Angle() ) > 0 );
-
-    // Normalize the angle
-    if( clockwise && angle < 0.0 )
-        angle += 3600.0;
-    else if( !clockwise && angle > 0.0 )
-        angle -= 3600.0;
-
-    return angle;
 }

@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2015 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -26,6 +26,8 @@
 #include "pns_solid.h"
 #include "pns_topology.h"
 #include "pns_debug_decorator.h"
+#include "pns_arc.h"
+#include "pns_utils.h"
 
 namespace PNS {
 
@@ -37,18 +39,18 @@ DIFF_PAIR_PLACER::DIFF_PAIR_PLACER( ROUTER* aRouter ) :
     m_initialDiagonal = false;
     m_startDiagonal = false;
     m_fitOk = false;
-    m_netP = 0;
-    m_netN = 0;
+    m_netP = nullptr;
+    m_netN = nullptr;
     m_iteration = 0;
     m_world = nullptr;
     m_shove = nullptr;
     m_currentNode = nullptr;
     m_lastNode = nullptr;
+    m_lastFixNode = nullptr;
     m_placingVia = false;
     m_viaDiameter = 0;
     m_viaDrill = 0;
     m_currentWidth = 0;
-    m_currentNet = 0;
     m_currentLayer = 0;
     m_startsOnVia = false;
     m_orthoMode = false;
@@ -56,6 +58,7 @@ DIFF_PAIR_PLACER::DIFF_PAIR_PLACER( ROUTER* aRouter ) :
     m_currentEndItem = nullptr;
     m_currentTraceOk = false;
     m_idle = true;
+    m_hasFixedAnything = false;
 }
 
 DIFF_PAIR_PLACER::~DIFF_PAIR_PLACER()
@@ -68,13 +71,18 @@ void DIFF_PAIR_PLACER::setWorld( NODE* aWorld )
 }
 
 
-const VIA DIFF_PAIR_PLACER::makeVia( const VECTOR2I& aP, int aNet )
+const VIA DIFF_PAIR_PLACER::makeVia( const VECTOR2I& aP, NET_HANDLE aNet )
 {
-    const LAYER_RANGE layers( m_sizes.GetLayerTop(), m_sizes.GetLayerBottom() );
+    auto iface = Router()->GetInterface();
 
-    VIA v( aP, layers, m_sizes.ViaDiameter(), m_sizes.ViaDrill(), -1, m_sizes.ViaType() );
-    v.SetNet( aNet );
-    v.SetDefinition( m_sizes.ViaDefinition() );
+    int start =
+            m_sizes.ViaType() == VIATYPE::THROUGH ? iface->GetPNSLayerFromBoardLayer( F_Cu ) : m_sizes.GetLayerTop();
+    int end =
+            m_sizes.ViaType() == VIATYPE::THROUGH ? iface->GetPNSLayerFromBoardLayer( B_Cu ) : m_sizes.GetLayerBottom();
+
+    const PNS_LAYER_RANGE layers( start, end );
+
+    VIA v( aP, layers, m_sizes.ViaDiameter(), m_sizes.ViaDrill(), aNet, m_sizes.ViaType() );
 
     return v;
 }
@@ -116,16 +124,16 @@ bool DIFF_PAIR_PLACER::rhMarkObstacles( const VECTOR2I& aP )
 
 bool DIFF_PAIR_PLACER::propagateDpHeadForces ( const VECTOR2I& aP, VECTOR2I& aNewP )
 {
-    VIA virtHead = makeVia( aP, -1 );
+    VIA virtHead = makeVia( aP, nullptr );
 
     if( m_placingVia )
     {
-        virtHead.SetDiameter( viaGap() + 2 * virtHead.Diameter() );
+        virtHead.SetDiameter( 0, viaGap() + 2 * virtHead.Diameter( 0 ) );
     }
     else
     {
         virtHead.SetLayer( m_currentLayer );
-        virtHead.SetDiameter( m_sizes.DiffPairGap() + 2 * m_sizes.DiffPairWidth() );
+        virtHead.SetDiameter( 0, m_sizes.DiffPairGap() + 2 * m_sizes.DiffPairWidth() );
     }
 
     bool solidsOnly = true;
@@ -146,11 +154,11 @@ bool DIFF_PAIR_PLACER::propagateDpHeadForces ( const VECTOR2I& aP, VECTOR2I& aNe
     // check proper clearances to the diff pair line.  It can be removed if some specialized
     // pushout for traces / diff pairs is implemented.  Just calling VIA::PushoutForce does not work
     // as the via may have different resolved clearance to items than the diff pair should.
-    int      maxIter  = 40;
-    int      iter     = 0;
-    bool     collided = false;
-    VECTOR2I force, totalForce;
-    std::set<ITEM*> handled;
+    int                   maxIter  = 40;
+    int                   iter     = 0;
+    bool                  collided = false;
+    VECTOR2I              force, totalForce;
+    std::set<const ITEM*> handled;
 
     while( iter < maxIter )
     {
@@ -160,11 +168,21 @@ bool DIFF_PAIR_PLACER::propagateDpHeadForces ( const VECTOR2I& aP, VECTOR2I& aNe
         if( !obs || handled.count( obs->m_item ) )
             break;
 
-        int clearance = m_currentNode->GetClearance( obs->m_item, &m_currentTrace.PLine() );
+        int clearance = m_currentNode->GetClearance( obs->m_item, &m_currentTrace.PLine(), false );
+        VECTOR2I layerForce;
+        collided = false;
 
-        if( obs->m_item->Shape()->Collide( virtHead.Shape(), clearance, &force ) )
+        for( int viaLayer : virtHead.RelevantShapeLayers( obs->m_item ) )
         {
-            collided = true;
+            collided |= obs->m_item->Shape( viaLayer )->Collide( virtHead.Shape( viaLayer ),
+                                                                 clearance, &layerForce );
+
+            if( layerForce.SquaredEuclideanNorm() > force.SquaredEuclideanNorm() )
+                force = layerForce;
+        }
+
+        if( collided )
+        {
             totalForce += force;
             virtHead.SetPos( virtHead.Pos() + force );
         }
@@ -190,10 +208,10 @@ bool DIFF_PAIR_PLACER::attemptWalk( NODE* aNode, DIFF_PAIR* aCurrent, DIFF_PAIR&
                                     bool aPFirst, bool aWindCw, bool aSolidsOnly )
 {
     WALKAROUND walkaround( aNode, Router() );
-    WALKAROUND::WALKAROUND_STATUS wf1;
 
     walkaround.SetSolidsOnly( aSolidsOnly );
     walkaround.SetIterationLimit( Settings().WalkaroundIterationLimit() );
+    walkaround.SetAllowedPolicies( { WALKAROUND::WP_SHORTEST } );
 
     SHOVE shove( aNode, Router() );
     LINE walkP, walkN;
@@ -224,20 +242,22 @@ bool DIFF_PAIR_PLACER::attemptWalk( NODE* aNode, DIFF_PAIR* aCurrent, DIFF_PAIR&
                 continue;
         }
 
-        wf1 = walkaround.Route( preWalk, postWalk, false );
+        auto wf1 = walkaround.Route( preWalk );
 
-        if( wf1 != WALKAROUND::DONE )
+        if( wf1.status[ WALKAROUND::WP_SHORTEST ] != WALKAROUND::ST_DONE )
             return false;
+
+        postWalk = wf1.lines[ WALKAROUND::WP_SHORTEST ];
 
         LINE postShove( preShove );
 
         shove.ForceClearance( true, cur.Gap() - 2 * PNS_HULL_MARGIN );
 
-        SHOVE::SHOVE_STATUS sh1;
+        bool sh1;
 
         sh1 = shove.ShoveObstacleLine( postWalk, preShove, postShove );
 
-        if( sh1 != SHOVE::SH_OK )
+        if( !sh1 )
             return false;
 
         postWalk.Line().Simplify();
@@ -278,7 +298,6 @@ bool DIFF_PAIR_PLACER::tryWalkDp( NODE* aNode, DIFF_PAIR &aPair, bool aSolidsOnl
 
         if( attemptWalk( tmp, &aPair, p, pfirst, wind_cw, aSolidsOnly ) )
         {
-        //    double len = p.TotalLength();
             double cl   = 1 + p.CoupledLength();
             double skew = p.Skew();
 
@@ -287,7 +306,7 @@ bool DIFF_PAIR_PLACER::tryWalkDp( NODE* aNode, DIFF_PAIR &aPair, bool aSolidsOnl
             if( score < bestScore )
             {
                 bestScore = score;
-                best = p;
+                best = std::move( p );
             }
         }
 
@@ -355,10 +374,11 @@ bool DIFF_PAIR_PLACER::rhShoveOnly( const VECTOR2I& aP )
     LINE nLine( m_currentTrace.NLine() );
     ITEM_SET head;
 
-    head.Add( &pLine );
-    head.Add( &nLine );
+    m_shove->ClearHeads();
+    m_shove->AddHeads( pLine );
+    m_shove->AddHeads( nLine );
 
-    SHOVE::SHOVE_STATUS status = m_shove->ShoveMultiLines( head );
+    SHOVE::SHOVE_STATUS status = m_shove->Run();
 
     m_currentNode = m_shove->CurrentNode();
 
@@ -366,12 +386,27 @@ bool DIFF_PAIR_PLACER::rhShoveOnly( const VECTOR2I& aP )
     {
         m_currentNode = m_shove->CurrentNode();
 
-        if( !m_currentNode->CheckColliding( &m_currentTrace.PLine() ) &&
-            !m_currentNode->CheckColliding( &m_currentTrace.NLine() ) )
+        if( m_shove->HeadsModified( 0 ))
+            pLine = m_shove->GetModifiedHead(0);
+
+        if( m_shove->HeadsModified( 1 ))
+            nLine = m_shove->GetModifiedHead(1);
+
+        // Update m_currentTrace with the shoved shapes so FixRoute() commits correct geometry
+        m_currentTrace.SetShape( pLine.CLine(), nLine.CLine() );
+
+        if( !m_currentNode->CheckColliding( &pLine ) &&
+            !m_currentNode->CheckColliding( &nLine ) )
         {
             m_fitOk = true;
         }
     }
+    else
+    {
+        // bring back previous state
+        m_currentTrace.SetShape( pLine.CLine(), nLine.CLine() );
+    }
+
 
     return m_fitOk;
 }
@@ -435,17 +470,39 @@ OPT_VECTOR2I getDanglingAnchor( NODE* aNode, ITEM* aItem )
 {
     switch( aItem->Kind() )
     {
+    case ITEM::LINE_T:
+    {
+        LINE* l = static_cast<LINE*>( aItem );
+
+        if( !l->PointCount() )
+            return OPT_VECTOR2I();
+        else
+            return l->CPoint( 0 );
+    }
     case ITEM::VIA_T:
     case ITEM::SOLID_T:
         return aItem->Anchor( 0 );
 
     case ITEM::ARC_T:
+    {
+        ARC* a = static_cast<ARC*>( aItem );
+
+        const JOINT* jA = aNode->FindJoint( aItem->Anchor( 0 ), aItem );
+        const JOINT* jB = aNode->FindJoint( aItem->Anchor( 1 ), aItem );
+
+        if( jA && jA->LinkCount() == 1 )
+            return a->Arc().GetP0();
+        else if( jB && jB->LinkCount() == 1 )
+            return a->Arc().GetP1();
+        else
+            return OPT_VECTOR2I();
+    }
     case ITEM::SEGMENT_T:
     {
         SEGMENT* s = static_cast<SEGMENT*>( aItem );
 
-        JOINT* jA = aNode->FindJoint( aItem->Anchor( 0 ), aItem );
-        JOINT* jB = aNode->FindJoint( aItem->Anchor( 1 ), aItem );
+        const JOINT* jA = aNode->FindJoint( aItem->Anchor( 0 ), aItem );
+        const JOINT* jB = aNode->FindJoint( aItem->Anchor( 1 ), aItem );
 
         if( jA && jA->LinkCount() == 1 )
             return s->Seg().A;
@@ -465,7 +522,7 @@ OPT_VECTOR2I getDanglingAnchor( NODE* aNode, ITEM* aItem )
 bool DIFF_PAIR_PLACER::FindDpPrimitivePair( NODE* aWorld, const VECTOR2I& aP, ITEM* aItem,
                                             DP_PRIMITIVE_PAIR& aPair, wxString* aErrorMsg )
 {
-    int netP, netN;
+    NET_HANDLE netP, netN;
 
     bool result = aWorld->GetRuleResolver()->DpNetPair( aItem, netP, netN );
 
@@ -480,8 +537,8 @@ bool DIFF_PAIR_PLACER::FindDpPrimitivePair( NODE* aWorld, const VECTOR2I& aP, IT
         return false;
     }
 
-    int refNet = aItem->Net();
-    int coupledNet = ( refNet == netP ) ? netN : netP;
+    NET_HANDLE refNet = aItem->Net();
+    NET_HANDLE coupledNet = ( refNet == netP ) ? netN : netP;
 
     OPT_VECTOR2I refAnchor = getDanglingAnchor( aWorld, aItem );
     ITEM* primRef = aItem;
@@ -559,8 +616,7 @@ bool DIFF_PAIR_PLACER::FindDpPrimitivePair( NODE* aWorld, const VECTOR2I& aP, IT
 
 int DIFF_PAIR_PLACER::viaGap() const
 {
-    return std::max( m_sizes.DiffPairViaGap(),
-                     m_sizes.GetHoleToHole() + m_sizes.ViaDrill() - m_sizes.ViaDiameter() );
+    return m_sizes.EffectiveDiffPairViaGap();
 }
 
 
@@ -592,9 +648,11 @@ bool DIFF_PAIR_PLACER::Start( const VECTOR2I& aP, ITEM* aStartItem )
     m_currentEnd = p;
     m_placingVia = false;
     m_chainedPlacement = false;
+    m_hasFixedAnything = false;
     m_currentTraceOk = false;
     m_currentTrace = DIFF_PAIR();
     m_currentTrace.SetNets( m_netP, m_netN );
+    m_lastFixNode = nullptr;
 
     initPlacement();
 
@@ -691,8 +749,8 @@ bool DIFF_PAIR_PLACER::routeHead( const VECTOR2I& aP )
 
         if( m_placingVia )
         {
-            m_currentTrace.AppendVias ( makeVia( m_currentTrace.CP().CPoint( -1 ), m_netP ),
-                                        makeVia( m_currentTrace.CN().CPoint( -1 ), m_netN ) );
+            m_currentTrace.AppendVias ( makeVia( m_currentTrace.CP().CLastPoint(), m_netP ),
+                                        makeVia( m_currentTrace.CN().CLastPoint(), m_netN ) );
         }
         else
         {
@@ -730,10 +788,18 @@ bool DIFF_PAIR_PLACER::Move( const VECTOR2I& aP , ITEM* aEndItem )
 
 void DIFF_PAIR_PLACER::UpdateSizes( const SIZES_SETTINGS& aSizes )
 {
+    int prevDiffPairWidth = m_sizes.DiffPairWidth();
+
     m_sizes = aSizes;
 
     if( !m_idle )
     {
+        // When continuing from an existing track in connected-track-width mode, preserve the
+        // inherited diff pair width rather than reverting to the netclass default. This matches
+        // the guard in LINE_PLACER::UpdateSizes() for single tracks.
+        if( !m_sizes.TrackWidthIsExplicit() && m_hasFixedAnything )
+            m_sizes.SetDiffPairWidth( prevDiffPairWidth );
+
         m_currentTrace.SetWidth( m_sizes.DiffPairWidth() );
         m_currentTrace.SetGap( m_sizes.DiffPairGap() );
 
@@ -795,9 +861,15 @@ bool DIFF_PAIR_PLACER::FixRoute( const VECTOR2I& aP, ITEM* aEndItem, bool aForce
     topo.SimplifyLine( &lineN );
 
     m_prevPair = m_currentTrace.EndingPrimitives();
+    m_lastFixNode = m_lastNode;
+
+    // avoid an use-after-free error (CommitPlacement calls NODE::Commit which will invalidate the shove heads state. Need to rethink the memory management).
+    if( Settings().Mode() == RM_Shove )
+        m_shove = std::make_unique<SHOVE>( m_world, Router() );
 
     CommitPlacement();
     m_placingVia = false;
+    m_lastFixNode = nullptr;
 
     if( m_snapOnTarget || aForceFinish )
     {
@@ -806,6 +878,7 @@ bool DIFF_PAIR_PLACER::FixRoute( const VECTOR2I& aP, ITEM* aEndItem, bool aForce
     }
     else
     {
+        m_hasFixedAnything = true;
         initPlacement();
         return false;
     }
@@ -815,6 +888,7 @@ bool DIFF_PAIR_PLACER::FixRoute( const VECTOR2I& aP, ITEM* aEndItem, bool aForce
 bool DIFF_PAIR_PLACER::AbortPlacement()
 {
     m_world->KillChildren();
+    m_lastNode = nullptr;
     return true;
 }
 
@@ -827,16 +901,17 @@ bool DIFF_PAIR_PLACER::HasPlacedAnything() const
 
 bool DIFF_PAIR_PLACER::CommitPlacement()
 {
-    if( m_lastNode )
-        Router()->CommitRouting( m_lastNode );
+    if( m_lastFixNode )
+        Router()->CommitRouting( m_lastFixNode );
 
+    m_lastFixNode = nullptr;
     m_lastNode = nullptr;
     m_currentNode = nullptr;
     return true;
 }
 
 
-void DIFF_PAIR_PLACER::GetModifiedNets( std::vector<int> &aNets ) const
+void DIFF_PAIR_PLACER::GetModifiedNets( std::vector<NET_HANDLE> &aNets ) const
 {
     aNets.push_back( m_netP );
     aNets.push_back( m_netN );
@@ -849,16 +924,16 @@ void DIFF_PAIR_PLACER::updateLeadingRatLine()
     TOPOLOGY topo( m_lastNode );
 
     if( topo.LeadingRatLine( &m_currentTrace.PLine(), ratLineP ) )
-        m_router->GetInterface()->DisplayRatline( ratLineP, 1 );
+        m_router->GetInterface()->DisplayRatline( ratLineP, m_netP );
 
     if( topo.LeadingRatLine ( &m_currentTrace.NLine(), ratLineN ) )
-        m_router->GetInterface()->DisplayRatline( ratLineN, 3 );
+        m_router->GetInterface()->DisplayRatline( ratLineN, m_netN );
 }
 
 
-const std::vector<int> DIFF_PAIR_PLACER::CurrentNets() const
+const std::vector<NET_HANDLE> DIFF_PAIR_PLACER::CurrentNets() const
 {
-    std::vector<int> rv;
+    std::vector<NET_HANDLE> rv;
     rv.push_back( m_netP );
     rv.push_back( m_netN );
     return rv;

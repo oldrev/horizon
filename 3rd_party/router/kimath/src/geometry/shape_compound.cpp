@@ -1,7 +1,7 @@
 /*
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
- * Copyright (C) 2020 KiCad Developers
+ * Copyright The KiCad Developers
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software; you can redistribute it and/or
@@ -27,7 +27,7 @@
 
 #include <geometry/shape_compound.h>
 
-const std::string SHAPE_COMPOUND::Format() const
+const std::string SHAPE_COMPOUND::Format( bool aCplusPlus ) const
 {
     std::stringstream ss;
 
@@ -102,9 +102,10 @@ int SHAPE_COMPOUND::Distance( const SEG& aSeg ) const
 }
 
 
-void SHAPE_COMPOUND::Rotate( double aAngle, const VECTOR2I& aCenter )
+void SHAPE_COMPOUND::Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter )
 {
-    assert( false );
+    for( auto& item : m_shapes )
+        item->Rotate( aAngle, aCenter );
 }
 
 
@@ -134,8 +135,16 @@ bool SHAPE_COMPOUND::Collide( const SEG& aSeg, int aClearance, int* aActual,
                 nearest = pn;
                 closest_dist = actual;
 
-                if( closest_dist == 0 || !aActual )
+                if( !aLocation && !aActual )
                     break;
+            }
+            else if( aLocation && actual == closest_dist )
+            {
+                if( ( pn - aSeg.A ).SquaredEuclideanNorm()
+                    < ( nearest - aSeg.A ).SquaredEuclideanNorm() )
+                {
+                    nearest = pn;
+                }
             }
         }
     }
@@ -155,7 +164,9 @@ bool SHAPE_COMPOUND::Collide( const SEG& aSeg, int aClearance, int* aActual,
 }
 
 
-bool SHAPE_COMPOUND::ConvertToSimplePolygon( SHAPE_SIMPLE* aOut ) const
+void SHAPE_COMPOUND::TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aError,
+                                         ERROR_LOC aErrorLoc ) const
 {
-    return false;
+    for( SHAPE* item : m_shapes )
+        item->TransformToPolygon( aBuffer, aError, aErrorLoc );
 }

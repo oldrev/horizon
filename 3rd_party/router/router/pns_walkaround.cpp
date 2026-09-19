@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -19,299 +19,387 @@
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <chrono>
 #include <optional>
 
+#include <advanced_config.h>
+#include <core/typeinfo.h>
 #include <geometry/shape_line_chain.h>
 
 #include "pns_walkaround.h"
 #include "pns_optimizer.h"
-#include "pns_utils.h"
 #include "pns_router.h"
 #include "pns_debug_decorator.h"
+#include "pns_solid.h"
+
 
 namespace PNS {
 
 void WALKAROUND::start( const LINE& aInitialPath )
 {
     m_iteration = 0;
-    m_iterationLimit = 50;
+    for( int pol = 0 ; pol < MaxWalkPolicies; pol++)
+    {
+        m_currentResult.status[ pol ] = ST_IN_PROGRESS;
+        m_currentResult.lines[ pol ] = aInitialPath;
+        m_currentResult.lines[ pol ].ClearLinks();
+    }
 }
 
 
 NODE::OPT_OBSTACLE WALKAROUND::nearestObstacle( const LINE& aPath )
 {
-    NODE::OPT_OBSTACLE obs = m_world->NearestObstacle(
-            &aPath, m_itemMask, m_restrictedSet.empty() ? nullptr : &m_restrictedSet );
+    COLLISION_SEARCH_OPTIONS opts;
 
-    if( m_restrictedSet.empty() )
-        return obs;
+    opts.m_kindMask = m_itemMask;
 
-    else if( obs && m_restrictedSet.find ( obs->m_item ) != m_restrictedSet.end() )
-        return obs;
+    if( ! m_restrictedSet.empty() )
+    {
+        opts.m_filter = [ this ] ( const ITEM* item ) -> bool
+        {
+            if( m_restrictedSet.find( item ) != m_restrictedSet.end() )
+                return true;
+            return false;
+        };
+    }
 
-    return NODE::OPT_OBSTACLE();
+    opts.m_useClearanceEpsilon = true;
+    return m_world->NearestObstacle( &aPath, opts );
 }
 
 
-WALKAROUND::WALKAROUND_STATUS WALKAROUND::singleStep( LINE& aPath, bool aWindingDirection )
+void WALKAROUND::RestrictToCluster( bool aEnabled, const TOPOLOGY::CLUSTER& aCluster )
 {
-    std::optional<OBSTACLE>& current_obs =
-        aWindingDirection ? m_currentObstacle[0] : m_currentObstacle[1];
+    m_restrictedVertices.clear();
+    m_restrictedSet.clear();
 
-    if( !current_obs )
-        return DONE;
-
-    VECTOR2I initialLast = aPath.CPoint( -1 );
-
-    SHAPE_LINE_CHAIN path_walk;
-
-    bool s_cw = aPath.Walkaround( current_obs->m_hull, path_walk, aWindingDirection );
-
-    PNS_DBG( Dbg(), BeginGroup, "hull/walk" );
-    char name[128];
-    snprintf( name, sizeof( name ), "hull-%s-%d", aWindingDirection ? "cw" : "ccw", m_iteration );
-    PNS_DBG( Dbg(), AddLine, current_obs->m_hull, RED, 1, name );
-    snprintf( name, sizeof( name ), "path-%s-%d", aWindingDirection ? "cw" : "ccw", m_iteration );
-    PNS_DBG( Dbg(), AddLine, aPath.CLine(), GREEN, 1, name );
-    snprintf( name, sizeof( name ), "result-%s-%d", aWindingDirection ? "cw" : "ccw", m_iteration );
-    PNS_DBG( Dbg(), AddLine, path_walk, BLUE, 10000, name );
-    PNS_DBG( Dbg(), Message, wxString::Format( wxT( "Stat cw %d" ), !!s_cw ) );
-    PNS_DBGN( Dbg(), EndGroup );
-
-    path_walk.Simplify();
-    aPath.SetShape( path_walk );
-
-    // If the end of the line is inside an obstacle, additional walkaround iterations are not
-    // going to help.  Exit now to prevent pegging the iteration limiter and causing lag.
-    if( current_obs && current_obs->m_hull.PointInside( initialLast ) &&
-        !current_obs->m_hull.PointOnEdge( initialLast ) )
+    if( aEnabled )
     {
-        return ALMOST_DONE;
+        for( ITEM* item : aCluster.m_items )
+        {
+            m_restrictedSet.insert( item );
+
+            if ( item->HasHole() )
+                m_restrictedSet.insert( item->Hole() );
+        }
     }
 
-    current_obs = nearestObstacle( LINE( aPath, path_walk ) );
+    for( ITEM* item : aCluster.m_items )
+    {
+        if( SOLID* solid = dyn_cast<SOLID*>( item ) )
+            m_restrictedVertices.push_back( solid->Anchor( 0 ) );
+    }
+}
 
-    return IN_PROGRESS;
+bool WALKAROUND::singleStep()
+{
+    TOPOLOGY topo( m_world );
+    TOPOLOGY::CLUSTER pendingClusters[MaxWalkPolicies];
+
+    for( int i = 0; i < MaxWalkPolicies; i++ )
+    {
+        if( !m_enabledPolicies[i] )
+            continue;
+
+        auto& line = m_currentResult.lines[ i ];
+        auto& status = m_currentResult.status[ i ];
+
+        PNS_DBG( Dbg(), AddItem, &line, WHITE, 10000, wxString::Format( "current (policy %d, stat %d)", i, status ) );
+
+        if( status != ST_IN_PROGRESS )
+            continue;
+
+        auto obstacle = nearestObstacle( line );
+
+        if( !obstacle )
+        {
+
+            m_currentResult.status[ i ] = ST_DONE;
+            PNS_DBG( Dbg(), Message,  wxString::Format( "no-more-colls pol %d st %d", i, status ) );
+
+            continue;
+        }
+
+
+        pendingClusters[ i ] = topo.AssembleCluster( obstacle->m_item, line.Layer(), 0.0, line.Net() );
+        PNS_DBG( Dbg(), AddItem, obstacle->m_item, BLUE, 10000, wxString::Format( "col-item owner-depth %d cl-items=%d", static_cast<const NODE*>( obstacle->m_item->Owner() )->Depth(), (int) pendingClusters[i].m_items.size() ) );
+
+    }
+
+    DIRECTION_45::CORNER_MODE cornerMode = Settings().GetCornerMode();
+
+    auto processCluster = [ & ] ( TOPOLOGY::CLUSTER& aCluster, LINE& aLine, bool aCw ) -> bool
+    {
+        using namespace std::chrono;
+        auto start_time = steady_clock::now();
+
+        int timeout_ms = ADVANCED_CFG::GetCfg().m_PNSProcessClusterTimeout;
+
+        PNS_DBG( Dbg(), BeginGroup, wxString::Format( "cluster-details [cw %d]", aCw?1:0 ), 1 );
+
+        for( auto& clItem : aCluster.m_items )
+        {
+            // Check for wallclock timeout
+            // Emprically, 100ms seems to be about where you're not going to find a valid path
+            // if you haven't found it by then.  This allows the user to adjust their mouse position
+            // to get a better path without waiting too long.
+            auto now = steady_clock::now();
+            auto elapsed = duration_cast<milliseconds>( now - start_time ).count();
+
+            if( elapsed > timeout_ms )
+            {
+                PNS_DBG( Dbg(), Message, wxString::Format( "processCluster timeout after %d ms", timeout_ms ) );
+                PNS_DBGN( Dbg(), EndGroup );
+                return false;
+            }
+
+            int clearance = m_world->GetClearance( clItem, &aLine, false );
+            const SHAPE_LINE_CHAIN& cachedHull = m_world->GetRuleResolver()->HullCache(
+                    clItem, clearance, aLine.Width(), aLine.Layer() );
+
+            SHAPE_LINE_CHAIN hull;
+
+            if( cornerMode == DIRECTION_45::MITERED_90 || cornerMode == DIRECTION_45::ROUNDED_90 )
+            {
+                BOX2I bbox = cachedHull.BBox();
+                hull.Append( bbox.GetLeft(),  bbox.GetTop()    );
+                hull.Append( bbox.GetRight(), bbox.GetTop()    );
+                hull.Append( bbox.GetRight(), bbox.GetBottom() );
+                hull.Append( bbox.GetLeft(),  bbox.GetBottom() );
+            }
+            else
+            {
+                hull = cachedHull;
+            }
+
+            LINE tmp( aLine );
+
+            aLine.Line().Simplify2();
+
+            bool stat = aLine.Walkaround( hull, tmp.Line(), aCw );
+
+            PNS_DBG( Dbg(), AddShape, &hull, YELLOW, 10000, wxString::Format( "hull stat %d", stat?1:0 ) );
+            PNS_DBG( Dbg(), AddItem, &tmp, RED, 10000, wxString::Format( "walk stat %d", stat?1:0 ) );
+            PNS_DBG( Dbg(), AddItem, clItem, WHITE, 10000, wxString::Format( "item stat %d", stat?1:0 ) );
+
+            if( !stat )
+            {
+                PNS_DBGN( Dbg(), EndGroup );
+                return false;
+            }
+
+            aLine.SetShape( tmp.CLine() );
+        }
+
+        PNS_DBGN( Dbg(), EndGroup );
+
+        return true;
+    };
+
+    if ( m_enabledPolicies[WP_CW] )
+    {
+        bool stat = processCluster( pendingClusters[ WP_CW ], m_currentResult.lines[ WP_CW ], true );
+        if( !stat )
+            m_currentResult.status[ WP_CW ] = ST_STUCK;
+    }
+
+    if ( m_enabledPolicies[WP_CCW] )
+    {
+        bool stat = processCluster( pendingClusters[ WP_CCW ], m_currentResult.lines[ WP_CCW ], false );
+        if( !stat )
+            m_currentResult.status[ WP_CCW ] = ST_STUCK;
+    }
+
+    if( m_enabledPolicies[WP_SHORTEST] )
+    {
+        LINE& line = m_currentResult.lines[WP_SHORTEST];
+        LINE  path_cw( line ), path_ccw( line );
+
+        auto st_cw = processCluster( pendingClusters[WP_SHORTEST], path_cw, true );
+        auto st_ccw = processCluster( pendingClusters[WP_SHORTEST], path_ccw, false );
+
+        bool cw_coll = st_cw ? m_world->CheckColliding( &path_cw ).has_value() : false;
+        bool ccw_coll = st_ccw ? m_world->CheckColliding( &path_ccw ).has_value() : false;
+
+        double lengthFactorCw = (double) path_cw.CLine().Length() / (double) m_initialLength;
+        double lengthFactorCcw = (double) path_ccw.CLine().Length() / (double) m_initialLength;
+
+        PNS_DBG( Dbg(), AddItem, &path_cw, RED, 10000, wxString::Format( "shortest-cw stat %d lf %.1f", st_cw?1:0, lengthFactorCw ) );
+        PNS_DBG( Dbg(), AddItem, &path_ccw, BLUE, 10000, wxString::Format( "shortest-ccw stat %d lf %.1f", st_ccw?1:0, lengthFactorCcw ) );
+
+
+        std::optional<LINE> shortest;
+        std::optional<LINE> shortest_alt;
+
+
+        if( st_cw && st_ccw )
+        {
+            if( ( !cw_coll && !ccw_coll ) || ( cw_coll && ccw_coll ) )
+            {
+                if( path_cw.CLine().Length() > path_ccw.CLine().Length() )
+                {
+                    shortest = path_ccw;
+                    shortest_alt = path_cw;
+                }
+                else
+                {
+                    shortest = path_cw;
+                    shortest_alt = path_ccw;
+                }
+            }
+            else if( !cw_coll )
+                shortest = path_cw;
+            else if( !ccw_coll )
+                shortest = path_ccw;
+
+        }
+        else if( st_ccw )
+            shortest = path_ccw;
+        else if( st_cw )
+            shortest = path_cw;
+
+        bool anyColliding = false;
+
+        if( shortest.has_value() )
+        {
+            PNS_DBG( Dbg(), AddItem, &shortest.value(), RED, 10000, wxString::Format( "shortest-l" ) );
+
+            for( auto& item : m_processedItems )
+            {
+                std::set<PNS::OBSTACLE> obstacles;
+                PNS::COLLISION_SEARCH_CONTEXT ctx( obstacles );
+                if( shortest->Collide( item, m_world, shortest->Layer(), &ctx ) )
+                {
+                    anyColliding = true;
+                    break;
+                }
+            }
+
+            PNS_DBG( Dbg(), Message, wxString::Format("check-back cc %d items %d coll %d", (int) pendingClusters[ WP_SHORTEST ].m_items.size(), (int) m_processedItems.size(), anyColliding ? 1: 0 ) );
+        }
+
+        if ( anyColliding )
+        {
+            shortest = std::move( shortest_alt );
+        }
+
+        if( !shortest )
+        {
+            m_currentResult.status[WP_SHORTEST] = ST_STUCK;
+        }
+        else
+        {
+            m_currentResult.lines[WP_SHORTEST] = *shortest;
+        }
+
+        for( auto item : pendingClusters[ WP_SHORTEST ].m_items )
+            m_processedItems.insert( item );
+    }
+
+    return ST_IN_PROGRESS;
 }
 
 
 const WALKAROUND::RESULT WALKAROUND::Route( const LINE& aInitialPath )
 {
-    LINE path_cw( aInitialPath ), path_ccw( aInitialPath );
-    WALKAROUND_STATUS s_cw = IN_PROGRESS, s_ccw = IN_PROGRESS;
-    SHAPE_LINE_CHAIN best_path;
     RESULT result;
 
+    m_initialLength = aInitialPath.CLine().Length();
+
     // special case for via-in-the-middle-of-track placement
+
+#if 0
     if( aInitialPath.PointCount() <= 1 )
     {
         if( aInitialPath.EndsWithVia() && m_world->CheckColliding( &aInitialPath.Via(),
                                                                    m_itemMask ) )
-            return RESULT( STUCK, STUCK );
+            {
+                // fixme restult
+            }
+            //return RESULT( STUCK, STUCK );
 
-        return RESULT( DONE, DONE, aInitialPath, aInitialPath );
+        return RESULT(); //( DONE, DONE, aInitialPath, aInitialPath );
     }
+#endif
 
     start( aInitialPath );
 
-    m_currentObstacle[0] = m_currentObstacle[1] = nearestObstacle( aInitialPath );
-    m_recursiveBlockageCount = 0;
+    m_processedItems.clear();
 
-    result.lineCw = aInitialPath;
-    result.lineCcw = aInitialPath;
-
-    if( m_forceWinding )
-    {
-        s_cw = m_forceCw ? IN_PROGRESS : STUCK;
-        s_ccw = m_forceCw ? STUCK : IN_PROGRESS;
-        m_forceSingleDirection = true;
-    }
-    else
-    {
-        m_forceSingleDirection = false;
-    }
-
-    // In some situations, there isn't a trivial path (or even a path at all).  Hitting the
-    // iteration limit causes lag, so we can exit out early if the walkaround path gets very long
-    // compared with the initial path.  If the length exceeds the initial length times this factor,
-    // fail out.
-    const int maxWalkDistFactor = 10;
-    long long lengthLimit       = aInitialPath.CLine().Length() * maxWalkDistFactor;
+    PNS_DBG( Dbg(), AddItem, &aInitialPath, WHITE, 10000, wxT( "initial-path" ) );
 
     while( m_iteration < m_iterationLimit )
     {
-        if( s_cw != STUCK && s_cw != ALMOST_DONE )
-            s_cw = singleStep( path_cw, true );
+        singleStep();
 
-        if( s_ccw != STUCK && s_ccw != ALMOST_DONE )
-            s_ccw = singleStep( path_ccw, false );
+        bool stillInProgress = false;
 
-        if( s_cw != IN_PROGRESS )
+        for( int pol = 0; pol < MaxWalkPolicies; pol++ )
         {
-            result.lineCw = path_cw;
-            result.statusCw = s_cw;
+            if (!m_enabledPolicies[pol])
+                continue;
+
+            auto& st = m_currentResult.status[pol];
+            auto& ln = m_currentResult.lines[pol];
+            double lengthFactor = (double) ln.CLine().Length() / (double) aInitialPath.CLine().Length();
+            // In some situations, there isn't a trivial path (or even a path at all).  Hitting the
+            // iteration limit causes lag, so we can exit out early if the walkaround path gets very long
+            // compared with the initial path.  If the length exceeds the initial length times this factor,
+            // fail out.
+            if( m_lengthLimitOn )
+            {
+                if( st != ST_DONE && lengthFactor > m_lengthExpansionFactor )
+                    st = ST_ALMOST_DONE;
+            }
+
+            PNS_DBG( Dbg(), Message, wxString::Format( "check-wp iter %d st %d i %d lf %.1f", m_iteration, st, pol, lengthFactor ) );
+
+            if ( st == ST_IN_PROGRESS )
+                stillInProgress = true;
         }
 
-        if( s_ccw != IN_PROGRESS )
-        {
-            result.lineCcw = path_ccw;
-            result.statusCcw = s_ccw;
-        }
 
-        if( s_cw != IN_PROGRESS && s_ccw != IN_PROGRESS )
-            break;
-
-        // Safety valve
-        if( path_cw.Line().Length() > lengthLimit && path_ccw.Line().Length() > lengthLimit )
+        if( !stillInProgress )
             break;
 
         m_iteration++;
     }
 
-    if( s_cw == IN_PROGRESS )
+
+    for( int pol = 0; pol < MaxWalkPolicies; pol++ )
     {
-        result.lineCw = path_cw;
-        result.statusCw = ALMOST_DONE;
+        auto&       st = m_currentResult.status[pol];
+        const auto& ln = m_currentResult.lines[pol].CLine();
+
+        m_currentResult.lines[pol].ClearLinks();
+        if( st == ST_IN_PROGRESS )
+            st = ST_ALMOST_DONE;
+
+        if( ln.SegmentCount() < 1 || ln.CPoint( 0 ) != aInitialPath.CPoint( 0 ) )
+        {
+            st = ST_STUCK;
+        }
+
+        if( ln.PointCount() > 0 && ln.CLastPoint() != aInitialPath.CLastPoint() )
+        {
+            st = ST_ALMOST_DONE;
+
+        }
+        PNS_DBG( Dbg(), Message, wxString::Format( "stat=%d", st ) );
+
     }
 
-    if( s_ccw == IN_PROGRESS )
-    {
-        result.lineCcw = path_ccw;
-        result.statusCcw = ALMOST_DONE;
-    }
 
-    if( result.lineCw.SegmentCount() < 1 || result.lineCw.CPoint( 0 ) != aInitialPath.CPoint( 0 ) )
-    {
-        result.statusCw = STUCK;
-    }
-
-    if( result.lineCw.PointCount() > 0 && result.lineCw.CPoint( -1 ) != aInitialPath.CPoint( -1 ) )
-    {
-        result.statusCw = ALMOST_DONE;
-    }
-
-    if( result.lineCcw.SegmentCount() < 1 ||
-        result.lineCcw.CPoint( 0 ) != aInitialPath.CPoint( 0 ) )
-    {
-        result.statusCcw = STUCK;
-    }
-
-    if( result.lineCcw.PointCount() > 0 &&
-        result.lineCcw.CPoint( -1 ) != aInitialPath.CPoint( -1 ) )
-    {
-        result.statusCcw = ALMOST_DONE;
-    }
-
-    return result;
+    return m_currentResult;
 }
 
-
-WALKAROUND::WALKAROUND_STATUS WALKAROUND::Route( const LINE& aInitialPath, LINE& aWalkPath,
-                                                 bool aOptimize )
+void WALKAROUND::SetAllowedPolicies( std::vector<WALK_POLICY> aPolicies)
 {
-    LINE path_cw( aInitialPath ), path_ccw( aInitialPath );
-    WALKAROUND_STATUS s_cw = IN_PROGRESS, s_ccw = IN_PROGRESS;
-    SHAPE_LINE_CHAIN best_path;
+    for( int i = 0; i < MaxWalkPolicies; i++ )
+        m_enabledPolicies[i] =  false;
 
-    // special case for via-in-the-middle-of-track placement
-    if( aInitialPath.PointCount() <= 1 )
-    {
-        if( aInitialPath.EndsWithVia() && m_world->CheckColliding( &aInitialPath.Via(),
-                                                                   m_itemMask ) )
-            return STUCK;
-
-        aWalkPath = aInitialPath;
-        return DONE;
-    }
-
-    start( aInitialPath );
-
-    m_currentObstacle[0] = m_currentObstacle[1] = nearestObstacle( aInitialPath );
-    m_recursiveBlockageCount = 0;
-
-    aWalkPath = aInitialPath;
-
-    if( m_forceWinding )
-    {
-        s_cw = m_forceCw ? IN_PROGRESS : STUCK;
-        s_ccw = m_forceCw ? STUCK : IN_PROGRESS;
-        m_forceSingleDirection = true;
-    }
-    else
-    {
-        m_forceSingleDirection = false;
-    }
-
-    while( m_iteration < m_iterationLimit )
-    {
-        if( path_cw.PointCount() == 0 )
-            s_cw = STUCK; // cw path is empty, can't continue
-
-        if( path_ccw.PointCount() == 0 )
-            s_ccw = STUCK; // ccw path is empty, can't continue
-
-        if( s_cw != STUCK )
-            s_cw = singleStep( path_cw, true );
-
-        if( s_ccw != STUCK )
-            s_ccw = singleStep( path_ccw, false );
-
-        if( ( s_cw == DONE && s_ccw == DONE ) || ( s_cw == STUCK && s_ccw == STUCK ) )
-        {
-            int len_cw  = path_cw.CLine().Length();
-            int len_ccw = path_ccw.CLine().Length();
-
-            if( m_forceLongerPath )
-                aWalkPath = ( len_cw > len_ccw ? path_cw : path_ccw );
-            else
-                aWalkPath = ( len_cw < len_ccw ? path_cw : path_ccw );
-
-            break;
-        }
-        else if( s_cw == DONE && !m_forceLongerPath )
-        {
-            aWalkPath = path_cw;
-            break;
-        }
-        else if( s_ccw == DONE && !m_forceLongerPath )
-        {
-            aWalkPath = path_ccw;
-            break;
-        }
-
-        m_iteration++;
-    }
-
-    if( m_iteration == m_iterationLimit )
-    {
-        int len_cw  = path_cw.CLine().Length();
-        int len_ccw = path_ccw.CLine().Length();
-
-        if( m_forceLongerPath )
-            aWalkPath = ( len_cw > len_ccw ? path_cw : path_ccw );
-        else
-            aWalkPath = ( len_cw < len_ccw ? path_cw : path_ccw );
-    }
-
-    aWalkPath.Line().Simplify();
-
-    if( aWalkPath.SegmentCount() < 1 )
-        return STUCK;
-
-    if( aWalkPath.CPoint( -1 ) != aInitialPath.CPoint( -1 ) )
-        return ALMOST_DONE;
-
-    if( aWalkPath.CPoint( 0 ) != aInitialPath.CPoint( 0 ) )
-        return STUCK;
-
-    WALKAROUND_STATUS st = s_ccw == DONE || s_cw == DONE ? DONE : STUCK;
-
-    if( st == DONE )
-    {
-        if( aOptimize )
-            OPTIMIZER::Optimize( &aWalkPath, OPTIMIZER::MERGE_OBTUSE, m_world );
-    }
-
-    return st;
+    for ( auto p : aPolicies )
+        m_enabledPolicies[p] = true;
 }
+
 }

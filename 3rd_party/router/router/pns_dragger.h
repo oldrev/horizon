@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -73,7 +73,7 @@ public:
      * and eventually commits it to the world.
      * @return true, if dragging finished with success.
      */
-    bool FixRoute() override;
+    bool FixRoute( bool aForceCommit ) override;
 
     /**
      * Function CurrentNode()
@@ -86,12 +86,9 @@ public:
     /**
      * Function CurrentNets()
      *
-     * Returns the net code(s) of currently routed track(s).
+     * Returns the net(s) of currently routed track(s).
      */
-    const std::vector<int> CurrentNets() const override
-    {
-        return std::vector<int>( 1, m_draggedLine.Net() );
-    }
+    const std::vector<NET_HANDLE> CurrentNets() const override;
 
     /**
      * Function CurrentLayer()
@@ -103,6 +100,16 @@ public:
         return m_draggedLine.Layer();
     }
 
+    const LINE& GetOriginalLine()
+    {
+        return m_draggedLine;
+    }
+
+    const LINE& GetLastDragSolution()
+    {
+        return m_lastDragSolution;
+    }
+
     /**
      * Function Traces()
      *
@@ -110,7 +117,15 @@ public:
      */
     const ITEM_SET Traces() override;
 
-    void SetMode( int aDragMode ) override;
+    void SetMode( PNS::DRAG_MODE aDragMode ) override;
+
+    PNS::DRAG_MODE Mode() const override;
+
+    bool GetForceMarkObstaclesMode( bool* aDragStatus ) const override
+    {
+        *aDragStatus = m_dragStatus;
+        return m_forceMarkObstaclesMode;
+    }
 
 private:
     const ITEM_SET findViaFanoutByHandle ( NODE *aNode, const VIA_HANDLE& handle );
@@ -133,6 +148,7 @@ private:
     VIA_HANDLE             m_draggedVia;
 
     NODE*                  m_lastNode;
+    NODE*                  m_preDragNode;
     int                    m_mode;
     LINE                   m_draggedLine;
     LINE                   m_lastDragSolution;
@@ -148,6 +164,7 @@ private:
 
     ///< If true, moves the connection lines without maintaining 45 degrees corners
     bool                   m_freeAngleMode;
+    bool                   m_forceMarkObstaclesMode;
     MOUSE_TRAIL_TRACER     m_mouseTrailTracer;
 };
 

@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -25,8 +25,7 @@
 
 #include <vector>
 #include <list>
-#include <unordered_set>
-#include <unordered_map>
+#include <set>
 #include <core/minoptmax.h>
 
 #include <geometry/shape_line_chain.h>
@@ -36,6 +35,7 @@
 #include "pns_joint.h"
 #include "pns_itemset.h"
 
+class ZONE;
 namespace PNS {
 
 class ARC;
@@ -47,10 +47,6 @@ class INDEX;
 class ROUTER;
 class NODE;
 
-/**
- * An abstract function object, returning a design rule (clearance, diff pair gap, etc) required
- * between two items.
- */
 
 enum class CONSTRAINT_TYPE
 {
@@ -62,8 +58,17 @@ enum class CONSTRAINT_TYPE
     CT_VIA_HOLE = 6,
     CT_HOLE_CLEARANCE = 7,
     CT_EDGE_CLEARANCE = 8,
-    CT_HOLE_TO_HOLE = 9
+    CT_HOLE_TO_HOLE = 9,
+    CT_DIFF_PAIR_SKEW = 10,
+    CT_MAX_UNCOUPLED = 11,
+    CT_PHYSICAL_CLEARANCE = 12,
+    CT_PHYSICAL_HOLE_CLEARANCE = 13
 };
+
+/**
+ * An abstract function object, returning a design rule (clearance, diff pair gap, etc) required
+ * between two items.
+ */
 
 struct CONSTRAINT
 {
@@ -73,44 +78,110 @@ struct CONSTRAINT
     wxString        m_RuleName;
     wxString        m_FromName;
     wxString        m_ToName;
+    bool            m_IsTimeDomain;
 };
 
-class RULE_RESOLVER
-{
-public:
-    virtual ~RULE_RESOLVER() {}
-
-    virtual int Clearance( const ITEM* aA, const ITEM* aB ) = 0;
-    virtual int HoleClearance( const ITEM* aA, const ITEM* aB ) = 0;
-    virtual int HoleToHoleClearance( const ITEM* aA, const ITEM* aB ) = 0;
-
-    virtual int DpCoupledNet( int aNet ) = 0;
-    virtual int DpNetPolarity( int aNet ) = 0;
-    virtual bool DpNetPair( const ITEM* aItem, int& aNetP, int& aNetN ) = 0;
-
-    virtual bool IsDiffPair( const ITEM* aA, const ITEM* aB ) = 0;
-
-    virtual bool QueryConstraint( CONSTRAINT_TYPE aType, const PNS::ITEM* aItemA,
-                                  const PNS::ITEM* aItemB, int aLayer,
-                                  PNS::CONSTRAINT* aConstraint ) = 0;
-
-    virtual wxString NetName( int aNet ) = 0;
-
-    virtual void ClearCacheForItem( const ITEM* aItem ) {}
-};
 
 /**
  * Hold an object colliding with another object, along with some useful data about the collision.
  */
 struct OBSTACLE
 {
-    const ITEM*      m_head;        ///< Item we search collisions with
+    ITEM*            m_head = nullptr;           ///< Line we search collisions against
+    ITEM*            m_item = nullptr;           ///< Item found to be colliding with m_head
+    VECTOR2I         m_ipFirst;        ///< First intersection between m_head and m_hull
+    int              m_clearance;
+    VECTOR2I         m_pos;
+    int              m_distFirst;      ///< ... and the distance thereof
+    int              m_maxFanoutWidth; ///< worst case (largest) width of the tracks connected to the item
 
-    ITEM*            m_item;        ///< Item found to be colliding with m_head
-    SHAPE_LINE_CHAIN m_hull;        ///< Hull of the colliding m_item
-    VECTOR2I         m_ipFirst;     ///< First intersection between m_head and m_hull
-    int              m_distFirst;   ///< ... and the distance thereof
+    bool operator==(const OBSTACLE& other) const
+    {
+        return m_head == other.m_head && m_item == other.m_item;
+    }
+
+    bool operator<(const OBSTACLE& other) const
+    {
+        if( (uintptr_t)m_head < (uintptr_t)other.m_head )
+            return true;
+        else if ( m_head == other.m_head )
+            return (uintptr_t)m_item < (uintptr_t)other.m_item;
+        return false;
+    }
 };
+
+
+struct COLLISION_SEARCH_OPTIONS
+{
+    bool m_differentNetsOnly = true;
+    int m_overrideClearance = -1;
+    int m_limitCount = -1;
+    int m_kindMask = -1;
+    bool m_useClearanceEpsilon = true;
+    std::function<bool(const ITEM*)> m_filter = nullptr;
+    int m_layer = -1;
+};
+
+
+struct COLLISION_SEARCH_CONTEXT
+{
+    COLLISION_SEARCH_CONTEXT( std::set<OBSTACLE>& aObs, const COLLISION_SEARCH_OPTIONS aOpts = COLLISION_SEARCH_OPTIONS() ) :
+        obstacles( aObs ),
+        options( aOpts )
+    {
+    }
+
+    std::set<OBSTACLE>& obstacles;
+    const COLLISION_SEARCH_OPTIONS options;
+};
+
+
+class RULE_RESOLVER
+{
+public:
+    virtual ~RULE_RESOLVER() {}
+
+    virtual int Clearance( const ITEM* aA, const ITEM* aB, bool aUseClearanceEpsilon = true ) = 0;
+    virtual bool HasUserDefinedPhysicalConstraint() { return false; }
+
+    virtual NET_HANDLE DpCoupledNet( NET_HANDLE aNet ) = 0;
+    virtual int DpNetPolarity( NET_HANDLE aNet ) = 0;
+    virtual bool DpNetPair( const ITEM* aItem, NET_HANDLE& aNetP, NET_HANDLE& aNetN ) = 0;
+
+    virtual int NetCode( NET_HANDLE aNet ) = 0;
+    virtual wxString NetName( NET_HANDLE aNet ) = 0;
+
+    virtual bool IsInNetTie( const ITEM* aA ) = 0;
+    virtual bool IsNetTieExclusion( const ITEM* aItem, const VECTOR2I& aCollisionPos,
+                                    const ITEM* aCollidingItem ) = 0;
+
+    virtual bool IsDrilledHole( const PNS::ITEM* aItem ) = 0;
+    virtual bool IsNonPlatedSlot( const PNS::ITEM* aItem ) = 0;
+
+    /**
+     * @return true if \a aObstacle is a keepout.  Set \a aEnforce if said keepout's rules
+     *         exclude \a aItem.
+     */
+    virtual bool IsKeepout( const ITEM* aObstacle, const ITEM* aItem, bool* aEnforce ) = 0;
+
+    virtual bool QueryConstraint( CONSTRAINT_TYPE aType, const ITEM* aItemA, const ITEM* aItemB,
+                                  int aLayer, CONSTRAINT* aConstraint ) = 0;
+
+    virtual void ClearCacheForItems( std::vector<const ITEM*>& aItems ) {}
+    virtual void ClearCaches() {}
+    virtual void ClearTemporaryCaches() {}
+
+    virtual int ClearanceEpsilon() const { return 0; }
+
+    virtual const SHAPE_LINE_CHAIN& HullCache( const ITEM* aItem, int aClearance,
+                                               int aWalkaroundThickness, int aLayer )
+    {
+        static SHAPE_LINE_CHAIN empty;
+        empty = aItem->Hull( aClearance, aWalkaroundThickness, aLayer );
+        return empty;
+    }
+};
+
 
 class OBSTACLE_VISITOR
 {
@@ -123,6 +194,9 @@ public:
 
     void SetWorld( const NODE* aNode, const NODE* aOverride = nullptr );
 
+    void SetLayerContext( int aLayer ) { m_layerContext = aLayer; }
+    void ClearLayerContext() { m_layerContext = std::nullopt; }
+
     virtual bool operator()( ITEM* aCandidate ) = 0;
 
 protected:
@@ -133,6 +207,26 @@ protected:
 
     const NODE* m_node;             ///< node we are searching in (either root or a branch)
     const NODE* m_override;         ///< node that overrides root entries
+    std::optional<int> m_layerContext;
+};
+
+
+class LAYER_CONTEXT_SETTER
+{
+public:
+    LAYER_CONTEXT_SETTER( OBSTACLE_VISITOR& aVisitor, int aLayer ) :
+            m_visitor( aVisitor )
+    {
+        m_visitor.SetLayerContext( aLayer );
+    }
+
+    ~LAYER_CONTEXT_SETTER()
+    {
+        m_visitor.ClearLayerContext();
+    }
+
+private:
+    OBSTACLE_VISITOR& m_visitor;
 };
 
 /**
@@ -144,20 +238,26 @@ protected:
  * - assembly of lines connecting joints, finding loops and unique paths.
  * - lightweight cloning/branching (for recursive optimization and shove springback).
  **/
-class NODE
+class NODE : public ITEM_OWNER
 {
 public:
+
+///< Supported item types
+    enum COLLISION_QUERY_SCOPE
+    {
+        CQS_ALL_RULES               =    1, ///< check all rules
+        CQS_IGNORE_HOLE_CLEARANCE   =    2  ///< check everything except hole2hole / hole2copper
+    };
+
     typedef std::optional<OBSTACLE>         OPT_OBSTACLE;
     typedef std::vector<ITEM*>    ITEM_VECTOR;
-    typedef std::vector<OBSTACLE> OBSTACLES;
+    typedef std::set<OBSTACLE>    OBSTACLES;
 
     NODE();
     ~NODE();
 
     ///< Return the expected clearance between items a and b.
-    int GetClearance( const ITEM* aA, const ITEM* aB ) const;
-    int GetHoleClearance( const ITEM* aA, const ITEM* aB ) const;
-    int GetHoleToHoleClearance( const ITEM* aA, const ITEM* aB ) const;
+    int GetClearance( const ITEM* aA, const ITEM* aB, bool aUseClearanceEpsilon = true ) const;
 
     ///< Return the pre-set worst case clearance between any pair of items.
     int GetMaxClearance() const
@@ -203,22 +303,22 @@ public:
      * @param aLimitCount stop looking for collisions after finding this number of colliding items
      * @return number of obstacles found
      */
-    int QueryColliding( const ITEM* aItem, OBSTACLES& aObstacles, int aKindMask = ITEM::ANY_T,
-                        int aLimitCount = -1, bool aDifferentNetsOnly = true );
+    int QueryColliding( const ITEM* aItem, OBSTACLES& aObstacles,
+                        const COLLISION_SEARCH_OPTIONS& aOpts = COLLISION_SEARCH_OPTIONS() ) const;
 
     int QueryJoints( const BOX2I& aBox, std::vector<JOINT*>& aJoints,
-                     LAYER_RANGE aLayerMask = LAYER_RANGE::All(), int aKindMask = ITEM::ANY_T );
+                     PNS_LAYER_RANGE aLayerMask = PNS_LAYER_RANGE::All(), int aKindMask = ITEM::ANY_T );
 
     /**
      * Follow the line in search of an obstacle that is nearest to the starting to the line's
      * starting point.
      *
      * @param aLine the item to find collisions with
-     * @param aKindMask mask of obstacle types to take into account
+     * @param aOpts options for the search
      * @return the obstacle, if found, otherwise empty.
      */
-    OPT_OBSTACLE NearestObstacle( const LINE* aLine, int aKindMask = ITEM::ANY_T,
-                                  const std::set<ITEM*>* aRestrictedSet = nullptr );
+    OPT_OBSTACLE NearestObstacle( const LINE* aLine,
+                                  const COLLISION_SEARCH_OPTIONS& aOpts = COLLISION_SEARCH_OPTIONS() );
 
     /**
      * Check if the item collides with anything else in the world, and if found, returns the
@@ -242,6 +342,16 @@ public:
     OPT_OBSTACLE CheckColliding( const ITEM_SET&  aSet, int aKindMask = ITEM::ANY_T );
 
     /**
+     * Check if the item collides with anything else in the world, and if found, returns the
+     * obstacle.
+     *
+     * @param aItem the item to find collisions with
+     * @param aOpts options for the search
+     * @return the obstacle, if found, otherwise empty.
+     */
+    OPT_OBSTACLE CheckColliding( const ITEM* aItem, const COLLISION_SEARCH_OPTIONS& aOpts );
+
+    /**
      * Find all items that contain the point \a aPoint.
      *
      * @param aPoint the point.
@@ -257,12 +367,15 @@ public:
      *                        at the same coordinates as an existing one).
      * @return true if added
      */
-    bool Add( std::unique_ptr< SEGMENT > aSegment, bool aAllowRedundant = false );
-    void Add( std::unique_ptr< SOLID >   aSolid );
-    void Add( std::unique_ptr< VIA >     aVia );
-    bool Add( std::unique_ptr< ARC >     aArc, bool aAllowRedundant = false );
+    bool Add( std::unique_ptr<SEGMENT> aSegment, bool aAllowRedundant = false );
+    void Add( std::unique_ptr<SOLID>   aSolid );
+    void Add( std::unique_ptr<VIA>     aVia );
+    bool Add( std::unique_ptr<ARC>     aArc, bool aAllowRedundant = false );
 
     void Add( LINE& aLine, bool aAllowRedundant = false );
+
+    void AddEdgeExclusion( std::unique_ptr<SHAPE> aShape );
+    bool QueryEdgeExclusions( const VECTOR2I& aPos ) const;
 
     /**
      * Remove an item from this branch.
@@ -287,7 +400,7 @@ public:
      * @param aNewItem item add instead
      */
     void Replace( ITEM* aOldItem, std::unique_ptr< ITEM > aNewItem );
-    void Replace( LINE& aOldLine, LINE& aNewLine );
+    void Replace( LINE& aOldLine, LINE& aNewLine, bool aAllowRedundantSegments = false );
 
     /**
      * Create a lightweight copy (called branch) of self that tracks the changes (added/removed
@@ -308,11 +421,13 @@ public:
      * @param aStopAtLockedJoints will terminate the line at the first locked joint encountered
      * @param aFollowLockedSegments will consider a joint between a locked segment and an unlocked
      *                              segment of the same width as a trivial joint.
+     * @param aAllowSegmentSizeMismatch will allow segments of different widths to be connected
      * @return the line
      */
     const LINE AssembleLine( LINKED_ITEM* aSeg, int* aOriginSegmentIndex = nullptr,
                              bool aStopAtLockedJoints = false,
-                             bool aFollowLockedSegments = false );
+                             bool aFollowLockedSegments = false,
+                             bool aAllowSegmentSizeMismatch = true );
 
     ///< Print the contents and joints structure.
     void Dump( bool aLong = false );
@@ -340,7 +455,7 @@ public:
      *
      * @return the joint, if found, otherwise empty.
      */
-    JOINT* FindJoint( const VECTOR2I& aPos, int aLayer, int aNet );
+    const JOINT* FindJoint( const VECTOR2I& aPos, int aLayer, NET_HANDLE aNet ) const;
 
     void LockJoint( const VECTOR2I& aPos, const ITEM* aItem, bool aLock );
 
@@ -349,7 +464,7 @@ public:
      *
      * @return the joint, if found, otherwise empty.
      */
-    JOINT* FindJoint( const VECTOR2I& aPos, const ITEM* aItem )
+    const JOINT* FindJoint( const VECTOR2I& aPos, const ITEM* aItem ) const
     {
         return FindJoint( aPos, aItem->Layers().Start(), aItem->Net() );
     }
@@ -363,13 +478,15 @@ public:
     ///< Destroy all child nodes. Applicable only to the root node.
     void KillChildren();
 
-    void AllItemsInNet( int aNet, std::set<ITEM*>& aItems, int aKindMask = -1 );
+    void AllItemsInNet( NET_HANDLE aNet, std::set<ITEM*>& aItems, int aKindMask = -1 );
 
-    void ClearRanks( int aMarkerMask = MK_HEAD | MK_VIOLATION | MK_HOLE );
+    void ClearRanks( int aMarkerMask = MK_HEAD | MK_VIOLATION );
 
     void RemoveByMarker( int aMarker );
 
-    ITEM* FindItemByParent( const class PNS_HORIZON_PARENT_ITEM* aParent, int net);
+    ITEM* FindItemByParent( const BOARD_ITEM* aParent );
+
+    std::vector<ITEM*> FindItemsByParent( const BOARD_ITEM* aParent );
 
     bool HasChildren() const
     {
@@ -389,27 +506,42 @@ public:
 
     void FixupVirtualVias();
 
+    void AddRaw( ITEM* aItem, bool aAllowRedundant = false )
+    {
+        add( aItem, aAllowRedundant );
+    }
+
+    const std::unordered_set<ITEM*>& GetOverrides() const
+    {
+        return m_override;
+    }
+
+    VIA* FindViaByHandle ( const VIA_HANDLE& handle ) const;
+
 private:
-    void Add( std::unique_ptr< ITEM > aItem, bool aAllowRedundant = false );
+    void add( ITEM* aItem, bool aAllowRedundant = false );
 
     /// nodes are not copyable
     NODE( const NODE& aB );
     NODE& operator=( const NODE& aB );
 
     ///< Try to find matching joint and creates a new one if not found.
-    JOINT& touchJoint( const VECTOR2I& aPos, const LAYER_RANGE& aLayers, int aNet );
+    JOINT& touchJoint( const VECTOR2I& aPos, const PNS_LAYER_RANGE& aLayers, NET_HANDLE aNet );
 
     ///< Touch a joint and links it to an m_item.
-    void linkJoint( const VECTOR2I& aPos, const LAYER_RANGE& aLayers, int aNet, ITEM* aWhere );
+    void linkJoint( const VECTOR2I& aPos, const PNS_LAYER_RANGE& aLayers, NET_HANDLE aNet,
+                    ITEM* aWhere );
 
     ///< Unlink an item from a joint.
-    void unlinkJoint( const VECTOR2I& aPos, const LAYER_RANGE& aLayers, int aNet, ITEM* aWhere );
+    void unlinkJoint( const VECTOR2I& aPos, const PNS_LAYER_RANGE& aLayers, NET_HANDLE aNet,
+                      ITEM* aWhere );
 
     ///< Helpers for adding/removing items.
     void addSolid( SOLID* aSeg );
     void addSegment( SEGMENT* aSeg );
     void addVia( VIA* aVia );
     void addArc( ARC* aVia );
+    void addHole( HOLE* aHole );
 
     void removeSolidIndex( SOLID* aSeg );
     void removeSegmentIndex( SEGMENT* aSeg );
@@ -420,24 +552,26 @@ private:
     void unlinkParent();
     void releaseChildren();
     void releaseGarbage();
-    void rebuildJoint( JOINT* aJoint, ITEM* aItem );
+    void rebuildJoint( const JOINT* aJoint, const ITEM* aItem );
 
     bool isRoot() const
     {
         return m_parent == nullptr;
     }
 
-    SEGMENT* findRedundantSegment( const VECTOR2I& A, const VECTOR2I& B, const LAYER_RANGE& lr,
-                                   int aNet );
+    SEGMENT* findRedundantSegment( const VECTOR2I& A, const VECTOR2I& B, const PNS_LAYER_RANGE& lr,
+                                   NET_HANDLE aNet );
     SEGMENT* findRedundantSegment( SEGMENT* aSeg );
 
-    ARC* findRedundantArc( const VECTOR2I& A, const VECTOR2I& B, const LAYER_RANGE& lr, int aNet );
+    ARC* findRedundantArc( const VECTOR2I& A, const VECTOR2I& B, const PNS_LAYER_RANGE& lr,
+                           NET_HANDLE aNet );
     ARC* findRedundantArc( ARC* aSeg );
 
     ///< Scan the joint map, forming a line starting from segment (current).
     void followLine( LINKED_ITEM* aCurrent, bool aScanDirection, int& aPos, int aLimit,
                      VECTOR2I* aCorners, LINKED_ITEM** aSegments, bool* aArcReversed,
-                     bool& aGuardHit, bool aStopAtLockedJoints, bool aFollowLockedSegments );
+                     bool& aGuardHit, bool aStopAtLockedJoints, bool aFollowLockedSegments,
+                     bool aAllowSegmentSizeMismatch );
 
 private:
     struct DEFAULT_OBSTACLE_VISITOR;
@@ -459,6 +593,8 @@ private:
     INDEX*          m_index;            ///< Geometric/Net index of the items
     int             m_depth;            ///< depth of the node (number of parent nodes in the
                                         ///< inheritance chain)
+
+    std::vector< std::unique_ptr<SHAPE> > m_edgeExclusions;
 
     std::unordered_set<ITEM*> m_garbageItems;
 };

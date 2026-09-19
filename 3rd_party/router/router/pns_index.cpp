@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -27,36 +27,43 @@ namespace PNS {
 
 void INDEX::Add( ITEM* aItem )
 {
-    const LAYER_RANGE& range = aItem->Layers();
+    const PNS_LAYER_RANGE& range = aItem->Layers();
+    assert( range.Start() != -1 && range.End() != -1 );
 
     if( m_subIndices.size() <= static_cast<size_t>( range.End() ) )
-        m_subIndices.resize( 2 * range.End() + 1 ); // +1 handles the 0 case
+    {
+        int startIdx = static_cast<int>( m_subIndices.size() );
+
+        for( int i = startIdx; i <= range.End(); ++i )
+            m_subIndices.emplace_back( std::make_unique<ITEM_SHAPE_INDEX>( i ) );
+    }
 
     for( int i = range.Start(); i <= range.End(); ++i )
-        m_subIndices[i].Add( aItem );
+        m_subIndices[i]->Add( aItem );
 
     m_allItems.insert( aItem );
-    int net = aItem->Net();
+    NET_HANDLE net = aItem->Net();
 
-    if( net >= 0 )
+    if( net )
         m_netMap[net].push_back( aItem );
 }
 
 
 void INDEX::Remove( ITEM* aItem )
 {
-    const LAYER_RANGE& range = aItem->Layers();
+    const PNS_LAYER_RANGE& range = aItem->Layers();
+    assert( range.Start() != -1 && range.End() != -1 );
 
     if( m_subIndices.size() <= static_cast<size_t>( range.End() ) )
         return;
 
     for( int i = range.Start(); i <= range.End(); ++i )
-        m_subIndices[i].Remove( aItem );
+        m_subIndices[i]->Remove( aItem );
 
     m_allItems.erase( aItem );
-    int net = aItem->Net();
+    NET_HANDLE net = aItem->Net();
 
-    if( net >= 0 && m_netMap.find( net ) != m_netMap.end() )
+    if( net && m_netMap.find( net ) != m_netMap.end() )
         m_netMap[net].remove( aItem );
 }
 
@@ -68,7 +75,7 @@ void INDEX::Replace( ITEM* aOldItem, ITEM* aNewItem )
 }
 
 
-INDEX::NET_ITEMS_LIST* INDEX::GetItemsForNet( int aNet )
+INDEX::NET_ITEMS_LIST* INDEX::GetItemsForNet( NET_HANDLE aNet )
 {
     if( m_netMap.find( aNet ) == m_netMap.end() )
         return nullptr;

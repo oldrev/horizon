@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -25,6 +25,7 @@
 
 #include <cstdio>
 
+#include <settings/nested_settings.h>
 #include <geometry/direction45.h>
 
 #include "time_limit.h"
@@ -54,10 +55,10 @@ enum PNS_OPTIMIZATION_EFFORT
  * Contain all persistent settings of the router, such as the mode, optimization effort, etc.
  */
 
-class ROUTING_SETTINGS //: public NESTED_SETTINGS
+class ROUTING_SETTINGS : public NESTED_SETTINGS
 {
 public:
-    ROUTING_SETTINGS();
+    ROUTING_SETTINGS( JSON_SETTINGS* aParent = nullptr, const std::string& aPath = "" );
 
     ///< Return the routing mode.
     PNS_MODE Mode() const { return m_routingMode; }
@@ -153,6 +154,9 @@ public:
 
     double WalkaroundHugLengthThreshold() const { return m_walkaroundHugLengthThreshold; }
 
+    int ViaForcePropIterationLimit() const { return m_viaForcePropIterationLimit; }
+    void SetViaForcePropIterationLimit(int aLimit) { m_viaForcePropIterationLimit = aLimit; }
+
 private:
     bool m_shoveVias;
     bool m_startDiagonal;
@@ -177,6 +181,7 @@ private:
 
     int m_walkaroundIterationLimit;
     int m_shoveIterationLimit;
+    int m_viaForcePropIterationLimit;
     double m_walkaroundHugLengthThreshold;
 
     TIME_LIMIT m_shoveTimeLimit;

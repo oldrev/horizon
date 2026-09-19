@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -19,6 +19,7 @@
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <core/typeinfo.h>
 #include <geometry/shape_line_chain.h>
 #include <geometry/shape_rect.h>
 #include <geometry/shape_simple.h>
@@ -120,6 +121,10 @@ OPTIMIZER::OPTIMIZER( NODE* aWorld ) :
 
 OPTIMIZER::~OPTIMIZER()
 {
+    for( OPT_CONSTRAINT* c : m_constraints )
+        delete c;
+
+    m_constraints.clear();
 }
 
 
@@ -137,7 +142,8 @@ struct OPTIMIZER::CACHE_VISITOR
         if( !( m_mask & aOtherItem->Kind() ) )
             return true;
 
-        if( !aOtherItem->Collide( m_ourItem, m_node ) )
+        // TODO(JE) viastacks
+        if( !aOtherItem->Collide( m_ourItem, m_node, m_ourItem->Layer() ) )
             return true;
 
         m_collidingItem = aOtherItem;
@@ -212,16 +218,29 @@ bool AREA_CONSTRAINT::Check( int aVertex1, int aVertex2, const LINE* aOriginLine
                              const SHAPE_LINE_CHAIN& aCurrentPath,
                              const SHAPE_LINE_CHAIN& aReplacement )
 {
-    const VECTOR2I& p1 = aOriginLine->CPoint( aVertex1 );
-    const VECTOR2I& p2 = aOriginLine->CPoint( aVertex2 );
+    const VECTOR2I& p1 = aCurrentPath.CPoint( aVertex1 );
+    const VECTOR2I& p2 = aCurrentPath.CPoint( aVertex2 );
 
     bool p1_in = m_allowedArea.Contains( p1 );
     bool p2_in = m_allowedArea.Contains( p2 );
 
-    if( m_allowedAreaStrict ) // strict restriction? both points must be inside the restricted area
-        return p1_in && p2_in;
-    else // loose restriction
-        return p1_in || p2_in;
+    if( p1_in && p2_in )
+        return true;
+
+    if( aVertex1 < aCurrentPath.PointCount() - 1 && !p1_in && p2_in
+        && m_allowedArea.Contains( aCurrentPath.CPoint( aVertex1 + 1 ) ) )
+        return aReplacement.CSegment( 0 ).Angle( aCurrentPath.CSegment( aVertex1 ) ).IsHorizontal();
+
+    if( p1_in && !p2_in && m_allowedArea.Contains( aCurrentPath.CPoint( aVertex2 - 1 ) ) )
+        return aReplacement.CSegment( -1 )
+                .Angle( aCurrentPath.CSegment( aVertex2 - 1 ) )
+                .IsHorizontal();
+
+    //PNS_DBG( dbg, AddShape, m_allowedArea, YELLOW, 10000, wxT( "drag-affected-area" ) );
+    //PNS_DBG( dbg, AddPoint, p1, YELLOW, 1000000, wxT( "drag-p1" ) );
+    //PNS_DBG( dbg, AddPoint, p2, YELLOW, 1000000, wxT( "drag-p2" ) );
+
+    return false;
 }
 
 
@@ -271,13 +290,16 @@ bool CORNER_COUNT_LIMIT_CONSTRAINT::Check( int aVertex1, int aVertex2, const LIN
 {
     LINE newPath( *aOriginLine, aCurrentPath );
     newPath.Line().Replace( aVertex1, aVertex2, aReplacement );
-    newPath.Line().Simplify();
+    newPath.Line().Simplify2();
     int cc = newPath.CountCorners( m_angleMask );
 
-    if( cc >= m_minCorners && cc <= m_maxCorners )
+    if( cc >= m_minCorners )
         return true;
 
-    return false;
+    // fixme: something fishy with the max corneriness limit
+    // (cc <= m_maxCorners)
+
+    return true;
 }
 
 
@@ -414,16 +436,7 @@ bool OPTIMIZER::checkColliding( ITEM* aItem, bool aUpdateCache )
 }
 
 
-void OPTIMIZER::ClearConstraints()
-{
-    for( OPT_CONSTRAINT* c : m_constraints )
-        delete c;
-
-    m_constraints.clear();
-}
-
-
-void OPTIMIZER::AddConstraint ( OPT_CONSTRAINT *aConstraint )
+void OPTIMIZER::addConstraint ( OPT_CONSTRAINT *aConstraint )
 {
     m_constraints.push_back( aConstraint );
 }
@@ -456,7 +469,6 @@ bool OPTIMIZER::mergeObtuse( LINE* aLine )
     SHAPE_LINE_CHAIN& line = aLine->Line();
 
     int step = line.PointCount() - 3;
-    int iter = 0;
     int segs_pre = line.SegmentCount();
 
     if( step < 0 )
@@ -464,9 +476,8 @@ bool OPTIMIZER::mergeObtuse( LINE* aLine )
 
     SHAPE_LINE_CHAIN current_path( line );
 
-    while( 1 )
+    while( true )
     {
-        iter++;
         int n_segs = current_path.SegmentCount();
         int max_step = n_segs - 2;
 
@@ -475,8 +486,8 @@ bool OPTIMIZER::mergeObtuse( LINE* aLine )
 
         if( step < 2 )
         {
-            line = current_path;
-            return current_path.SegmentCount() < segs_pre;
+            line = std::move( current_path );
+            return line.SegmentCount() < segs_pre;
         }
 
         bool found_anything = false;
@@ -520,15 +531,13 @@ bool OPTIMIZER::mergeObtuse( LINE* aLine )
         {
             if( step <= 2 )
             {
-                line = current_path;
+                line = std::move( current_path );
                 return line.SegmentCount() < segs_pre;
             }
 
             step--;
         }
     }
-
-    return line.SegmentCount() < segs_pre;
 }
 
 
@@ -539,14 +548,14 @@ bool OPTIMIZER::mergeFull( LINE* aLine )
 
     int segs_pre = line.SegmentCount();
 
-    line.Simplify();
+    line.Simplify2();
 
     if( step < 0 )
         return false;
 
     SHAPE_LINE_CHAIN current_path( line );
 
-    while( 1 )
+    while( true )
     {
         int n_segs = current_path.SegmentCount();
         int max_step = n_segs - 2;
@@ -597,25 +606,13 @@ bool OPTIMIZER::mergeColinear( LINE* aLine )
 }
 
 
-bool OPTIMIZER::Optimize( LINE* aLine, LINE* aResult, LINE* aRoot )
+bool OPTIMIZER::Optimize( const LINE* aLine, LINE* aResult, LINE* aRoot )
 {
-    DEBUG_DECORATOR* dbg = ROUTER::GetInstance()->GetInterface()->GetDebugDecorator();
-
-    if( aRoot )
-    {
-        PNS_DBG( dbg, AddLine, aRoot->CLine(), BLUE, 100000, "root-line" );
-    }
-
-
     if( !aResult )
-    {
-        aResult = aLine;
-    }
-    else
-    {
-        *aResult = *aLine;
-        aResult->ClearLinks();
-    }
+        return false;
+
+    *aResult = *aLine;
+    aResult->ClearLinks();
 
     bool hasArcs = aLine->ArcCount();
     bool rv = false;
@@ -626,32 +623,38 @@ bool OPTIMIZER::Optimize( LINE* aLine, LINE* aResult, LINE* aRoot )
         int rootObtuseCorners = aRoot->CountCorners( angleMask );
         auto c = new CORNER_COUNT_LIMIT_CONSTRAINT( m_world, rootObtuseCorners,
                                                     aLine->SegmentCount(), angleMask );
-        AddConstraint( c );
+        //PNS_DBG( dbg, Message,
+         //        wxString::Format( "opt limit-corner-count root %d maxc %d mask %x",
+           //                        rootObtuseCorners, aLine->SegmentCount(), angleMask ) );
+
+        addConstraint( c );
     }
 
     if( m_effortLevel & PRESERVE_VERTEX )
     {
         auto c = new PRESERVE_VERTEX_CONSTRAINT( m_world, m_preservedVertex );
-        AddConstraint( c );
+        addConstraint( c );
     }
 
     if( m_effortLevel & RESTRICT_VERTEX_RANGE )
     {
         auto c = new RESTRICT_VERTEX_RANGE_CONSTRAINT( m_world, m_restrictedVertexRange.first,
                                                        m_restrictedVertexRange.second );
-        AddConstraint( c );
+        addConstraint( c );
     }
 
     if( m_effortLevel & RESTRICT_AREA )
     {
         auto c = new AREA_CONSTRAINT( m_world, m_restrictArea, m_restrictAreaIsStrict );
-        AddConstraint( c );
+        SHAPE_RECT r( m_restrictArea );
+        //PNS_DBG( dbg, AddShape, &r, YELLOW, 0, wxT( "area-constraint" ) );
+        addConstraint( c );
     }
 
     if( m_effortLevel & KEEP_TOPOLOGY )
     {
         auto c = new KEEP_TOPOLOGY_CONSTRAINT( m_world );
-        AddConstraint( c );
+        addConstraint( c );
     }
 
     // TODO: Fix for arcs
@@ -686,8 +689,11 @@ bool OPTIMIZER::mergeStep( LINE* aLine, SHAPE_LINE_CHAIN& aCurrentPath, int step
     if( aLine->SegmentCount() < 2 )
         return false;
 
-    DIRECTION_45 orig_start( aLine->CSegment( 0 ) );
-    DIRECTION_45 orig_end( aLine->CSegment( -1 ) );
+    DIRECTION_45::CORNER_MODE cornerMode = ROUTER::GetInstance()->Settings().GetCornerMode();
+    bool is90mode = cornerMode == DIRECTION_45::MITERED_90 || cornerMode == DIRECTION_45::ROUNDED_90;
+
+    DIRECTION_45 orig_start( aLine->CSegment( 0 ), is90mode );
+    DIRECTION_45 orig_end( aLine->CSegment( -1 ), is90mode );
 
 
     for( int n = 0; n < n_segs - step; n++ )
@@ -708,14 +714,13 @@ bool OPTIMIZER::mergeStep( LINE* aLine, SHAPE_LINE_CHAIN& aCurrentPath, int step
 
         for( int i = 0; i < 2; i++ )
         {
-            SHAPE_LINE_CHAIN bypass = DIRECTION_45().BuildInitialTrace( s1.A, s2.B, i );
+            SHAPE_LINE_CHAIN bypass = DIRECTION_45().BuildInitialTrace( s1.A, s2.B, i, cornerMode );
             cost[i] = INT_MAX;
 
             bool ok = false;
 
             if( !checkColliding( aLine, bypass ) )
             {
-                //printf("Chk-constraints: %d %d\n", n, n+step+1 );
                 ok = checkConstraints ( n, n + step + 1, aLine, aCurrentPath, bypass );
             }
 
@@ -723,7 +728,7 @@ bool OPTIMIZER::mergeStep( LINE* aLine, SHAPE_LINE_CHAIN& aCurrentPath, int step
             {
                 path[i] = aCurrentPath;
                 path[i].Replace( s1.Index(), s2.Index(), bypass );
-                path[i].Simplify();
+                path[i].Simplify2();
                 cost[i] = COST_ESTIMATOR::CornerCost( path[i] );
             }
         }
@@ -750,15 +755,17 @@ OPTIMIZER::BREAKOUT_LIST OPTIMIZER::circleBreakouts( int aWidth, const SHAPE* aS
 {
     BREAKOUT_LIST breakouts;
 
-    for( int angle = 0; angle < 360; angle += 45 )
+    for( EDA_ANGLE angle = ANGLE_0; angle < ANGLE_360; angle += ANGLE_45 )
     {
         const SHAPE_CIRCLE* cir = static_cast<const SHAPE_CIRCLE*>( aShape );
         SHAPE_LINE_CHAIN    l;
         VECTOR2I            p0 = cir->GetCenter();
         VECTOR2I            v0( cir->GetRadius() * M_SQRT2, 0 );
 
+        RotatePoint( v0, -angle );
+
         l.Append( p0 );
-        l.Append( p0 + v0.Rotate( angle * M_PI / 180.0 ) );
+        l.Append( p0 + v0 );
         breakouts.push_back( l );
     }
 
@@ -770,17 +777,20 @@ OPTIMIZER::BREAKOUT_LIST OPTIMIZER::customBreakouts( int aWidth, const ITEM* aIt
                                                      bool aPermitDiagonal ) const
 {
     BREAKOUT_LIST breakouts;
-    const SHAPE_SIMPLE* convex = static_cast<const SHAPE_SIMPLE*>( aItem->Shape() );
+    const SHAPE_SIMPLE* convex = static_cast<const SHAPE_SIMPLE*>( aItem->Shape( -1 ) );
 
     BOX2I bbox = convex->BBox( 0 );
     VECTOR2I p0 = static_cast<const SOLID*>( aItem )->Pos();
     // must be large enough to guarantee intersecting the convex polygon
     int length = std::max( bbox.GetWidth(), bbox.GetHeight() ) / 2 + 5;
+    EDA_ANGLE increment = ( aPermitDiagonal ? ANGLE_45 : ANGLE_90 );
 
-    for( int angle = 0; angle < 360; angle += ( aPermitDiagonal ? 45 : 90 ) )
+    for( EDA_ANGLE angle = ANGLE_0; angle < ANGLE_360; angle += increment )
     {
         SHAPE_LINE_CHAIN l;
-        VECTOR2I v0( p0 + VECTOR2I( length, 0 ).Rotate( angle * M_PI / 180.0 ) );
+        VECTOR2I v0( p0 + VECTOR2I( length, 0 ) );
+        RotatePoint( v0, p0, -angle );
+
         SHAPE_LINE_CHAIN::INTERSECTIONS intersections;
         int n = convex->Vertices().Intersect( SEG( p0, v0 ), intersections );
 
@@ -815,7 +825,9 @@ OPTIMIZER::BREAKOUT_LIST OPTIMIZER::rectBreakouts( int aWidth, const SHAPE* aSha
     const SHAPE_RECT* rect = static_cast<const SHAPE_RECT*>(aShape);
     VECTOR2I s = rect->GetSize();
     VECTOR2I c = rect->GetPosition() + VECTOR2I( s.x / 2, s.y / 2 );
+
     BREAKOUT_LIST breakouts;
+    breakouts.reserve( 12 );
 
     VECTOR2I d_offset;
 
@@ -833,7 +845,6 @@ OPTIMIZER::BREAKOUT_LIST OPTIMIZER::rectBreakouts( int aWidth, const SHAPE* aSha
     if( aPermitDiagonal )
     {
         int l = aWidth + std::min( s.x, s.y ) / 2;
-        VECTOR2I d_diag;
 
         if( s.x >= s.y )
         {
@@ -872,12 +883,13 @@ OPTIMIZER::BREAKOUT_LIST OPTIMIZER::computeBreakouts( int aWidth, const ITEM* aI
     case ITEM::VIA_T:
     {
         const VIA* via = static_cast<const VIA*>( aItem );
-        return circleBreakouts( aWidth, via->Shape(), aPermitDiagonal );
+        // TODO(JE) padstacks -- computeBreakouts needs to have a layer argument
+        return circleBreakouts( aWidth, via->Shape( 0 ), aPermitDiagonal );
     }
 
     case ITEM::SOLID_T:
     {
-        const SHAPE* shape = aItem->Shape();
+        const SHAPE* shape = aItem->Shape( -1 );
 
         switch( shape->Type() )
         {
@@ -912,9 +924,9 @@ OPTIMIZER::BREAKOUT_LIST OPTIMIZER::computeBreakouts( int aWidth, const ITEM* aI
 }
 
 
-ITEM* OPTIMIZER::findPadOrVia( int aLayer, int aNet, const VECTOR2I& aP ) const
+ITEM* OPTIMIZER::findPadOrVia( int aLayer, NET_HANDLE aNet, const VECTOR2I& aP ) const
 {
-    JOINT* jt = m_world->FindJoint( aP, aLayer, aNet );
+    const JOINT* jt = m_world->FindJoint( aP, aLayer, aNet );
 
     if( !jt )
         return nullptr;
@@ -958,7 +970,7 @@ int OPTIMIZER::smartPadsSingle( LINE* aLine, ITEM* aPad, bool aEnd, int aEndVert
     for( int p = 1; p <= p_end; p++ )
     {
         // If the line is contained inside the pad, don't optimize
-        if( solid && solid->Shape() && !solid->Shape()->Collide(
+        if( solid && solid->Shape( -1 ) && !solid->Shape( -1 )->Collide(
                 SEG( line.CPoint( 0 ), line.CPoint( p ) ), aLine->Width() / 2 ) )
         {
             continue;
@@ -970,7 +982,7 @@ int OPTIMIZER::smartPadsSingle( LINE* aLine, ITEM* aPad, bool aEnd, int aEndVert
             {
                 SHAPE_LINE_CHAIN v;
                 SHAPE_LINE_CHAIN connect = dir.BuildInitialTrace(
-                        breakout.CPoint( -1 ), line.CPoint( p ), diag == 0 );
+                        breakout.CLastPoint(), line.CPoint( p ), diag == 0 );
 
                 DIRECTION_45 dir_bkout( breakout.CSegment( -1 ) );
 
@@ -1000,8 +1012,8 @@ int OPTIMIZER::smartPadsSingle( LINE* aLine, ITEM* aPad, bool aEnd, int aEndVert
                     std::get<0>( vp ) = p;
                     std::get<1>( vp ) = breakout.Length();
                     std::get<2>( vp ) = aEnd ? v.Reverse() : v;
-                    std::get<2>( vp ).Simplify();
-                    variants.push_back( vp );
+                    std::get<2>( vp ).Simplify2();
+                    variants.push_back( std::move( vp ) );
                 }
             }
         }
@@ -1057,7 +1069,7 @@ bool OPTIMIZER::runSmartPads( LINE* aLine )
     if( line.PointCount() < 3 )
         return false;
 
-    VECTOR2I p_start = line.CPoint( 0 ), p_end = line.CPoint( -1 );
+    VECTOR2I p_start = line.CPoint( 0 ), p_end = line.CLastPoint();
 
     ITEM* startPad = findPadOrVia( aLine->Layer(), aLine->Net(), p_start );
     ITEM* endPad = findPadOrVia( aLine->Layer(), aLine->Net(), p_end );
@@ -1071,7 +1083,7 @@ bool OPTIMIZER::runSmartPads( LINE* aLine )
         smartPadsSingle( aLine, endPad, true,
                          vtx < 0 ? line.PointCount() - 1 : line.PointCount() - 1 - vtx );
 
-    aLine->Line().Simplify();
+    aLine->Line().Simplify2();
 
     return true;
 }
@@ -1087,7 +1099,8 @@ bool OPTIMIZER::Optimize( LINE* aLine, int aEffortLevel, NODE* aWorld, const VEC
     if( aEffortLevel & OPTIMIZER::PRESERVE_VERTEX )
         opt.SetPreserveVertex( aV );
 
-    return opt.Optimize( aLine );
+    LINE tmp( *aLine );
+    return opt.Optimize( &tmp, aLine );
 }
 
 
@@ -1096,7 +1109,9 @@ bool OPTIMIZER::fanoutCleanup( LINE* aLine )
     if( aLine->PointCount() < 3 )
         return false;
 
-    VECTOR2I p_start = aLine->CPoint( 0 ), p_end = aLine->CPoint( -1 );
+    DIRECTION_45::CORNER_MODE cornerMode = ROUTER::GetInstance()->Settings().GetCornerMode();
+
+    VECTOR2I p_start = aLine->CPoint( 0 ), p_end = aLine->CLastPoint();
 
     ITEM* startPad = findPadOrVia( aLine->Layer(), aLine->Net(), p_start );
     ITEM* endPad = findPadOrVia( aLine->Layer(), aLine->Net(), p_end );
@@ -1123,7 +1138,7 @@ bool OPTIMIZER::fanoutCleanup( LINE* aLine )
     {
         for( int i = 0; i < 2; i++ )
         {
-            SHAPE_LINE_CHAIN l2 = DIRECTION_45().BuildInitialTrace( p_start, p_end, i );
+            SHAPE_LINE_CHAIN l2 = DIRECTION_45().BuildInitialTrace( p_start, p_end, i, cornerMode );
             LINE repl;
             repl = LINE( *aLine, l2 );
 
@@ -1172,7 +1187,7 @@ bool verifyDpBypass( NODE* aNode, DIFF_PAIR* aPair, bool aRefIsP, const SHAPE_LI
     LINE refLine ( aRefIsP ? aPair->PLine() : aPair->NLine(), aNewRef );
     LINE coupledLine ( aRefIsP ? aPair->NLine() : aPair->PLine(), aNewCoupled );
 
-    if( refLine.Collide( &coupledLine, aNode ) )
+    if( refLine.Collide( &coupledLine, aNode, refLine.Layer() ) )
         return false;
 
     if( aNode->CheckColliding ( &refLine ) )
@@ -1227,7 +1242,7 @@ bool coupledBypass( NODE* aNode, DIFF_PAIR* aPair, bool aRefIsP, const SHAPE_LIN
                 if( coupledLength > bestLength && verifyDpBypass( aNode, aPair, aRefIsP, aRef,
                                                                   newCoupled) )
                 {
-                    bestBypass = newCoupled;
+                    bestBypass = std::move( newCoupled );
                     bestLength = coupledLength;
                     found = true;
                 }
@@ -1236,7 +1251,7 @@ bool coupledBypass( NODE* aNode, DIFF_PAIR* aPair, bool aRefIsP, const SHAPE_LIN
     }
 
     if( found )
-        aNewCoupled = bestBypass;
+        aNewCoupled = std::move( bestBypass );
 
     return found;
 }
@@ -1289,8 +1304,8 @@ bool OPTIMIZER::mergeDpStep( DIFF_PAIR* aPair, bool aTryP, int step )
 
                 if( deltaCoupled >= 0 )
                 {
-                    newRef.Simplify();
-                    newCoup.Simplify();
+                    newRef.Simplify2();
+                    newCoup.Simplify2();
 
                     aPair->SetShape( newRef, newCoup, !aTryP );
                     return true;
@@ -1298,8 +1313,8 @@ bool OPTIMIZER::mergeDpStep( DIFF_PAIR* aPair, bool aTryP, int step )
             }
             else if( deltaUni >= 0 && verifyDpBypass( m_world, aPair, aTryP, newRef, coupledPath ) )
             {
-                newRef.Simplify();
-                coupledPath.Simplify();
+                newRef.Simplify2();
+                coupledPath.Simplify2();
 
                 aPair->SetShape( newRef, coupledPath, !aTryP );
                 return true;
@@ -1396,9 +1411,6 @@ bool tightenSegment( bool dir, NODE *aNode, const LINE& cur, const SHAPE_LINE_CH
     if (!dirA.IsObtuse( dirCenter) || !dirCenter.IsObtuse(dirB))
         return false;
 
-    //VECTOR2I perp = (center.B - center.A).Perpendicular();
-    VECTOR2I guideA, guideB ;
-
     SEG guide;
     int initial;
 
@@ -1471,14 +1483,11 @@ bool tightenSegment( bool dir, NODE *aNode, const LINE& cur, const SHAPE_LINE_CH
 
         if ( current == initial )
             break;
-
-
     }
-
-    out = snew;
 
     //dbg->AddLine ( snew, 3, 100000 );
 
+    out = std::move( snew );
     return true;
 }
 
@@ -1495,7 +1504,7 @@ void Tighten( NODE *aNode, const SHAPE_LINE_CHAIN& aOldLine, const LINE& aNewLin
 
     for( int step = 0; step < 3; step++ )
     {
-        current.Simplify();
+        current.Simplify2();
 
         for( int i = 0; i <= current.SegmentCount() - 3; i++ )
         {
@@ -1509,11 +1518,11 @@ void Tighten( NODE *aNode, const SHAPE_LINE_CHAIN& aOldLine, const LINE& aNewLin
                 {
                     SHAPE_LINE_CHAIN opt = current;
                     opt.Replace( i, i + 3, l_out );
-                    auto optArea = std::abs( shovedArea( aOldLine, opt ) );
-                    auto prevArea = std::abs( shovedArea( aOldLine, current ) );
+                    long long int optArea = std::abs( shovedArea( aOldLine, opt ) );
+                    long long int prevArea = std::abs( shovedArea( aOldLine, current ) );
 
                     if( optArea < prevArea )
-                        current = opt;
+                        current = std::move( opt );
 
                     break;
                 }

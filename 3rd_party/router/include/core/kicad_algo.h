@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2019 CERN
- * Copyright (C) 2019-2021 KiCad Developers, see AUTHORS.TXT for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.TXT for contributors.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -28,7 +28,8 @@
 #include <algorithm>
 #include <functional> // std::function
 #include <utility>    // std::pair
-#include "../wx_compat.h" // wxCHECK_MSG
+#include <vector>
+#include <wx/debug.h> // wxCHECK_MSG
 
 namespace alg
 {
@@ -127,7 +128,7 @@ bool pair_contains( const std::pair<_Type, _Type> __pair, _Value __value )
 template <class T>
 bool within_wrapped_range( T __val, T __minval, T __maxval, T __wrap )
 {
-    //wxCHECK_MSG( __wrap > 0, false, "Wrap must be positive!" );
+    wxCHECK_MSG( __wrap > 0, false, wxT( "Wrap must be positive!" ) );
 
     while( __maxval >= __wrap )
         __maxval -= __wrap;
@@ -154,25 +155,100 @@ bool within_wrapped_range( T __val, T __minval, T __maxval, T __wrap )
 }
 
 /**
- * Covers for the horrifically named std::remove and std::remove_if (neither of which remove
- * anything).
+ * @brief Deletes all duplicate values from \a __c.
  */
-/**
- * @brief Deletes all values from \a __c which match \a __value.
- */
-template <class _Container, typename _Value>
-void delete_matching( _Container& __c, _Value __value )
+template <class _Container>
+void remove_duplicates( _Container& __c )
 {
-    __c.erase( std::remove( __c.begin(), __c.end(), __value ), __c.end() );
+    __c.erase( std::unique( __c.begin(), __c.end() ), __c.end() );
+}
+
+template <class _Container, class _Function>
+void remove_duplicates( _Container& __c, _Function&& __f )
+{
+    __c.erase( std::unique( __c.begin(), __c.end(), std::forward<_Function>( __f ) ), __c.end() );
 }
 
 /**
- * @brief Deletes all values from \a __c for which \a __f returns true.
+ * @brief Integral version of std::signbit that works all compilers.
  */
-template <class _Container, class _Function>
-void delete_if( _Container& __c, _Function&& __f )
+template <typename T, std::enable_if_t<std::is_integral<T>::value, int> = 0>
+bool signbit( T v )
 {
-    __c.erase( std::remove_if( __c.begin(), __c.end(), std::forward<_Function>( __f ) ), __c.end() );
+    return v < 0;
+}
+
+
+/**
+ * @brief Returns the length of the longest common subset of values between two containers.
+*/
+template <class _Container>
+size_t longest_common_subset( const _Container& __c1, const _Container& __c2 )
+{
+    size_t __c1_size = __c1.size();
+    size_t __c2_size = __c2.size();
+
+    if( __c1_size == 0 || __c2_size == 0 )
+        return 0;
+
+    // Create a 2D table to store the lengths of common subsets
+    std::vector<std::vector<size_t>> table( __c1_size + 1, std::vector<size_t>( __c2_size + 1, 0 ) );
+
+    size_t longest = 0;
+
+    for( size_t i = 1; i <= __c1_size; ++i )
+    {
+        for( size_t j = 1; j <= __c2_size; ++j )
+        {
+            if( __c1[i - 1] == __c2[j - 1] )
+            {
+                table[i][j] = table[i - 1][j - 1] + 1;
+                longest = std::max( longest, static_cast<size_t>( table[i][j] ) );
+            }
+        }
+    }
+
+    return longest;
+}
+
+/**
+ * @brief Compares two containers lexicographically.
+ *
+ * Returns a negative value if the first container is less than the second,
+ * zero if they are equal, and a positive value if the first container is
+ * greater than the second.  This is a re-implementation of
+ * std::lexicographical_compare_three_way because it is not available in all
+ * compilers.
+ */
+template <class Container1Iter, class Container2Iter>
+int lexicographical_compare_three_way( Container1Iter aC1_first, Container1Iter aC1_last,
+                                       Container2Iter aC2_first, Container2Iter aC2_last )
+{
+#ifdef __cpp_lib_three_way_comparison // Check to see if we have an optimized version
+    auto retval =
+            std::lexicographical_compare_three_way( aC1_first, aC1_last, aC2_first, aC2_last );
+    return retval == std::strong_ordering::equal
+                   ? 0
+                   : ( retval == std::strong_ordering::less ? -1 : 1 );
+#else
+    Container1Iter it1 = aC1_first;
+    Container2Iter it2 = aC2_first;
+
+    while( it1 != aC1_last && it2 != aC2_last )
+    {
+        if( *it1 < *it2 )
+            return -1;
+        if( *it1 > *it2 )
+            return 1;
+        ++it1;
+        ++it2;
+    }
+
+    if( it2 == aC2_last )
+        return !( it1 == aC1_last );
+    else
+        return -1;
+#endif // __cpp_lib_three_way_comparison
 }
 
 

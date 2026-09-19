@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2017 CERN
- * Copyright (C) 2016-2020 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -28,22 +28,43 @@
 #include "pns_node.h"
 #include "pns_via.h"
 #include "pns_utils.h"
+#include "pns_router.h"
+#include "pns_debug_decorator.h"
 
 #include <geometry/shape_rect.h>
+#include <geometry/circle.h>
+#include <trigo.h>
+#include <advanced_config.h>
+#include <base_units.h>
 
 namespace PNS {
 
-LINE::LINE( const LINE& aOther )
-        : LINK_HOLDER( aOther ),
-          m_line( aOther.m_line ),
-          m_width( aOther.m_width ),
-          m_snapThreshhold( aOther.m_snapThreshhold )
+LINE::LINE( const LINE& aOther ) :
+        LINK_HOLDER( aOther ),
+        m_line( aOther.m_line ),
+        m_width( aOther.m_width ),
+        m_snapThreshhold( aOther.m_snapThreshhold )
 {
     m_net = aOther.m_net;
     m_movable = aOther.m_movable;
     m_layers = aOther.m_layers;
-    m_via = aOther.m_via;
-    m_hasVia = aOther.m_hasVia;
+
+    m_via = nullptr;
+
+    if( aOther.m_via )
+    {
+        if( aOther.m_via->BelongsTo( &aOther ) )
+        {
+            m_via = aOther.m_via->Clone();
+            m_via->SetOwner( this );
+            m_via->SetNet( m_net );
+        }
+        else
+        {
+            m_via = aOther.m_via;
+        }
+    }
+
     m_marker = aOther.m_marker;
     m_rank = aOther.m_rank;
     m_blockingObstacle = aOther.m_blockingObstacle;
@@ -54,25 +75,89 @@ LINE::LINE( const LINE& aOther )
 
 LINE::~LINE()
 {
+    if( m_via && m_via->BelongsTo( this ) )
+        delete m_via;
 }
 
 
 LINE& LINE::operator=( const LINE& aOther )
 {
+    m_parent = aOther.m_parent;
+    m_sourceItem = aOther.m_sourceItem;
+
     m_line = aOther.m_line;
     m_width = aOther.m_width;
     m_net = aOther.m_net;
     m_movable = aOther.m_movable;
     m_layers = aOther.m_layers;
-    m_via = aOther.m_via;
-    m_hasVia = aOther.m_hasVia;
+
+    m_via = nullptr;
+
+    if( aOther.m_via )
+    {
+        if( aOther.m_via->BelongsTo( &aOther ) )
+        {
+            m_via = aOther.m_via->Clone();
+            m_via->SetOwner( this );
+            m_via->SetNet( m_net );
+        }
+        else
+        {
+            m_via = aOther.m_via;
+        }
+    }
+
     m_marker = aOther.m_marker;
     m_rank = aOther.m_rank;
+    m_routable = aOther.m_routable;
     m_owner = aOther.m_owner;
     m_snapThreshhold = aOther.m_snapThreshhold;
     m_blockingObstacle = aOther.m_blockingObstacle;
 
     copyLinks( &aOther );
+
+    return *this;
+}
+
+
+LINE& LINE::operator=( LINE&& aOther ) noexcept
+{
+   if (this != &aOther)
+   {
+       m_parent = aOther.m_parent;
+       m_sourceItem = aOther.m_sourceItem;
+
+       m_line = std::move( aOther.m_line );
+       m_width = aOther.m_width;
+       m_net = aOther.m_net;
+       m_movable = aOther.m_movable;
+       m_layers = aOther.m_layers;
+
+       m_via = nullptr;
+
+       if( aOther.m_via )
+       {
+           if( aOther.m_via->BelongsTo( &aOther ) )
+           {
+               m_via = aOther.m_via->Clone();
+               m_via->SetOwner( this );
+               m_via->SetNet( m_net );
+           }
+           else
+           {
+               m_via = aOther.m_via;
+           }
+       }
+
+       m_marker = aOther.m_marker;
+       m_rank = aOther.m_rank;
+       m_routable = aOther.m_routable;
+       m_owner = aOther.m_owner;
+       m_snapThreshhold = aOther.m_snapThreshhold;
+       m_blockingObstacle = aOther.m_blockingObstacle;
+
+       m_links = std::move( aOther.m_links );
+   }
 
     return *this;
 }
@@ -109,10 +194,8 @@ int LINE::Marker() const
 {
     int marker = m_marker;
 
-    for( auto s : m_links )
-    {
+    for( LINKED_ITEM* s : m_links )
         marker |= s->Marker();
-    }
 
     return marker;
 }
@@ -120,7 +203,7 @@ int LINE::Marker() const
 
 SEGMENT* SEGMENT::Clone() const
 {
-    SEGMENT* s = new SEGMENT;
+    SEGMENT* s = new SEGMENT( *this );
 
     s->m_seg = m_seg;
     s->m_net = m_net;
@@ -164,10 +247,9 @@ static int areNeighbours( int x, int y, int max = 0 )
     return false;
 }
 
-
-//#ifdef TOM_EXTRA_DEBUG
+#ifdef TOM_EXTRA_DEBUG
 SHAPE_LINE_CHAIN g_pnew, g_hnew;
-//#endif
+#endif
 
 bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPath, bool aCw ) const
 {
@@ -178,7 +260,7 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
         return false;
     }
 
-    const auto pFirst = line.CPoint(0);
+    const VECTOR2I pFirst = line.CPoint(0);
 
     bool inFirst = aObstacle.PointInside( pFirst ) && !aObstacle.PointOnEdge( pFirst );
 
@@ -219,45 +301,39 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
 
     std::vector<VERTEX> vts;
 
-    auto findVertex = [&]( VECTOR2I pos) -> VERTEX*
-    {
-        for( VERTEX& v : vts )
-        {
-            if(v.pos == pos )
-                return &v;
-        }
+    auto findVertex =
+            [&]( const VECTOR2I& pos ) -> VERTEX*
+            {
+                for( VERTEX& v : vts )
+                {
+                    if( v.pos == pos )
+                        return &v;
+                }
 
-        return nullptr;
-    };
-
+                return nullptr;
+            };
 
     // corner case for loopy tracks: insert the end loop point back into the hull
-    if( auto isect = pnew.SelfIntersecting() )
+    if( const std::optional<SHAPE_LINE_CHAIN::INTERSECTION> isect = pnew.SelfIntersecting() )
     {
-        if( isect->p != pnew.CPoint( -1 ) )
-        {
+        if( isect->p != pnew.CLastPoint() )
             pnew.Split( isect->p );
-        }
     }
 
     // insert all intersections found into the new hull/path SLCs
-    for( auto& ip : ips )
+    for( SHAPE_LINE_CHAIN::INTERSECTION& ip : ips )
     {
         if( pnew.Find( ip.p, 1 ) < 0)
-        {
             pnew.Split(ip.p);
-        }
 
         if( hnew.Find( ip.p, 1 ) < 0 )
-        {
             hnew.Split(ip.p);
-        }
     }
 
     for( int i = 0; i < pnew.PointCount(); i++ )
     {
-        auto p = pnew.CPoint(i);
-        bool onEdge = hnew.PointOnEdge( p );
+        const VECTOR2I& p = pnew.CPoint( i );
+        bool            onEdge = hnew.PointOnEdge( p );
 
         if ( !onEdge )
             continue;
@@ -265,9 +341,7 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
         int idx = hnew.Find( p );
 
         if(idx < 0 )
-        {
-            hnew.Split(p);
-        }
+            hnew.Split( p );
     }
 
     #ifdef TOM_EXTRA_DEBUG
@@ -287,9 +361,9 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
     // create a graph of hull/path vertices and classify them (inside/on edge/outside the hull)
     for( int i = 0; i < pnew.PointCount(); i++ )
     {
-        auto p = pnew.CPoint(i);
-        bool onEdge = hnew.PointOnEdge( p );
-        bool inside = hnew.PointInside( p );
+        const VECTOR2I& p = pnew.CPoint(i);
+        bool            onEdge = hnew.PointOnEdge( p );
+        bool            inside = hnew.PointInside( p );
 
         #ifdef TOM_EXTRA_DEBUG
         printf("pnew %d inside %d onedge %d\n", i, !!inside, !!onEdge );
@@ -324,8 +398,8 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
     // insert hull vertices into the graph
     for( int i = 0; i < hnew.PointCount(); i++ )
     {
-        auto hp = hnew.CPoint( i );
-        auto vn = findVertex( hp );
+        const VECTOR2I& hp = hnew.CPoint( i );
+        VERTEX*         vn = findVertex( hp );
 
         // if vertex already present (it's very likely that in recursive shoving hull and path vertices will overlap)
         // just mark it as a path vertex that also belongs to the hull
@@ -348,33 +422,34 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
     // go around the hull and fix up the neighbour link lists
     for( int i = 0; i < hnew.PointCount(); i++ )
     {
-        auto vc = findVertex( hnew.CPoint(i ) );
-        auto vnext = findVertex( hnew.CPoint( i+1 ) );
+        VERTEX* vc = findVertex( hnew.CPoint( i ) );
+        VERTEX* vnext = findVertex( hnew.CPoint( i+1 ) );
 
-        if(vc && vnext)
-            vc->neighbours.push_back(vnext);
+        if( vc && vnext )
+            vc->neighbours.push_back( vnext );
     }
 
     // In the case that the initial path ends *inside* the current obstacle (i.e. the mouse cursor
     // is somewhere inside the hull for the current obstacle) we want to end the walkaround at the
     // point closest to the cursor
-    bool inLast  = aObstacle.PointInside( CPoint( -1 ) ) && !aObstacle.PointOnEdge( CPoint( -1 ) );
+    bool inLast  = aObstacle.PointInside( CLastPoint() ) && !aObstacle.PointOnEdge( CLastPoint() );
     bool appendV = true;
     int  lastDst = INT_MAX;
 
-    int i = 0;
 #ifdef TOM_EXTRA_DEBUG
-    for(auto &v: vts)
+    int i = 0;
+
+    for( VERTEX* &v: vts )
     {
         if( v.indexh < 0 && v.type == ON_EDGE )
-        {
             v.type = OUTSIDE; // hack
-        }
+
         printf("V %d pos %d %d ip %d ih %d type %d\n", i++, v.pos.x, v.pos.y, v.indexp, v.indexh, v.type );
     }
 #endif
     // vts[0] = start point
-    VERTEX* v = &vts[0], *v_prev = nullptr;
+    VERTEX*          v = &vts[0];
+    VERTEX*          v_prev = nullptr;
     SHAPE_LINE_CHAIN out;
 
     int iterLimit = 1000;
@@ -387,15 +462,14 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
         // I'm not 100% sure this algorithm doesn't have bugs that may cause it to freeze,
         // so here's a temporary iteration limit
         if( iterLimit == 0 )
-        {
             return false;
-        }
 
         if( v->visited )
         {
             // loop found? stop walking
             break;
         }
+
 #ifdef TOM_EXTRA_DEBUG
         printf("---\nvisit ip %d ih %d type %d outs %d neig %d\n", v->indexp, v->indexh, v->type, out.PointCount(), v->neighbours.size() );
 #endif
@@ -409,10 +483,11 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
             // that is not inside the hull
             out.Append( v->pos );
             VERTEX* v_next_fallback = nullptr;
-            for( auto vn : v->neighbours )
+
+            for( VERTEX* vn : v->neighbours )
             {
-                if( areNeighbours( vn->indexp , v->indexp, pnew.PointCount() ) &&
-                    vn->type != INSIDE )
+                if( areNeighbours( vn->indexp , v->indexp, pnew.PointCount() )
+                        && vn->type != INSIDE )
                 {
                     if( !vn->visited )
                     {
@@ -420,7 +495,9 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
                         break;
                     }
                     else if( vn != v_prev )
+                    {
                         v_next_fallback = vn;
+                    }
                 }
             }
 
@@ -435,7 +512,6 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
                 #endif
                 return false;
             }
-
         }
         else if( v->type == ON_EDGE )
         {
@@ -475,6 +551,9 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
             // we should never reach this part of the code, but who really knows?
             if( !v_next )
             {
+#ifdef TOM_EXTRA_DEBUG
+                printf("still no v_next\n");
+#endif
                 for( VERTEX* vn : v->neighbours )
                 {
                     if( vn->type == ON_EDGE )
@@ -487,12 +566,25 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
                     }
                 }
 
+                if( v_next )
+                {
+                    for( VERTEX &vt : vts )
+                    {
+                        if( vt.isHull )
+                            vt.visited = false;
+                    }
+                }
+
+#ifdef TOM_EXTRA_DEBUG
+                printf("v_next %p\n", v_next);
+#endif
+
                 // Did we get the next hull point but the end of the line is inside?  Instead of walking
                 // around the hull some more (which will just end up taking us back to the start), lets
                 // just project the normal of the endpoint onto this next segment and call it quits.
                 if( inLast && v_next )
                 {
-                    int d = ( v_next->pos - CPoint( -1 ) ).SquaredEuclideanNorm();
+                    int d = ( v_next->pos - CLastPoint() ).SquaredEuclideanNorm();
 
                     if( d < lastDst )
                     {
@@ -500,7 +592,7 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
                     }
                     else
                     {
-                        VECTOR2I proj = SEG( v->pos, v_next->pos ).NearestPoint( CPoint( -1 ) );
+                        VECTOR2I proj = SEG( v->pos, v_next->pos ).NearestPoint( CLastPoint() );
                         out.Append( proj );
                         appendV = false;
                         break;
@@ -514,54 +606,27 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
         v = v_next;
 
         if( !v )
-        {
             return false;
-        }
     }
 
     if( appendV )
         out.Append( v->pos );
 
-    aPath = out;
-
+    aPath = std::move( out );
     return true;
 }
 
 
 const SHAPE_LINE_CHAIN SEGMENT::Hull( int aClearance, int aWalkaroundThickness, int aLayer ) const
 {
+    /*DEBUG_DECORATOR* debugDecorator = ROUTER::GetInstance()->GetInterface()->GetDebugDecorator();
+
+    PNS_DBG( debugDecorator, Message, wxString::Format( wxT( "seghull %d %d" ), aWalkaroundThickness, aClearance ) );
+    PNS_DBG(debugDecorator, AddShape, &m_seg, RED, 0, wxT("theseg") );
+        */
+
    return SegmentHull( m_seg, aClearance, aWalkaroundThickness );
 }
-
-
-bool LINE::Is45Degree() const
-{
-    for( int i = 0; i < m_line.SegmentCount(); i++ )
-    {
-        const SEG& s = m_line.CSegment( i );
-
-        if( m_line.IsArcSegment( i ) )
-            continue;
-
-        if( s.Length() < 10 )
-            continue;
-
-        double angle = 180.0 / M_PI *
-                       atan2( (double) s.B.y - (double) s.A.y,
-                              (double) s.B.x - (double) s.A.x );
-
-        if( angle < 0 )
-            angle += 360.0;
-
-        double angle_a = fabs( fmod( angle, 45.0 ) );
-
-        if( angle_a > 1.0 && angle_a < 44.0 )
-            return false;
-    }
-
-    return true;
-}
-
 
 const LINE LINE::ClipToNearestObstacle( NODE* aNode ) const
 {
@@ -606,7 +671,7 @@ const LINE LINE::ClipToNearestObstacle( NODE* aNode ) const
 
 
 
-SHAPE_LINE_CHAIN dragCornerInternal( const SHAPE_LINE_CHAIN& aOrigin, const VECTOR2I& aP )
+SHAPE_LINE_CHAIN dragCornerInternal( const SHAPE_LINE_CHAIN& aOrigin, const VECTOR2I& aP, DIRECTION_45 aPreferredEndingDirection = DIRECTION_45() )
 {
     std::optional<SHAPE_LINE_CHAIN> picked;
     int i;
@@ -625,17 +690,19 @@ SHAPE_LINE_CHAIN dragCornerInternal( const SHAPE_LINE_CHAIN& aOrigin, const VECT
         return DIRECTION_45().BuildInitialTrace( aOrigin.CPoint( 0 ), aP, dir.IsDiagonal() );
     }
 
-    if( aOrigin.CSegment( -1 ).Length() > 100000 * 30 ) // fixme: constant/parameter?
+
+    //if( aOrigin.CSegment( -1 ).Length() > 100000 * 30 ) // fixme: constant/parameter?
         d = 1;
 
     for( i = aOrigin.SegmentCount() - d; i >= 0; i-- )
     {
-        DIRECTION_45 d_start( aOrigin.CSegment( i ) );
-        VECTOR2I p_start = aOrigin.CPoint( i );
+        DIRECTION_45     d_start( aOrigin.CSegment( i ) );
+        const VECTOR2I&  p_start = aOrigin.CPoint( i );
         SHAPE_LINE_CHAIN paths[2];
-        DIRECTION_45 dirs[2];
-        DIRECTION_45 d_prev = ( i > 0 ? DIRECTION_45( aOrigin.CSegment( i-1 ) ) : DIRECTION_45() );
-        int dirCount = 0;
+        DIRECTION_45     dirs[2];
+        DIRECTION_45     d_prev = ( i > 0 ? DIRECTION_45( aOrigin.CSegment( i-1 ) )
+                                          : DIRECTION_45() );
+        int              dirCount = 0;
 
         for( int j = 0; j < 2; j++ )
         {
@@ -650,12 +717,28 @@ SHAPE_LINE_CHAIN dragCornerInternal( const SHAPE_LINE_CHAIN& aOrigin, const VECT
             ++dirCount;
         }
 
-        for( int j = 0; j < dirCount; j++ )
+        if( aPreferredEndingDirection != DIRECTION_45::UNDEFINED )
         {
-            if( dirs[j] == d_start )
+            for( int j = 0; j < dirCount; j++ )
             {
-                picked = paths[j];
-                break;
+                DIRECTION_45 endingDir( paths[j].CSegment(-1) );
+                if( endingDir == aPreferredEndingDirection )
+                {
+                    picked = paths[j];
+                    break;
+                }
+            }
+        }
+
+        if( !picked )
+        {
+            for( int j = 0; j < dirCount; j++ )
+            {
+                if( dirs[j] == d_start )
+                {
+                    picked = paths[j];
+                    break;
+                }
             }
         }
 
@@ -683,13 +766,13 @@ SHAPE_LINE_CHAIN dragCornerInternal( const SHAPE_LINE_CHAIN& aOrigin, const VECT
         return path;
     }
 
-    DIRECTION_45 dir( aOrigin.CPoint( -1 ) - aOrigin.CPoint( -2 ) );
+    DIRECTION_45 dir( aOrigin.CLastPoint() - aOrigin.CPoints()[ aOrigin.PointCount() - 2 ] );
 
     return DIRECTION_45().BuildInitialTrace( aOrigin.CPoint( 0 ), aP, dir.IsDiagonal() );
 }
 
 
-void LINE::dragCorner45( const VECTOR2I& aP, int aIndex )
+void LINE::dragCorner45( const VECTOR2I& aP, int aIndex, DIRECTION_45 aPreferredEndingDirection )
 {
     SHAPE_LINE_CHAIN path;
 
@@ -697,9 +780,13 @@ void LINE::dragCorner45( const VECTOR2I& aP, int aIndex )
     VECTOR2I snapped = snapDraggedCorner( m_line, aP, aIndex );
 
     if( aIndex == 0 )
-        path = dragCornerInternal( m_line.Reverse(), snapped ).Reverse();
+    {
+        path = dragCornerInternal( m_line.Reverse(), snapped, aPreferredEndingDirection ).Reverse();
+    }
     else if( aIndex == m_line.SegmentCount() )
-        path = dragCornerInternal( m_line, snapped );
+    {
+        path = dragCornerInternal( m_line, snapped, aPreferredEndingDirection );
+    }
     else
     {
         // Are we next to an arc? Insert a new point so we slice correctly
@@ -707,15 +794,15 @@ void LINE::dragCorner45( const VECTOR2I& aP, int aIndex )
             m_line.Insert( aIndex + 1, m_line.CPoint( aIndex + 1 ) );
 
         // fixme: awkward behaviour for "outwards" drags
-        path = dragCornerInternal( m_line.Slice( 0, aIndex ), snapped );
+        path = dragCornerInternal( m_line.Slice( 0, aIndex ), snapped, aPreferredEndingDirection );
         SHAPE_LINE_CHAIN path_rev =
-                dragCornerInternal( m_line.Slice( aIndex + 1, -1 ).Reverse(), snapped ).Reverse();
+                dragCornerInternal( m_line.Slice( aIndex, -1 ).Reverse(), snapped, aPreferredEndingDirection ).Reverse();
         path.Append( path_rev );
     }
 
     path.Simplify();
     path.SetWidth( width );
-    m_line = path;
+    m_line = std::move( path );
 }
 
 
@@ -746,7 +833,7 @@ void LINE::dragCornerFree( const VECTOR2I& aP, int aIndex )
     m_line.Simplify();
 }
 
-void LINE::DragCorner( const VECTOR2I& aP, int aIndex, bool aFreeAngle )
+void LINE::DragCorner( const VECTOR2I& aP, int aIndex, bool aFreeAngle, DIRECTION_45 aPreferredEndingDirection )
 {
     wxCHECK_RET( aIndex >= 0, wxT( "Negative index passed to LINE::DragCorner" ) );
 
@@ -756,7 +843,7 @@ void LINE::DragCorner( const VECTOR2I& aP, int aIndex, bool aFreeAngle )
     }
     else
     {
-        dragCorner45( aP, aIndex );
+        dragCorner45( aP, aIndex, aPreferredEndingDirection );
     }
 }
 
@@ -770,6 +857,239 @@ void LINE::DragSegment( const VECTOR2I& aP, int aIndex, bool aFreeAngle )
     {
         dragSegment45( aP, aIndex );
     }
+}
+
+
+void LINE::DragArc( const VECTOR2I& aP, int aIndex )
+{
+    if( aIndex < 0 || aIndex >= m_line.PointCount() )
+        return;
+
+    ssize_t arcIdx = m_line.ArcIndex( aIndex );
+
+    if( arcIdx < 0 )
+        return;
+
+    int firstArcPt = -1;
+    int lastArcPt = -1;
+
+    for( int i = 0; i < m_line.PointCount(); i++ )
+    {
+        if( m_line.ArcIndex( i ) == arcIdx )
+        {
+            if( firstArcPt < 0 )
+                firstArcPt = i;
+
+            lastArcPt = i;
+        }
+    }
+
+    if( firstArcPt < 0 || lastArcPt < 0 )
+        return;
+
+    const SHAPE_ARC& oldArc = m_line.CArcs()[arcIdx];
+    int              width = oldArc.GetWidth();
+
+    auto tangentLineAtArcEndpoint = [&]( const VECTOR2I& aEndpoint ) -> SEG
+    {
+        VECTOR2I center = oldArc.GetCenter();
+        VECTOR2I radial = aEndpoint - center;
+        VECTOR2I perp( -radial.y, radial.x );
+        return SEG( aEndpoint - perp, aEndpoint + perp );
+    };
+
+    auto isCollinearTo = [&]( const SEG& aA, const SEG& aB, double aMaxDeviationDeg ) -> bool
+    {
+        VECTOR2D dirA( aA.B - aA.A );
+        VECTOR2D dirB( aB.B - aB.A );
+        double   magA = dirA.EuclideanNorm();
+        double   magB = dirB.EuclideanNorm();
+
+        if( magA <= 0 || magB <= 0 )
+            return false;
+
+        double crossMag = std::abs( dirA.x * dirB.y - dirA.y * dirB.x );
+        double sinAngle = crossMag / ( magA * magB );
+        double angleDeg = std::asin( std::clamp( sinAngle, 0.0, 1.0 ) ) * 180.0 / M_PI;
+
+        return angleDeg <= aMaxDeviationDeg;
+    };
+
+    double maxDeviation = ADVANCED_CFG::GetCfg().m_MaxTangentAngleDeviation;
+    SEG    arcLineStart = tangentLineAtArcEndpoint( oldArc.GetP0() );
+    SEG    arcLineEnd = tangentLineAtArcEndpoint( oldArc.GetP1() );
+
+    bool useChainStart = false;
+    bool useChainEnd = false;
+
+    if( firstArcPt > 0 )
+    {
+        SEG candidate( m_line.CPoint( firstArcPt - 1 ), m_line.CPoint( firstArcPt ) );
+
+        if( isCollinearTo( candidate, arcLineStart, maxDeviation ) )
+            useChainStart = true;
+    }
+
+    if( lastArcPt < m_line.PointCount() - 1 )
+    {
+        SEG candidate( m_line.CPoint( lastArcPt ), m_line.CPoint( lastArcPt + 1 ) );
+
+        if( isCollinearTo( candidate, arcLineEnd, maxDeviation ) )
+            useChainEnd = true;
+    }
+
+    OPT_VECTOR2I arcOwnTanIntersect = arcLineStart.IntersectLines( arcLineEnd );
+
+    SEG tanStartSeg, tanEndSeg;
+
+    if( useChainStart )
+    {
+        tanStartSeg = SEG( m_line.CPoint( firstArcPt - 1 ), m_line.CPoint( firstArcPt ) );
+    }
+    else
+    {
+        if( !arcOwnTanIntersect )
+            return;
+
+        tanStartSeg = SEG( *arcOwnTanIntersect, oldArc.GetP0() );
+    }
+
+    if( useChainEnd )
+    {
+        tanEndSeg = SEG( m_line.CPoint( lastArcPt ), m_line.CPoint( lastArcPt + 1 ) );
+    }
+    else
+    {
+        if( !arcOwnTanIntersect )
+            return;
+
+        tanEndSeg = SEG( *arcOwnTanIntersect, oldArc.GetP1() );
+    }
+
+    OPT_VECTOR2I tanIntersect = tanStartSeg.IntersectLines( tanEndSeg );
+
+    if( !tanIntersect )
+        return; // parallel tangents have no tangent-circle solution
+
+    // Reorient tangent segments so they emanate from the intersection point, so the
+    // constraint math below operates on the (intersect, arc-endpoint) directed segments.
+    SEG tanStartFromIntersect = SEG( *tanIntersect, oldArc.GetP0() );
+    SEG tanEndFromIntersect = SEG( *tanIntersect, oldArc.GetP1() );
+
+    auto furthestFromIntersect = [&]( const VECTOR2I& aA, const VECTOR2I& aB ) -> VECTOR2I
+    {
+        return ( aA - *tanIntersect ).EuclideanNorm() > ( aB - *tanIntersect ).EuclideanNorm() ? aA : aB;
+    };
+
+    VECTOR2I tanStartFar = furthestFromIntersect( tanStartSeg.A, tanStartSeg.B );
+    VECTOR2I tanEndFar = furthestFromIntersect( tanEndSeg.A, tanEndSeg.B );
+    VECTOR2I tempTangentPoint = furthestFromIntersect( tanStartFar, tanEndFar ) == tanEndFar ? tanStartFar : tanEndFar;
+
+    CIRCLE maxTanCircle;
+    maxTanCircle.ConstructFromTanTanPt( tanStartFromIntersect, tanEndFromIntersect, tempTangentPoint );
+
+    VECTOR2I maxTanPtStart = tanStartFromIntersect.LineProject( maxTanCircle.Center );
+    VECTOR2I maxTanPtEnd = tanEndFromIntersect.LineProject( maxTanCircle.Center );
+
+    SEG cSegTanStart( maxTanPtStart, *tanIntersect );
+    SEG cSegTanEnd( maxTanPtEnd, *tanIntersect );
+    SEG cSegChord( maxTanPtStart, maxTanPtEnd );
+
+    VECTOR2I oldMid = oldArc.GetArcMid();
+    int      cSegTanStartSide = cSegTanStart.Side( oldMid );
+    int      cSegTanEndSide = cSegTanEnd.Side( oldMid );
+    int      cSegChordSide = cSegChord.Side( oldMid );
+
+    VECTOR2I cursor = aP;
+
+    if( cSegTanStartSide != cSegTanStart.Side( cursor ) || cSegTanEndSide != cSegTanEnd.Side( cursor )
+        || cSegChordSide != cSegChord.Side( cursor ) )
+    {
+        VECTOR2I best = cSegTanStart.NearestPoint( cursor );
+
+        for( const VECTOR2I& candidate : { cSegTanEnd.NearestPoint( cursor ), cSegChord.NearestPoint( cursor ) } )
+        {
+            if( ( candidate - cursor ).SquaredEuclideanNorm() < ( best - cursor ).SquaredEuclideanNorm() )
+            {
+                best = candidate;
+            }
+        }
+
+        cursor = best;
+    }
+
+    if( ( cursor - maxTanCircle.Center ).EuclideanNorm() < maxTanCircle.Radius )
+        cursor = maxTanCircle.NearestPoint( cursor );
+
+    CIRCLE c;
+    c.ConstructFromTanTanPt( tanStartSeg, tanEndSeg, cursor );
+
+    if( c.Radius <= 0 )
+        return;
+
+    VECTOR2I newCenter = c.Center;
+    VECTOR2I newStart = tanStartSeg.LineProject( newCenter );
+    VECTOR2I newEnd = tanEndSeg.LineProject( newCenter );
+
+    // Non-tangent side keeps the original arc endpoint in the chain so the corner
+    // stays put while a new tangent stub grows out to newStart.
+    int maxStubIU = KiROUND( ADVANCED_CFG::GetCfg().m_MaxTrackLengthToKeep * pcbIUScale.IU_PER_MM );
+
+    int prefixCutoff = useChainStart ? ( firstArcPt - 1 ) : firstArcPt;
+    int suffixCutoff = useChainEnd ? ( lastArcPt + 1 ) : lastArcPt;
+
+    if( ( newEnd - newStart ).EuclideanNorm() <= maxStubIU )
+    {
+        SHAPE_LINE_CHAIN rebuilt;
+        rebuilt.SetWidth( m_line.Width() );
+
+        if( prefixCutoff >= 0 )
+            rebuilt.Append( m_line.Slice( 0, prefixCutoff ) );
+
+        if( suffixCutoff <= m_line.PointCount() - 1 )
+            rebuilt.Append( m_line.Slice( suffixCutoff, m_line.PointCount() - 1 ) );
+
+        m_line = rebuilt;
+        return;
+    }
+
+    if( firstArcPt > 0 )
+    {
+        VECTOR2I anchor = useChainStart ? m_line.CPoint( firstArcPt - 1 ) : m_line.CPoint( firstArcPt );
+
+        if( ( anchor - newStart ).EuclideanNorm() <= maxStubIU )
+        {
+            newStart = anchor;
+            prefixCutoff = useChainStart ? ( firstArcPt - 2 ) : ( firstArcPt - 1 );
+        }
+    }
+
+    if( lastArcPt < m_line.PointCount() - 1 )
+    {
+        VECTOR2I anchor = useChainEnd ? m_line.CPoint( lastArcPt + 1 ) : m_line.CPoint( lastArcPt );
+
+        if( ( anchor - newEnd ).EuclideanNorm() <= maxStubIU )
+        {
+            newEnd = anchor;
+            suffixCutoff = useChainEnd ? ( lastArcPt + 2 ) : ( lastArcPt + 1 );
+        }
+    }
+
+    VECTOR2I  newMid = CalcArcMid( newStart, newEnd, newCenter );
+    SHAPE_ARC newArc( newStart, newMid, newEnd, width );
+
+    SHAPE_LINE_CHAIN rebuilt;
+    rebuilt.SetWidth( m_line.Width() );
+
+    if( prefixCutoff >= 0 )
+        rebuilt.Append( m_line.Slice( 0, prefixCutoff ) );
+
+    rebuilt.Append( newArc );
+
+    if( suffixCutoff <= m_line.PointCount() - 1 )
+        rebuilt.Append( m_line.Slice( suffixCutoff, m_line.PointCount() - 1 ) );
+
+    m_line = rebuilt;
 }
 
 VECTOR2I LINE::snapDraggedCorner(
@@ -884,7 +1204,7 @@ void LINE::dragSegment45( const VECTOR2I& aP, int aIndex )
 
     if( index == path.SegmentCount() - 1 )
     {
-        path.Insert( path.PointCount() - 1, path.CPoint( -1 ) );
+        path.Insert( path.PointCount() - 1, path.CLastPoint() );
     }
     else if( path.IsPtOnArc( index + 1 ) )
     {
@@ -1011,7 +1331,7 @@ void LINE::dragSegment45( const VECTOR2I& aP, int aIndex )
             if( np.Length() < best_len )
             {
                 best_len = np.Length();
-                best = np;
+                best = std::move( np );
             }
         }
     }
@@ -1050,9 +1370,21 @@ void LINE::AppendVia( const VIA& aVia )
         Reverse();
     }
 
-    m_hasVia = true;
+    m_via = aVia.Clone();
+    m_via->SetOwner( this );
+    m_via->SetNet( m_net );
+}
+
+
+void LINE::LinkVia( VIA* aVia )
+{
+    if( m_line.PointCount() > 1 && aVia->Pos() == m_line.CPoint( 0 ) )
+    {
+        Reverse();
+    }
+
     m_via = aVia;
-    m_via.SetNet( m_net );
+    Link( aVia );
 }
 
 
@@ -1070,12 +1402,13 @@ int LINE::Rank() const
 {
     int min_rank = INT_MAX;
 
-    if( IsLinked() ) {
-        for( auto s : m_links )
-        {
-            min_rank = std::min( min_rank, s->Rank() );
-        }
-    } else {
+    if( IsLinked() )
+    {
+        for( const LINKED_ITEM* item : m_links )
+            min_rank = std::min( min_rank, item->Rank() );
+    }
+    else
+    {
         min_rank = m_rank;
     }
 
@@ -1096,8 +1429,6 @@ void LINE::ClipVertexRange( int aStart, int aEnd )
     int firstLink = 0;
     int lastLink  = std::max( 0, static_cast<int>( m_links.size() ) - 1 );
     int linkIdx   = 0;
-
-    int numPoints = static_cast<int>( m_line.PointCount() );
 
     for( int i = 0; i >= 0 && i < m_line.PointCount(); i = m_line.NextShape( i ) )
     {
@@ -1254,12 +1585,50 @@ bool LINE::HasLockedSegments() const
     return false;
 }
 
+
 void LINE::Clear()
 {
-    m_hasVia = false;
+    ClearLinks();
+    RemoveVia();
     m_line.Clear();
 }
 
 
+void LINE::RemoveVia()
+{
+    if( m_via )
+    {
+        if( ContainsLink( m_via ) )
+            Unlink( m_via );
+        if( m_via->BelongsTo( this ) )
+            delete m_via;
+    }
+
+    m_via = nullptr;
 }
+
+
+const std::string SEGMENT::Format( ) const
+{
+    std::stringstream ss;
+    ss << ITEM::Format() << " ";
+    ss << m_seg.Format( false );
+    return ss.str();
+}
+
+
+int LINE::FindSegment( const SEGMENT* aSeg ) const
+{
+    for( int i = 0; i < m_line.SegmentCount(); i++)
+    {
+        const SEG&s = m_line.CSegment(i);
+        if( s == aSeg->Seg() )
+            return i;
+    }
+
+    return -1;
+}
+
+}
+
 

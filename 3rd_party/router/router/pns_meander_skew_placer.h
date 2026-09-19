@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2015 CERN
- * Copyright (C) 2016 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -48,20 +48,30 @@ public:
     /// @copydoc PLACEMENT_ALGO::Move()
     bool Move( const VECTOR2I& aP, ITEM* aEndItem ) override;
 
-    /// @copydoc MEANDER_PLACER_BASE::TuningInfo()
-    const wxString TuningInfo( EDA_UNITS aUnits ) const override;
+    /// @copydoc MEANDER_PLACER_BASE::TuningLengthResult()
+    long long int TuningLengthResult() const override;
+
+    /// @copydoc MEANDER_PLACER_BASE::TuningDelayResult()
+    int64_t TuningDelayResult() const override;
+
+    long long int CurrentSkew() const;
 
 private:
-    long long int currentSkew() const;
-
     long long int origPathLength() const override;
 
+    int64_t origPathDelay() const override;
+
+    void calculateTimeDomainTargets() override;
+
     DIFF_PAIR m_originPair;
-    ITEM_SET  m_tunedPath, m_tunedPathP, m_tunedPathN;
+    ITEM_SET  m_tunedPathP, m_tunedPathN;
 
     long long int m_coupledLength;
-    int           m_padToDieP;
-    int           m_padToDieN;
+    int64_t       m_coupledDelay;
+    int           m_padToDieLengthP;
+    int           m_padToDieLengthN;
+    int64_t       m_padToDieDelayP;
+    int64_t       m_padToDieDelayN;
 };
 
 }

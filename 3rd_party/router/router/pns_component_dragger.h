@@ -2,6 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2020 CERN
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -24,7 +25,6 @@
 #include <math/vector2d.h>
 
 #include "pns_drag_algo.h"
-#include "layer_ids.h"
 
 namespace PNS
 {
@@ -66,7 +66,7 @@ public:
      * and eventually commits it to the world.
      * @return true, if dragging finished with success.
      */
-    bool FixRoute() override;
+    bool FixRoute( bool aForceCommit ) override;
 
     /**
      * Function CurrentNode()
@@ -79,12 +79,12 @@ public:
     /**
      * Function CurrentNets()
      *
-     * Returns the net code(s) of currently dragged item(s).
+     * Returns the net(s) of currently dragged item(s).
      * Currently unused for component dragging.
      */
-    const std::vector<int> CurrentNets() const override
+    const std::vector<NET_HANDLE> CurrentNets() const override
     {
-        return std::vector<int>();
+        return std::vector<NET_HANDLE>();
     }
 
     /**
@@ -104,6 +104,17 @@ public:
      * Returns the set of dragged items.
      */
     const ITEM_SET Traces() override;
+
+    virtual PNS::DRAG_MODE Mode() const override
+    {
+        return PNS::DM_COMPONENT;
+    }
+
+    bool GetForceMarkObstaclesMode( bool* aDragStatus ) const override
+    {
+        *aDragStatus = m_dragStatus;
+        return false;
+    }
 
 private:
     struct DRAGGED_CONNECTION

@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2019 CERN
- * Copyright (C) 2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * Author: Seth Hillbrand <hillbrand@ucdavis.edu>
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.h>
@@ -25,29 +25,46 @@
 #define PCBNEW_ROUTER_PNS_LINK_HOLDER_H_
 
 #include <core/kicad_algo.h>
+#include <algorithm>
+
+#include <wx/log.h>
+
 #include "pns_item.h"
 #include "pns_linked_item.h"
+
 
 namespace PNS
 {
 class LINK_HOLDER : public ITEM
 {
 public:
-    typedef std::vector<LINKED_ITEM*> LINKS;
-
-    LINK_HOLDER( PnsKind aKind ) : ITEM( aKind )
+    LINK_HOLDER( PnsKind aKind ) :
+        ITEM( aKind )
     {}
 
     ///< Add a reference to an item registered in a #NODE that is a part of this line.
     void Link( LINKED_ITEM* aLink )
     {
+        if( alg::contains( m_links, aLink ) )
+        {
+            wxLogDebug( wxT( "PNS LINK_HOLDER::Link: item %p already linked to %p" ), aLink, this );
+            return;
+        }
+
         m_links.push_back( aLink );
+    }
+
+    void Unlink( const LINKED_ITEM* aLink )
+    {
+        wxCHECK_MSG( alg::contains( m_links, aLink ), /* void */,
+                     "Trying to unlink an item that is not linked" );
+        std::erase( m_links, aLink );
     }
 
     ///< Return the list of links from the owning node that constitute this
     ///< line (or NULL if the line is not linked).
-    LINKS& Links() { return m_links; }
-    const LINKS& Links() const { return m_links; }
+    std::vector<LINKED_ITEM*>& Links() { return m_links; }
+    const std::vector<LINKED_ITEM*>& Links() const { return m_links; }
 
     bool IsLinked() const
     {
@@ -62,6 +79,9 @@ public:
 
     LINKED_ITEM* GetLink( int aIndex ) const
     {
+        if( aIndex < 0 )
+            aIndex += m_links.size();
+
         return m_links[aIndex];
     }
 
@@ -102,7 +122,7 @@ protected:
 
     ///< List of segments in the owning NODE (ITEM::m_owner) that constitute this line, or NULL
     ///< if the line is not a part of any node.
-    LINKS m_links;
+    std::vector<LINKED_ITEM*> m_links;
 };
 
 } // namespace PNS

@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2015-2019 CERN
- * Copyright (C) 2021-2022 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  * @author Alejandro García Montoro <alejandro.garciamontoro@gmail.com>
@@ -37,27 +37,39 @@
 #include <map>
 #include <memory>
 #include <set>
-#include <string>                            // for char_traits, operator!=
-#include <type_traits>                       // for swap, move
+#include <string> // for char_traits, operator!=
 #include <unordered_set>
+#include <utility> // for swap, move
 #include <vector>
+#include <array>
 
-#include "router/clipper_kicad/clipper.hpp"                       // for Clipper, PolyNode, Clipp...
+#include <clipper2/clipper.h>
 #include <geometry/geometry_utils.h>
 #include <geometry/polygon_triangulation.h>
 #include <geometry/seg.h>                    // for SEG, OPT_VECTOR2I
 #include <geometry/shape.h>
 #include <geometry/shape_line_chain.h>
 #include <geometry/shape_poly_set.h>
+#include <geometry/rtree.h>
 #include <math/box2.h>                       // for BOX2I
 #include <math/util.h>                       // for KiROUND, rescale
 #include <math/vector2d.h>                   // for VECTOR2I, VECTOR2D, VECTOR2
-#include <md5_hash.h>
+#include <hash.h>
+#include <mmh3_hash.h>
 #include <geometry/shape_segment.h>
 #include <geometry/shape_circle.h>
 
-#include "wx_compat.h"
+#include <wx/log.h>
 
+// ADVANCED_CFG::GetCfg() cannot be used on msys2/mingw builds (link failure)
+// So we use the ADVANCED_CFG default values
+#if defined( __MINGW32__ )
+    #define TRIANGULATESIMPLIFICATIONLEVEL 50
+    #define ENABLECACHEFRIENDLYFRACTURE true
+#else
+    #define TRIANGULATESIMPLIFICATIONLEVEL ADVANCED_CFG::GetCfg().m_TriangulateSimplificationLevel
+    #define ENABLECACHEFRIENDLYFRACTURE ADVANCED_CFG::GetCfg().m_EnableCacheFriendlyFracture
+#endif
 
 SHAPE_POLY_SET::SHAPE_POLY_SET() :
     SHAPE( SH_POLY_SET )
@@ -84,12 +96,21 @@ SHAPE_POLY_SET::SHAPE_POLY_SET( const SHAPE_LINE_CHAIN& aOutline ) :
 }
 
 
+SHAPE_POLY_SET::SHAPE_POLY_SET( const POLYGON& aPolygon ) :
+    SHAPE( SH_POLY_SET )
+{
+    AddPolygon( aPolygon );
+}
+
+
 SHAPE_POLY_SET::SHAPE_POLY_SET( const SHAPE_POLY_SET& aOther ) :
     SHAPE( aOther ),
     m_polys( aOther.m_polys )
 {
     if( aOther.IsTriangulationUpToDate() )
     {
+        m_triangulatedPolys.reserve( aOther.TriangulatedPolyCount() );
+
         for( unsigned i = 0; i < aOther.TriangulatedPolyCount(); i++ )
         {
             const TRIANGULATED_POLYGON* poly = aOther.TriangulatedPolygon( i );
@@ -97,14 +118,25 @@ SHAPE_POLY_SET::SHAPE_POLY_SET( const SHAPE_POLY_SET& aOther ) :
         }
 
         m_hash = aOther.GetHash();
+        m_hashValid = true;
         m_triangulationValid = true;
     }
     else
     {
+        m_hash.Clear();
+        m_hashValid = false;
         m_triangulationValid = false;
-        m_hash = MD5_HASH();
-        m_triangulatedPolys.clear();
     }
+}
+
+
+SHAPE_POLY_SET::SHAPE_POLY_SET( const SHAPE_POLY_SET& aOther, DROP_TRIANGULATION_FLAG ) :
+    SHAPE( aOther ),
+    m_polys( aOther.m_polys )
+{
+    m_hash.Clear();
+    m_hashValid = false;
+    m_triangulationValid = false;
 }
 
 
@@ -116,6 +148,12 @@ SHAPE_POLY_SET::~SHAPE_POLY_SET()
 SHAPE* SHAPE_POLY_SET::Clone() const
 {
     return new SHAPE_POLY_SET( *this );
+}
+
+
+SHAPE_POLY_SET SHAPE_POLY_SET::CloneDropTriangulation() const
+{
+    return SHAPE_POLY_SET( *this, DROP_TRIANGULATION_FLAG::SINGLETON );
 }
 
 
@@ -201,11 +239,11 @@ bool SHAPE_POLY_SET::GetGlobalIndex( SHAPE_POLY_SET::VERTEX_INDEX aRelativeIndic
 int SHAPE_POLY_SET::NewOutline()
 {
     SHAPE_LINE_CHAIN empty_path;
-    POLYGON poly;
+    POLYGON          poly;
 
     empty_path.SetClosed( true );
     poly.push_back( empty_path );
-    m_polys.push_back( poly );
+    m_polys.push_back( std::move( poly ) );
     return m_polys.size() - 1;
 }
 
@@ -250,7 +288,8 @@ int SHAPE_POLY_SET::Append( int x, int y, int aOutline, int aHole, bool aAllowDu
 }
 
 
-int SHAPE_POLY_SET::Append( SHAPE_ARC& aArc, int aOutline, int aHole )
+int SHAPE_POLY_SET::Append( const SHAPE_ARC& aArc, int aOutline, int aHole,
+                            std::optional<int> aMaxError )
 {
     assert( m_polys.size() );
 
@@ -267,7 +306,10 @@ int SHAPE_POLY_SET::Append( SHAPE_ARC& aArc, int aOutline, int aHole )
     assert( aOutline < (int) m_polys.size() );
     assert( idx < (int) m_polys[aOutline].size() );
 
-    m_polys[aOutline][idx].Append( aArc );
+    if( aMaxError.has_value() )
+        m_polys[aOutline][idx].Append( aArc, aMaxError.value() );
+    else
+        m_polys[aOutline][idx].Append( aArc );
 
     return m_polys[aOutline][idx].PointCount();
 }
@@ -391,7 +433,7 @@ const VECTOR2I& SHAPE_POLY_SET::CVertex( SHAPE_POLY_SET::VERTEX_INDEX index ) co
 }
 
 
-bool SHAPE_POLY_SET::GetNeighbourIndexes( int aGlobalIndex, int* aPrevious, int* aNext )
+bool SHAPE_POLY_SET::GetNeighbourIndexes( int aGlobalIndex, int* aPrevious, int* aNext ) const
 {
     SHAPE_POLY_SET::VERTEX_INDEX index;
 
@@ -406,8 +448,8 @@ bool SHAPE_POLY_SET::GetNeighbourIndexes( int aGlobalIndex, int* aPrevious, int*
 
     if( index.m_vertex == 0 )
     {
-        index.m_vertex  = lastpoint;
-        inext.m_vertex  = 1;
+        index.m_vertex = lastpoint - 1;
+        inext.m_vertex = 1;
     }
     else if( index.m_vertex == lastpoint )
     {
@@ -418,6 +460,9 @@ bool SHAPE_POLY_SET::GetNeighbourIndexes( int aGlobalIndex, int* aPrevious, int*
     {
         inext.m_vertex++;
         index.m_vertex--;
+
+        if( inext.m_vertex == lastpoint )
+            inext.m_vertex = 0;
     }
 
     if( aPrevious )
@@ -440,23 +485,46 @@ bool SHAPE_POLY_SET::GetNeighbourIndexes( int aGlobalIndex, int* aPrevious, int*
 
 bool SHAPE_POLY_SET::IsPolygonSelfIntersecting( int aPolygonIndex ) const
 {
-    CONST_SEGMENT_ITERATOR iterator = CIterateSegmentsWithHoles( aPolygonIndex );
-    CONST_SEGMENT_ITERATOR innerIterator;
+    std::vector<SEG> segments;
+    segments.reserve( FullPointCount() );
 
-    for( iterator = CIterateSegmentsWithHoles( aPolygonIndex ); iterator; iterator++ )
+    for( CONST_SEGMENT_ITERATOR it = CIterateSegmentsWithHoles( aPolygonIndex ); it; it++ )
+        segments.emplace_back( *it );
+
+    std::sort( segments.begin(), segments.end(), []( const SEG& a, const SEG& b )
+            {
+                int min_a_x = std::min( a.A.x, a.B.x );
+                int min_b_x = std::min( b.A.x, b.B.x );
+
+                return min_a_x < min_b_x || ( min_a_x == min_b_x && std::min( a.A.y, a.B.y ) < std::min( b.A.y, b.B.y ) );
+            } );
+
+    for( auto it = segments.begin(); it != segments.end(); ++it )
     {
-        SEG firstSegment = *iterator;
+        SEG& firstSegment = *it;
 
         // Iterate through all remaining segments.
-        innerIterator = iterator;
+        auto innerIterator = it;
+        int max_x = std::max( firstSegment.A.x, firstSegment.B.x );
+        int max_y = std::max( firstSegment.A.y, firstSegment.B.y );
 
         // Start in the next segment, we don't want to check collision between a segment and itself
-        for( innerIterator++; innerIterator; innerIterator++ )
+        for( innerIterator++; innerIterator != segments.end(); innerIterator++ )
         {
-            SEG secondSegment = *innerIterator;
+            SEG& secondSegment = *innerIterator;
+            int min_x = std::min( secondSegment.A.x, secondSegment.B.x );
+            int min_y = std::min( secondSegment.A.y, secondSegment.B.y );
+
+            // We are ordered in minimum point order, so checking the static max (first segment) against
+            // the ordered min will tell us if any of the following segments are withing the BBox
+            if( max_x < min_x || ( max_x == min_x && max_y < min_y ) )
+                break;
+
+            int index_diff = std::abs( firstSegment.Index() - secondSegment.Index() );
+            bool adjacent = ( index_diff == 1) || (index_diff == ((int)segments.size() - 1) );
 
             // Check whether the two segments built collide, only when they are not adjacent.
-            if( !iterator.IsAdjacent( innerIterator ) && firstSegment.Collide( secondSegment, 0 ) )
+            if( !adjacent && firstSegment.Collide( secondSegment, 0 ) )
                 return true;
         }
     }
@@ -479,15 +547,19 @@ bool SHAPE_POLY_SET::IsSelfIntersecting() const
 
 int SHAPE_POLY_SET::AddOutline( const SHAPE_LINE_CHAIN& aOutline )
 {
-    assert( aOutline.IsClosed() );
-
     POLYGON poly;
 
     poly.push_back( aOutline );
 
-    m_polys.push_back( poly );
+    // This is an assertion because if it's generated by KiCad code, it probably
+    // indicates a bug elsewhere that should be fixed, but we also auto-fix it here
+    // for SWIG plugins that might mess it up
+    wxCHECK2_MSG( aOutline.IsClosed(), poly.back().SetClosed( true ),
+                  "Warning: non-closed outline added to SHAPE_POLY_SET" );
 
-    return m_polys.size() - 1;
+    m_polys.push_back( std::move( poly ) );
+
+    return (int) m_polys.size() - 1;
 }
 
 
@@ -496,7 +568,7 @@ int SHAPE_POLY_SET::AddHole( const SHAPE_LINE_CHAIN& aHole, int aOutline )
     assert( m_polys.size() );
 
     if( aOutline < 0 )
-        aOutline += m_polys.size();
+        aOutline += (int) m_polys.size();
 
     assert( aOutline < (int)m_polys.size() );
 
@@ -506,7 +578,15 @@ int SHAPE_POLY_SET::AddHole( const SHAPE_LINE_CHAIN& aHole, int aOutline )
 
     poly.push_back( aHole );
 
-    return poly.size() - 2;
+    return (int) poly.size() - 2;
+}
+
+
+int SHAPE_POLY_SET::AddPolygon( const POLYGON& apolygon )
+{
+    m_polys.push_back( apolygon );
+
+    return m_polys.size() - 1;
 }
 
 
@@ -516,10 +596,10 @@ double SHAPE_POLY_SET::Area()
 
     for( int i = 0; i < OutlineCount(); i++ )
     {
-        area += Outline( i ).Area();
+        area += Outline( i ).Area( true );
 
         for( int j = 0; j < HoleCount( i ); j++ )
-            area -= Hole( i, j ).Area();
+            area -= Hole( i, j ).Area( true );
     }
 
     return area;
@@ -563,15 +643,120 @@ void SHAPE_POLY_SET::ClearArcs()
 }
 
 
-void SHAPE_POLY_SET::booleanOp( ClipperLibKiCad::ClipType aType, const SHAPE_POLY_SET& aOtherShape,
-                                POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::RebuildHolesFromContours()
 {
-    booleanOp( aType, *this, aOtherShape, aFastMode );
+    std::vector<SHAPE_LINE_CHAIN> contours;
+
+    for( const POLYGON& poly : m_polys )
+        contours.insert( contours.end(), poly.begin(), poly.end() );
+
+    std::map<int, std::set<int>> parentToChildren;
+    std::map<int, std::set<int>> childToParents;
+
+    for( SHAPE_LINE_CHAIN& contour : contours )
+        contour.GenerateBBoxCache();
+
+    for( size_t i = 0; i < contours.size(); i++ )
+    {
+        const SHAPE_LINE_CHAIN& outline = contours[i];
+
+        for( size_t j = 0; j < contours.size(); j++ )
+        {
+            if( i == j )
+                continue;
+
+            const SHAPE_LINE_CHAIN& candidate = contours[j];
+            const VECTOR2I&         pt0 = candidate.CPoint( 0 );
+
+            if( outline.PointInside( pt0, 0, true ) )
+            {
+                parentToChildren[i].emplace( j );
+                childToParents[j].emplace( i );
+            }
+        }
+    }
+
+    std::set<int> topLevelParents;
+
+    for( size_t i = 0; i < contours.size(); i++ )
+    {
+        if( childToParents[i].size() == 0 )
+        {
+            topLevelParents.emplace( i );
+        }
+    }
+
+    SHAPE_POLY_SET result;
+
+    std::function<void( int, int, std::vector<int> )> process;
+
+    process =
+            [&]( int myId, int parentOutlineId, const std::vector<int>& path )
+            {
+                std::set<int> relParents = childToParents[myId];
+
+                for( int pathId : path )
+                {
+                    int erased = relParents.erase( pathId );
+                    wxASSERT( erased > 0 );
+                }
+
+                wxASSERT( relParents.size() == 0 );
+
+                int myOutline = -1;
+
+                bool isOutline = path.size() % 2 == 0;
+
+                if( isOutline )
+                {
+                    int outlineId = result.AddOutline( contours[myId] );
+                    myOutline = outlineId;
+                }
+                else
+                {
+                    wxASSERT( parentOutlineId != -1 );
+                    result.AddHole( contours[myId], parentOutlineId );
+                }
+
+                auto it = parentToChildren.find( myId );
+                if( it != parentToChildren.end() )
+                {
+                    std::vector<int> thisPath = path;
+                    thisPath.emplace_back( myId );
+
+                    std::set<int> thisPathSet;
+                    thisPathSet.insert( thisPath.begin(), thisPath.end() );
+
+                    for( int childId : it->second )
+                    {
+                        const std::set<int>& childPathSet = childToParents[childId];
+
+                        if( thisPathSet != childPathSet )
+                            continue; // Only interested in immediate children
+
+                        process( childId, myOutline, thisPath );
+                    }
+                }
+            };
+
+    for( int topParentId : topLevelParents )
+    {
+        std::vector<int> path;
+        process( topParentId, -1, std::move( path ) );
+    }
+
+    *this = std::move( result );
 }
 
 
-void SHAPE_POLY_SET::booleanOp( ClipperLibKiCad::ClipType aType, const SHAPE_POLY_SET& aShape,
-                                const SHAPE_POLY_SET& aOtherShape, POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::booleanOp( Clipper2Lib::ClipType aType, const SHAPE_POLY_SET& aOtherShape )
+{
+    booleanOp( aType, *this, aOtherShape );
+}
+
+
+void SHAPE_POLY_SET::booleanOp( Clipper2Lib::ClipType aType, const SHAPE_POLY_SET& aShape,
+                                const SHAPE_POLY_SET& aOtherShape )
 {
     if( ( aShape.OutlineCount() > 1 || aOtherShape.OutlineCount() > 0 )
         && ( aShape.ArcCount() > 0 || aOtherShape.ArcCount() > 0 ) )
@@ -580,20 +765,20 @@ void SHAPE_POLY_SET::booleanOp( ClipperLibKiCad::ClipType aType, const SHAPE_POL
                          "ClearArcs() before carrying out the boolean operation." ) );
     }
 
-    ClipperLibKiCad::Clipper c;
-
-    c.StrictlySimple( aFastMode == PM_STRICTLY_SIMPLE );
+    Clipper2Lib::Clipper64 c;
 
     std::vector<CLIPPER_Z_VALUE> zValues;
     std::vector<SHAPE_ARC> arcBuffer;
     std::map<VECTOR2I, CLIPPER_Z_VALUE> newIntersectPoints;
 
+    Clipper2Lib::Paths64 paths;
+    Clipper2Lib::Paths64 clips;
+
     for( const POLYGON& poly : aShape.m_polys )
     {
         for( size_t i = 0; i < poly.size(); i++ )
         {
-            c.AddPath( poly[i].convertToClipper( i == 0, zValues, arcBuffer ),
-                       ClipperLibKiCad::ptSubject, true );
+            paths.push_back( poly[i].convertToClipper2( i == 0, zValues, arcBuffer ) );
         }
     }
 
@@ -601,17 +786,19 @@ void SHAPE_POLY_SET::booleanOp( ClipperLibKiCad::ClipType aType, const SHAPE_POL
     {
         for( size_t i = 0; i < poly.size(); i++ )
         {
-            c.AddPath( poly[i].convertToClipper( i == 0, zValues, arcBuffer ),
-                       ClipperLibKiCad::ptClip, true );
+            clips.push_back( poly[i].convertToClipper2( i == 0, zValues, arcBuffer ) );
         }
     }
 
-    ClipperLibKiCad::PolyTree solution;
+    c.AddSubject( paths );
+    c.AddClip( clips );
 
-    ClipperLibKiCad::ZFillCallback callback =
-            [&]( ClipperLibKiCad::IntPoint & e1bot, ClipperLibKiCad::IntPoint & e1top,
-                ClipperLibKiCad::IntPoint & e2bot, ClipperLibKiCad::IntPoint & e2top,
-                ClipperLibKiCad::IntPoint & pt )
+    Clipper2Lib::PolyTree64 solution;
+
+    Clipper2Lib::ZCallback64 callback =
+            [&]( const Clipper2Lib::Point64 & e1bot, const Clipper2Lib::Point64 & e1top,
+                 const Clipper2Lib::Point64 & e2bot, const Clipper2Lib::Point64 & e2top,
+                 Clipper2Lib::Point64 & pt )
             {
                 auto arcIndex =
                     [&]( const ssize_t& aZvalue, const ssize_t& aCompareVal = -1 ) -> ssize_t
@@ -640,8 +827,8 @@ void SHAPE_POLY_SET::booleanOp( ClipperLibKiCad::ClipType aType, const SHAPE_POL
                         return retval;
                     };
 
-                ssize_t e1ArcSegmentIndex = arcSegment( e1bot.Z, e1top.Z );
-                ssize_t e2ArcSegmentIndex = arcSegment( e2bot.Z, e2top.Z );
+                ssize_t e1ArcSegmentIndex = arcSegment( e1bot.z, e1top.z );
+                ssize_t e2ArcSegmentIndex = arcSegment( e2bot.z, e2top.z );
 
                 CLIPPER_Z_VALUE newZval;
 
@@ -661,112 +848,117 @@ void SHAPE_POLY_SET::booleanOp( ClipperLibKiCad::ClipType aType, const SHAPE_POL
 
                 // Only worry about arc segments for later processing
                 if( newZval.m_FirstArcIdx != -1 )
-                    newIntersectPoints.insert( { VECTOR2I( pt.X, pt.Y ), newZval } );
+                    newIntersectPoints.insert( { VECTOR2I( pt.x, pt.y ), newZval } );
 
-                pt.Z = z_value_ptr;
+                pt.z = z_value_ptr;
                 //@todo amend X,Y values to true intersection between arcs or arc and segment
             };
 
-    c.ZFillFunction( callback ); // register callback
+    c.SetZCallback( std::move( callback ) ); // register callback
 
-    c.Execute( aType, solution, ClipperLibKiCad::pftNonZero, ClipperLibKiCad::pftNonZero );
+    c.Execute( aType, Clipper2Lib::FillRule::NonZero, solution );
 
-    importTree( &solution, zValues, arcBuffer );
+    importTree( solution, zValues, arcBuffer );
+    solution.Clear(); // Free used memory (not done in dtor)
 }
 
 
-void SHAPE_POLY_SET::BooleanAdd( const SHAPE_POLY_SET& b, POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::BooleanAdd( const SHAPE_POLY_SET& b )
 {
-    booleanOp( ClipperLibKiCad::ctUnion, b, aFastMode );
+    booleanOp( Clipper2Lib::ClipType::Union, b );
 }
 
 
-void SHAPE_POLY_SET::BooleanSubtract( const SHAPE_POLY_SET& b, POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::BooleanSubtract( const SHAPE_POLY_SET& b )
 {
-    booleanOp( ClipperLibKiCad::ctDifference, b, aFastMode );
+    booleanOp( Clipper2Lib::ClipType::Difference, b );
 }
 
 
-void SHAPE_POLY_SET::BooleanIntersection( const SHAPE_POLY_SET& b, POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::BooleanIntersection( const SHAPE_POLY_SET& b )
 {
-    booleanOp( ClipperLibKiCad::ctIntersection, b, aFastMode );
+    booleanOp( Clipper2Lib::ClipType::Intersection, b );
 }
 
 
-void SHAPE_POLY_SET::BooleanAdd( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b,
-                                 POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::BooleanXor( const SHAPE_POLY_SET& b )
 {
-    booleanOp( ClipperLibKiCad::ctUnion, a, b, aFastMode );
+    booleanOp( Clipper2Lib::ClipType::Xor, b );
 }
 
 
-void SHAPE_POLY_SET::BooleanSubtract( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b,
-                                      POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::BooleanAdd( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b )
 {
-    booleanOp( ClipperLibKiCad::ctDifference, a, b, aFastMode );
+    booleanOp( Clipper2Lib::ClipType::Union, a, b );
 }
 
 
-void SHAPE_POLY_SET::BooleanIntersection( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b,
-                                          POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::BooleanSubtract( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b )
 {
-    booleanOp( ClipperLibKiCad::ctIntersection, a, b, aFastMode );
+    booleanOp( Clipper2Lib::ClipType::Difference, a, b );
 }
 
 
-void SHAPE_POLY_SET::InflateWithLinkedHoles( int aFactor, int aCircleSegmentsCount,
-                                             POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::BooleanIntersection( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b )
 {
-    Unfracture( aFastMode );
-    Inflate( aFactor, aCircleSegmentsCount );
-    Fracture( aFastMode );
+    booleanOp( Clipper2Lib::ClipType::Intersection, a, b );
 }
 
 
-void SHAPE_POLY_SET::Inflate( int aAmount, int aCircleSegCount, CORNER_STRATEGY aCornerStrategy )
+void SHAPE_POLY_SET::BooleanXor( const SHAPE_POLY_SET& a, const SHAPE_POLY_SET& b )
 {
-    using namespace ClipperLibKiCad;
-    // A static table to avoid repetitive calculations of the coefficient
+    booleanOp( Clipper2Lib::ClipType::Xor, a, b );
+}
+
+
+void SHAPE_POLY_SET::InflateWithLinkedHoles( int aFactor, CORNER_STRATEGY aCornerStrategy,
+                                             int aMaxError )
+{
+    Unfracture();
+    Inflate( aFactor, aCornerStrategy, aMaxError );
+    Fracture();
+}
+
+
+void SHAPE_POLY_SET::inflate2( int aAmount, int aCircleSegCount, CORNER_STRATEGY aCornerStrategy,
+        bool aSimplify )
+{
+    using namespace Clipper2Lib;
+    // A thread-local table to avoid repetitive calculations of the coefficient
     // 1.0 - cos( M_PI / aCircleSegCount )
     // aCircleSegCount is most of time <= 64 and usually 8, 12, 16, 32
     #define SEG_CNT_MAX 64
-    static double arc_tolerance_factor[SEG_CNT_MAX + 1];
+    static thread_local double arc_tolerance_factor[SEG_CNT_MAX + 1];
 
     ClipperOffset c;
 
     // N.B. see the Clipper documentation for jtSquare/jtMiter/jtRound.  They are poorly named
     // and are not what you'd think they are.
-    // http://www.angusj.com/delphi/clipper/documentation/Docs/Units/ClipperLibKiCad/Types/JoinType.htm
-    JoinType joinType = jtRound;    // The way corners are offsetted
+    // http://www.angusj.com/delphi/clipper/documentation/Docs/Units/ClipperLib/Types/JoinType.htm
+    JoinType joinType = JoinType::Round;    // The way corners are offsetted
     double   miterLimit = 2.0;      // Smaller value when using jtMiter for joinType
-    JoinType miterFallback = jtSquare;
 
     switch( aCornerStrategy )
     {
-    case ALLOW_ACUTE_CORNERS:
-        joinType = jtMiter;
+    case CORNER_STRATEGY::ALLOW_ACUTE_CORNERS:
+        joinType = JoinType::Miter;
         miterLimit = 10;        // Allows large spikes
-        miterFallback = jtSquare;
         break;
 
-    case CHAMFER_ACUTE_CORNERS: // Acute angles are chamfered
-        joinType = jtMiter;
-        miterFallback = jtRound;
+    case CORNER_STRATEGY::CHAMFER_ACUTE_CORNERS: // Acute angles are chamfered
+        joinType = JoinType::Miter;
         break;
 
-    case ROUND_ACUTE_CORNERS:   // Acute angles are rounded
-        joinType = jtMiter;
-        miterFallback = jtSquare;
+    case CORNER_STRATEGY::ROUND_ACUTE_CORNERS: // Acute angles are rounded
+        joinType = JoinType::Miter;
         break;
 
-    case CHAMFER_ALL_CORNERS:   // All angles are chamfered.
-        joinType = jtSquare;
-        miterFallback = jtSquare;
+    case CORNER_STRATEGY::CHAMFER_ALL_CORNERS: // All angles are chamfered.
+        joinType = JoinType::Square;
         break;
 
-    case ROUND_ALL_CORNERS:     // All angles are rounded.
-        joinType = jtRound;
-        miterFallback = jtSquare;
+    case CORNER_STRATEGY::ROUND_ALL_CORNERS: // All angles are rounded.
+        joinType = JoinType::Round;
         break;
     }
 
@@ -775,18 +967,17 @@ void SHAPE_POLY_SET::Inflate( int aAmount, int aCircleSegCount, CORNER_STRATEGY 
 
     for( const POLYGON& poly : m_polys )
     {
-        for( size_t i = 0; i < poly.size(); i++ )
-        {
-            c.AddPath( poly[i].convertToClipper( i == 0, zValues, arcBuffer ),
-                       joinType, etClosedPolygon );
-        }
-    }
+        Paths64 paths;
 
-    PolyTree solution;
+        for( size_t i = 0; i < poly.size(); i++ )
+            paths.push_back( poly[i].convertToClipper2( i == 0, zValues, arcBuffer ) );
+
+        c.AddPaths( paths, joinType, EndType::Polygon );
+    }
 
     // Calculate the arc tolerance (arc error) from the seg count by circle. The seg count is
     // nn = M_PI / acos(1.0 - c.ArcTolerance / abs(aAmount))
-    // http://www.angusj.com/delphi/clipper/documentation/Docs/Units/ClipperLibKiCad/Classes/ClipperOffset/Properties/ArcTolerance.htm
+    // http://www.angusj.com/delphi/clipper/documentation/Docs/Units/ClipperLib/Classes/ClipperOffset/Properties/ArcTolerance.htm
 
     if( aCircleSegCount < 6 ) // avoid incorrect aCircleSegCount values
         aCircleSegCount = 6;
@@ -805,53 +996,222 @@ void SHAPE_POLY_SET::Inflate( int aAmount, int aCircleSegCount, CORNER_STRATEGY 
         coeff = arc_tolerance_factor[aCircleSegCount];
     }
 
-    c.ArcTolerance = std::abs( aAmount ) * coeff;
-    c.MiterLimit = miterLimit;
-    c.MiterFallback = miterFallback;
-    c.Execute( solution, aAmount );
+    c.ArcTolerance( std::abs( aAmount ) * coeff );
+    c.MiterLimit( miterLimit );
 
-    importTree( &solution, zValues, arcBuffer );
+    PolyTree64 tree;
+
+    if( aSimplify )
+    {
+        Paths64 paths;
+        c.Execute( aAmount, paths );
+
+        Clipper2Lib::SimplifyPaths( paths, std::abs( aAmount ) * coeff, true );
+
+        Clipper64 c2;
+        c2.PreserveCollinear( false );
+        c2.ReverseSolution( false );
+        c2.AddSubject( paths );
+        c2.Execute(ClipType::Union, FillRule::Positive, tree);
+    }
+    else
+    {
+        c.Execute( aAmount, tree );
+    }
+
+    importTree( tree, zValues, arcBuffer );
+    tree.Clear();
 }
 
 
-void SHAPE_POLY_SET::importTree( ClipperLibKiCad::PolyTree*               tree,
+void SHAPE_POLY_SET::inflateLine2( const SHAPE_LINE_CHAIN& aLine, int aAmount, int aCircleSegCount,
+                                   CORNER_STRATEGY aCornerStrategy, bool aSimplify )
+{
+    using namespace Clipper2Lib;
+    // A thread-local table to avoid repetitive calculations of the coefficient
+    // 1.0 - cos( M_PI / aCircleSegCount )
+    // aCircleSegCount is most of time <= 64 and usually 8, 12, 16, 32
+    #define SEG_CNT_MAX 64
+    static thread_local double arc_tolerance_factor[SEG_CNT_MAX + 1];
+
+    ClipperOffset c;
+
+    // N.B. see the Clipper documentation for jtSquare/jtMiter/jtRound.  They are poorly named
+    // and are not what you'd think they are.
+    // http://www.angusj.com/delphi/clipper/documentation/Docs/Units/ClipperLib/Types/JoinType.htm
+    JoinType joinType = JoinType::Round; // The way corners are offsetted
+    double   miterLimit = 2.0;           // Smaller value when using jtMiter for joinType
+
+    switch( aCornerStrategy )
+    {
+    case CORNER_STRATEGY::ALLOW_ACUTE_CORNERS:
+        joinType = JoinType::Miter;
+        miterLimit = 10; // Allows large spikes
+        break;
+
+    case CORNER_STRATEGY::CHAMFER_ACUTE_CORNERS: // Acute angles are chamfered
+        joinType = JoinType::Miter;
+        break;
+
+    case CORNER_STRATEGY::ROUND_ACUTE_CORNERS: // Acute angles are rounded
+        joinType = JoinType::Miter;
+        break;
+
+    case CORNER_STRATEGY::CHAMFER_ALL_CORNERS: // All angles are chamfered.
+        joinType = JoinType::Square;
+        break;
+
+    case CORNER_STRATEGY::ROUND_ALL_CORNERS: // All angles are rounded.
+        joinType = JoinType::Round;
+        break;
+    }
+
+    std::vector<CLIPPER_Z_VALUE> zValues;
+    std::vector<SHAPE_ARC>       arcBuffer;
+
+    Path64 path = aLine.convertToClipper2( true, zValues, arcBuffer );
+    c.AddPath( path, joinType, EndType::Butt );
+
+    // Calculate the arc tolerance (arc error) from the seg count by circle. The seg count is
+    // nn = M_PI / acos(1.0 - c.ArcTolerance / abs(aAmount))
+    // http://www.angusj.com/delphi/clipper/documentation/Docs/Units/ClipperLib/Classes/ClipperOffset/Properties/ArcTolerance.htm
+
+    if( aCircleSegCount < 6 ) // avoid incorrect aCircleSegCount values
+        aCircleSegCount = 6;
+
+    double coeff;
+
+    if( aCircleSegCount > SEG_CNT_MAX || arc_tolerance_factor[aCircleSegCount] == 0 )
+    {
+        coeff = 1.0 - cos( M_PI / aCircleSegCount );
+
+        if( aCircleSegCount <= SEG_CNT_MAX )
+            arc_tolerance_factor[aCircleSegCount] = coeff;
+    }
+    else
+    {
+        coeff = arc_tolerance_factor[aCircleSegCount];
+    }
+
+    c.ArcTolerance( std::abs( aAmount ) * coeff );
+    c.MiterLimit( miterLimit );
+
+    PolyTree64 tree;
+
+    if( aSimplify )
+    {
+        Paths64 paths2;
+        c.Execute( aAmount, paths2 );
+
+        Clipper2Lib::SimplifyPaths( paths2, std::abs( aAmount ) * coeff, false );
+
+        Clipper64 c2;
+        c2.PreserveCollinear( false );
+        c2.ReverseSolution( false );
+        c2.AddSubject( paths2 );
+        c2.Execute( ClipType::Union, FillRule::Positive, tree );
+    }
+    else
+    {
+        c.Execute( aAmount, tree );
+    }
+
+    importTree( tree, zValues, arcBuffer );
+    tree.Clear();
+}
+
+
+void SHAPE_POLY_SET::Inflate( int aAmount, CORNER_STRATEGY aCornerStrategy, int aMaxError,
+                              bool aSimplify )
+{
+    int segCount = GetArcToSegmentCount( std::abs( aAmount ), aMaxError, FULL_CIRCLE );
+
+    inflate2( aAmount, segCount, aCornerStrategy, aSimplify );
+}
+
+
+void SHAPE_POLY_SET::OffsetLineChain( const SHAPE_LINE_CHAIN& aLine, int aAmount,
+                                  CORNER_STRATEGY aCornerStrategy, int aMaxError, bool aSimplify )
+{
+    int segCount = GetArcToSegmentCount( std::abs( aAmount ), aMaxError, FULL_CIRCLE );
+
+    inflateLine2( aLine, aAmount, segCount, aCornerStrategy, aSimplify );
+}
+
+
+void SHAPE_POLY_SET::importPolyPath( const std::unique_ptr<Clipper2Lib::PolyPath64>& aPolyPath,
+                                     const std::vector<CLIPPER_Z_VALUE>&             aZValueBuffer,
+                                     const std::vector<SHAPE_ARC>&                   aArcBuffer )
+{
+    if( !aPolyPath->IsHole() )
+    {
+        POLYGON paths;
+        paths.reserve( aPolyPath->Count() + 1 );
+        paths.emplace_back( aPolyPath->Polygon(), aZValueBuffer, aArcBuffer );
+
+        for( const std::unique_ptr<Clipper2Lib::PolyPath64>& child : *aPolyPath )
+        {
+            paths.emplace_back( child->Polygon(), aZValueBuffer, aArcBuffer );
+
+            for( const std::unique_ptr<Clipper2Lib::PolyPath64>& grandchild : *child )
+                importPolyPath( grandchild, aZValueBuffer, aArcBuffer );
+        }
+
+        m_polys.emplace_back( std::move( paths ) );
+    }
+}
+
+
+void SHAPE_POLY_SET::importTree( Clipper2Lib::PolyTree64&            tree,
                                  const std::vector<CLIPPER_Z_VALUE>& aZValueBuffer,
                                  const std::vector<SHAPE_ARC>&       aArcBuffer )
 {
     m_polys.clear();
 
-    for( ClipperLibKiCad::PolyNode* n = tree->GetFirst(); n; n = n->GetNext() )
+    for( const std::unique_ptr<Clipper2Lib::PolyPath64>& n : tree )
+        importPolyPath( n, aZValueBuffer, aArcBuffer );
+}
+
+
+void SHAPE_POLY_SET::importPaths( Clipper2Lib::Paths64&              aPath,
+                                 const std::vector<CLIPPER_Z_VALUE>& aZValueBuffer,
+                                 const std::vector<SHAPE_ARC>&       aArcBuffer )
+{
+    m_polys.clear();
+    POLYGON path;
+
+    for( const Clipper2Lib::Path64& n : aPath )
     {
-        if( !n->IsHole() )
+        if( Clipper2Lib::Area( n ) > 0 )
         {
-            POLYGON paths;
-            paths.reserve( n->Childs.size() + 1 );
+            if( !path.empty() )
+                m_polys.emplace_back( path );
 
-            paths.emplace_back( n->Contour, aZValueBuffer, aArcBuffer );
-
-            for( unsigned int i = 0; i < n->Childs.size(); i++ )
-                paths.emplace_back( n->Childs[i]->Contour, aZValueBuffer, aArcBuffer );
-
-            m_polys.push_back( paths );
+            path.clear();
         }
+        else
+        {
+            wxCHECK2_MSG( !path.empty(), continue, wxT( "Cannot add a hole before an outline" ) );
+        }
+
+        path.emplace_back( n, aZValueBuffer, aArcBuffer );
     }
+
+    if( !path.empty() )
+        m_polys.emplace_back( std::move( path ) );
 }
 
 
 struct FractureEdge
 {
-    FractureEdge( int y = 0 ) :
-        m_connected( false ),
-        m_next( nullptr )
-    {
-        m_p1.x = m_p2.y = y;
-    }
+    using Index = int;
 
-    FractureEdge( bool connected, const VECTOR2I& p1, const VECTOR2I& p2 ) :
-        m_connected( connected ),
-        m_p1( p1 ),
-        m_p2( p2 ),
-        m_next( nullptr )
+    FractureEdge() = default;
+
+    FractureEdge( const VECTOR2I& p1, const VECTOR2I& p2, Index next ) :
+            m_p1( p1 ),
+            m_p2( p2 ),
+            m_next( next )
     {
     }
 
@@ -860,26 +1220,257 @@ struct FractureEdge
         return ( y >= m_p1.y || y >= m_p2.y ) && ( y <= m_p1.y || y <= m_p2.y );
     }
 
-    bool          m_connected;
-    VECTOR2I      m_p1;
-    VECTOR2I      m_p2;
-    FractureEdge* m_next;
+    VECTOR2I m_p1;
+    VECTOR2I m_p2;
+    Index    m_next;
 };
 
 
-typedef std::vector<FractureEdge*> FractureEdgeSet;
+typedef std::vector<FractureEdge> FractureEdgeSet;
 
 
-static int processEdge( FractureEdgeSet& edges, FractureEdge* edge )
+static FractureEdge* processHole( FractureEdgeSet& edges, FractureEdge::Index provokingIndex,
+                                  FractureEdge::Index edgeIndex, FractureEdge::Index bridgeIndex )
 {
-    int x   = edge->m_p1.x;
-    int y   = edge->m_p1.y;
-    int min_dist    = std::numeric_limits<int>::max();
-    int x_nearest   = 0;
+    FractureEdge& edge = edges[edgeIndex];
+    int           x = edge.m_p1.x;
+    int           y = edge.m_p1.y;
+    int           min_dist = std::numeric_limits<int>::max();
+    int           x_nearest = 0;
 
     FractureEdge* e_nearest = nullptr;
 
-    for( FractureEdge* e : edges )
+    // Since this function is run for all holes left to right, no need to
+    // check for any edge beyond the provoking one because they will always be
+    // further to the right, and unconnected to the outline anyway.
+    for( FractureEdge::Index i = 0; i < provokingIndex; i++ )
+    {
+        FractureEdge& e = edges[i];
+        // Don't consider this edge if it can't be bridged to, or faces left.
+        if( !e.matches( y ) )
+            continue;
+
+        int x_intersect;
+
+        if( e.m_p1.y == e.m_p2.y ) // horizontal edge
+        {
+            x_intersect = std::max( e.m_p1.x, e.m_p2.x );
+        }
+        else
+        {
+            x_intersect =
+                    e.m_p1.x + rescale( e.m_p2.x - e.m_p1.x, y - e.m_p1.y, e.m_p2.y - e.m_p1.y );
+        }
+
+        int dist = ( x - x_intersect );
+
+        if( dist >= 0 && dist < min_dist )
+        {
+            min_dist = dist;
+            x_nearest = x_intersect;
+            e_nearest = &e;
+        }
+    }
+
+    if( e_nearest )
+    {
+        const FractureEdge::Index outline2hole_index = bridgeIndex;
+        const FractureEdge::Index hole2outline_index = bridgeIndex + 1;
+        const FractureEdge::Index split_index = bridgeIndex + 2;
+        // Make an edge between the split outline edge and the hole...
+        edges[outline2hole_index] = FractureEdge( VECTOR2I( x_nearest, y ), edge.m_p1, edgeIndex );
+        // ...between the hole and the edge...
+        edges[hole2outline_index] =
+                FractureEdge( edge.m_p1, VECTOR2I( x_nearest, y ), split_index );
+        // ...and between the split outline edge and the rest.
+        edges[split_index] =
+                FractureEdge( VECTOR2I( x_nearest, y ), e_nearest->m_p2, e_nearest->m_next );
+
+        // Perform the actual outline edge split
+        e_nearest->m_p2 = VECTOR2I( x_nearest, y );
+        e_nearest->m_next = outline2hole_index;
+
+        FractureEdge* last = &edge;
+        for( ; last->m_next != edgeIndex; last = &edges[last->m_next] )
+            ;
+        last->m_next = hole2outline_index;
+    }
+
+    return e_nearest;
+}
+
+
+static void fractureSingleCacheFriendly( SHAPE_POLY_SET::POLYGON& paths )
+{
+    FractureEdgeSet edges;
+    bool            outline = true;
+
+    if( paths.size() == 1 )
+        return;
+
+    size_t total_point_count = 0;
+
+    for( const SHAPE_LINE_CHAIN& path : paths )
+    {
+        total_point_count += path.PointCount();
+    }
+
+    if( total_point_count > (size_t) std::numeric_limits<FractureEdge::Index>::max() )
+    {
+        wxLogWarning( wxT( "Polygon has more points than int limit" ) );
+        return;
+    }
+
+    // Reserve space in the edge set so pointers don't get invalidated during
+    // the whole fracture process; one for each original edge, plus 3 per
+    // path to join it to the outline.
+    edges.reserve( total_point_count + paths.size() * 3 );
+
+    // Sort the paths by their lowest X bound before processing them.
+    // This ensures the processing order for processEdge() is correct.
+    struct PathInfo
+    {
+        int                 path_or_provoking_index;
+        FractureEdge::Index leftmost;
+        int                 x;
+        int                 y_or_bridge;
+    };
+    std::vector<PathInfo> sorted_paths;
+    const int             paths_count = static_cast<int>( paths.size() );
+    sorted_paths.reserve( paths_count );
+
+    for( int path_index = 0; path_index < paths_count; path_index++ )
+    {
+        const SHAPE_LINE_CHAIN&      path = paths[path_index];
+        const std::vector<VECTOR2I>& points = path.CPoints();
+        const int                    point_count = static_cast<int>( points.size() );
+        int                          x_min = std::numeric_limits<int>::max();
+        int                          y_min = std::numeric_limits<int>::max();
+        int                          leftmost = -1;
+
+        for( int point_index = 0; point_index < point_count; point_index++ )
+        {
+            const VECTOR2I& point = points[point_index];
+            if( point.x < x_min )
+            {
+                x_min = point.x;
+                leftmost = point_index;
+            }
+            if( point.y < y_min )
+                y_min = point.y;
+        }
+
+        sorted_paths.emplace_back( PathInfo{ path_index, leftmost, x_min, y_min } );
+    }
+
+    std::sort( sorted_paths.begin() + 1, sorted_paths.end(),
+               []( const PathInfo& a, const PathInfo& b )
+               {
+                   if( a.x == b.x )
+                       return a.y_or_bridge < b.y_or_bridge;
+                   return a.x < b.x;
+               } );
+
+    FractureEdge::Index edge_index = 0;
+
+    for( PathInfo& path_info : sorted_paths )
+    {
+        const SHAPE_LINE_CHAIN&      path = paths[path_info.path_or_provoking_index];
+        const std::vector<VECTOR2I>& points = path.CPoints();
+        const size_t                 point_count = points.size();
+
+        // Index of the provoking (first) edge for this path
+        const FractureEdge::Index provoking_edge = edge_index;
+
+        for( size_t i = 0; i < point_count - 1; i++ )
+        {
+            edges.emplace_back( points[i], points[i + 1], edge_index + 1 );
+            edge_index++;
+        }
+
+        // Create last edge looping back to the provoking one.
+        edges.emplace_back( points[point_count - 1], points[0], provoking_edge );
+        edge_index++;
+
+        if( !outline )
+        {
+            // Repurpose the path sorting data structure to schedule the leftmost edge
+            // for merging to the outline, which will in turn merge the rest of the path.
+            path_info.path_or_provoking_index = provoking_edge;
+            path_info.y_or_bridge = edge_index;
+
+            // Reserve 3 additional edges to bridge with the outline.
+            edge_index += 3;
+            edges.resize( edge_index );
+        }
+
+        outline = false; // first path is always the outline
+    }
+
+    for( auto it = sorted_paths.begin() + 1; it != sorted_paths.end(); it++ )
+    {
+        auto edge = processHole( edges, it->path_or_provoking_index,
+                                 it->path_or_provoking_index + it->leftmost, it->y_or_bridge );
+
+        // If we can't handle the hole, the zone is broken (maybe)
+        if( !edge )
+        {
+            wxLogWarning( wxT( "Broken polygon, dropping path" ) );
+
+            return;
+        }
+    }
+
+    paths.resize( 1 );
+    SHAPE_LINE_CHAIN& newPath = paths[0];
+
+    newPath.Clear();
+    newPath.SetClosed( true );
+
+    // Root edge is always at index 0
+    FractureEdge* e = &edges[0];
+
+    for( ; e->m_next != 0; e = &edges[e->m_next] )
+        newPath.Append( e->m_p1 );
+
+    newPath.Append( e->m_p1 );
+}
+
+
+struct FractureEdgeSlow
+{
+    FractureEdgeSlow( int y = 0 ) : m_connected( false ), m_next( nullptr ) { m_p1.x = m_p2.y = y; }
+
+    FractureEdgeSlow( bool connected, const VECTOR2I& p1, const VECTOR2I& p2 ) :
+            m_connected( connected ), m_p1( p1 ), m_p2( p2 ), m_next( nullptr )
+    {
+    }
+
+    bool matches( int y ) const
+    {
+        return ( y >= m_p1.y || y >= m_p2.y ) && ( y <= m_p1.y || y <= m_p2.y );
+    }
+
+    bool              m_connected;
+    VECTOR2I          m_p1;
+    VECTOR2I          m_p2;
+    FractureEdgeSlow* m_next;
+};
+
+
+typedef std::vector<FractureEdgeSlow*> FractureEdgeSetSlow;
+
+
+static int processEdge( FractureEdgeSetSlow& edges, FractureEdgeSlow* edge )
+{
+    int x = edge->m_p1.x;
+    int y = edge->m_p1.y;
+    int min_dist = std::numeric_limits<int>::max();
+    int x_nearest = 0;
+
+    FractureEdgeSlow* e_nearest = nullptr;
+
+    for( FractureEdgeSlow* e : edges )
     {
         if( !e->matches( y ) )
             continue;
@@ -892,17 +1483,17 @@ static int processEdge( FractureEdgeSet& edges, FractureEdge* edge )
         }
         else
         {
-            x_intersect = e->m_p1.x + rescale( e->m_p2.x - e->m_p1.x, y - e->m_p1.y,
-                                               e->m_p2.y - e->m_p1.y );
+            x_intersect = e->m_p1.x
+                          + rescale( e->m_p2.x - e->m_p1.x, y - e->m_p1.y, e->m_p2.y - e->m_p1.y );
         }
 
         int dist = ( x - x_intersect );
 
         if( dist >= 0 && dist < min_dist && e->m_connected )
         {
-            min_dist    = dist;
-            x_nearest   = x_intersect;
-            e_nearest   = e;
+            min_dist = dist;
+            x_nearest = x_intersect;
+            e_nearest = e;
         }
     }
 
@@ -910,21 +1501,24 @@ static int processEdge( FractureEdgeSet& edges, FractureEdge* edge )
     {
         int count = 0;
 
-        FractureEdge* lead1 = new FractureEdge( true, VECTOR2I( x_nearest, y ), VECTOR2I( x, y ) );
-        FractureEdge* lead2 = new FractureEdge( true, VECTOR2I( x, y ), VECTOR2I( x_nearest, y ) );
-        FractureEdge* split_2 = new FractureEdge( true, VECTOR2I( x_nearest, y ), e_nearest->m_p2 );
+        FractureEdgeSlow* lead1 =
+                new FractureEdgeSlow( true, VECTOR2I( x_nearest, y ), VECTOR2I( x, y ) );
+        FractureEdgeSlow* lead2 =
+                new FractureEdgeSlow( true, VECTOR2I( x, y ), VECTOR2I( x_nearest, y ) );
+        FractureEdgeSlow* split_2 =
+                new FractureEdgeSlow( true, VECTOR2I( x_nearest, y ), e_nearest->m_p2 );
 
         edges.push_back( split_2 );
         edges.push_back( lead1 );
         edges.push_back( lead2 );
 
-        FractureEdge* link = e_nearest->m_next;
+        FractureEdgeSlow* link = e_nearest->m_next;
 
         e_nearest->m_p2 = VECTOR2I( x_nearest, y );
         e_nearest->m_next = lead1;
         lead1->m_next = edge;
 
-        FractureEdge* last;
+        FractureEdgeSlow* last;
 
         for( last = edge; last->m_next != edge; last = last->m_next )
         {
@@ -933,8 +1527,8 @@ static int processEdge( FractureEdgeSet& edges, FractureEdge* edge )
         }
 
         last->m_connected = true;
-        last->m_next    = lead2;
-        lead2->m_next   = split_2;
+        last->m_next = lead2;
+        lead2->m_next = split_2;
         split_2->m_next = link;
 
         return count + 1;
@@ -944,11 +1538,11 @@ static int processEdge( FractureEdgeSet& edges, FractureEdge* edge )
 }
 
 
-void SHAPE_POLY_SET::fractureSingle( POLYGON& paths )
+static void fractureSingleSlow( SHAPE_POLY_SET::POLYGON& paths )
 {
-    FractureEdgeSet edges;
-    FractureEdgeSet border_edges;
-    FractureEdge*   root = nullptr;
+    FractureEdgeSetSlow edges;
+    FractureEdgeSetSlow border_edges;
+    FractureEdgeSlow*   root = nullptr;
 
     bool first = true;
 
@@ -960,9 +1554,9 @@ void SHAPE_POLY_SET::fractureSingle( POLYGON& paths )
     for( const SHAPE_LINE_CHAIN& path : paths )
     {
         const std::vector<VECTOR2I>& points = path.CPoints();
-        int pointCount = points.size();
+        int                          pointCount = points.size();
 
-        FractureEdge* prev = nullptr, * first_edge = nullptr;
+        FractureEdgeSlow *prev = nullptr, *first_edge = nullptr;
 
         int x_min = std::numeric_limits<int>::max();
 
@@ -973,8 +1567,8 @@ void SHAPE_POLY_SET::fractureSingle( POLYGON& paths )
 
             // Do not use path.CPoint() here; open-coding it using the local variables "points"
             // and "pointCount" gives a non-trivial performance boost to zone fill times.
-            FractureEdge* fe = new FractureEdge( first, points[ i ],
-                                                 points[ i+1 == pointCount ? 0 : i+1 ] );
+            FractureEdgeSlow* fe = new FractureEdgeSlow( first, points[i],
+                                                         points[i + 1 == pointCount ? 0 : i + 1] );
 
             if( !root )
                 root = fe;
@@ -1001,22 +1595,22 @@ void SHAPE_POLY_SET::fractureSingle( POLYGON& paths )
                 num_unconnected++;
         }
 
-        first = false;    // first path is always the outline
+        first = false; // first path is always the outline
     }
 
     // keep connecting holes to the main outline, until there's no holes left...
     while( num_unconnected > 0 )
     {
-        int x_min = std::numeric_limits<int>::max();
+        int  x_min = std::numeric_limits<int>::max();
         auto it = border_edges.begin();
 
-        FractureEdge* smallestX = nullptr;
+        FractureEdgeSlow* smallestX = nullptr;
 
         // find the left-most hole edge and merge with the outline
         for( ; it != border_edges.end(); ++it )
         {
-            FractureEdge* border_edge = *it;
-            int xt = border_edge->m_p1.x;
+            FractureEdgeSlow* border_edge = *it;
+            int               xt = border_edge->m_p1.x;
 
             if( ( xt <= x_min ) && !border_edge->m_connected )
             {
@@ -1032,7 +1626,7 @@ void SHAPE_POLY_SET::fractureSingle( POLYGON& paths )
         {
             wxLogWarning( wxT( "Broken polygon, dropping path" ) );
 
-            for( FractureEdge* edge : edges )
+            for( FractureEdgeSlow* edge : edges )
                 delete edge;
 
             return;
@@ -1046,23 +1640,32 @@ void SHAPE_POLY_SET::fractureSingle( POLYGON& paths )
 
     newPath.SetClosed( true );
 
-    FractureEdge* e;
+    FractureEdgeSlow* e;
 
     for( e = root; e->m_next != root; e = e->m_next )
         newPath.Append( e->m_p1 );
 
     newPath.Append( e->m_p1 );
 
-    for( FractureEdge* edge : edges )
+    for( FractureEdgeSlow* edge : edges )
         delete edge;
 
     paths.push_back( std::move( newPath ) );
 }
 
 
-void SHAPE_POLY_SET::Fracture( POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::fractureSingle( POLYGON& paths )
 {
-    Simplify( aFastMode );    // remove overlapping holes/degeneracy
+    if( ENABLECACHEFRIENDLYFRACTURE )
+        return fractureSingleCacheFriendly( paths );
+    fractureSingleSlow( paths );
+}
+
+
+void SHAPE_POLY_SET::Fracture( bool aSimplify )
+{
+    if( aSimplify )
+        Simplify();    // remove overlapping holes/degeneracy
 
     for( POLYGON& paths : m_polys )
         fractureSingle( paths );
@@ -1106,8 +1709,9 @@ void SHAPE_POLY_SET::unfractureSingle( SHAPE_POLY_SET::POLYGON& aPoly )
             std::size_t operator()(  const EDGE& aEdge ) const
             {
                 const SEG& a = aEdge.m_poly->CSegment( aEdge.m_index );
-
-                return (std::size_t) ( a.A.x + a.B.x + a.A.y + a.B.y );
+                std::size_t seed = 0xa82de1c0;
+                hash_combine( seed, a.A.x, a.B.x, a.A.y, a.B.y );
+                return seed;
             }
         };
     };
@@ -1191,6 +1795,7 @@ void SHAPE_POLY_SET::unfractureSingle( SHAPE_POLY_SET::POLYGON& aPoly )
     int outline = -1;
 
     POLYGON result;
+    double max_poly = 0.0;
 
     while( queue.size() )
     {
@@ -1215,10 +1820,13 @@ void SHAPE_POLY_SET::unfractureSingle( SHAPE_POLY_SET::POLYGON& aPoly )
 
         outl.SetClosed( true );
 
-        bool cw = outl.Area() > 0.0;
+        double area = std::fabs( outl.Area() );
 
-        if( cw )
+        if( area > max_poly )
+        {
             outline = n;
+            max_poly = area;
+        }
 
         result.push_back( outl );
         n++;
@@ -1227,7 +1835,7 @@ void SHAPE_POLY_SET::unfractureSingle( SHAPE_POLY_SET::POLYGON& aPoly )
     if( outline > 0 )
         std::swap( result[0], result[outline] );
 
-    aPoly = result;
+    aPoly = std::move( result );
 }
 
 
@@ -1246,20 +1854,353 @@ bool SHAPE_POLY_SET::HasHoles() const
 }
 
 
-void SHAPE_POLY_SET::Unfracture( POLYGON_MODE aFastMode )
+void SHAPE_POLY_SET::Unfracture()
 {
     for( POLYGON& path : m_polys )
         unfractureSingle( path );
 
-    Simplify( aFastMode );    // remove overlapping holes/degeneracy
+    Simplify();    // remove overlapping holes/degeneracy
 }
 
 
-void SHAPE_POLY_SET::Simplify( POLYGON_MODE aFastMode )
+bool SHAPE_POLY_SET::isExteriorWaist( const SEG& aSegA, const SEG& aSegB ) const
 {
+    const VECTOR2I da = aSegA.B - aSegA.A;
+
+    int axis = std::abs( da.x ) >= std::abs( da.y ) ? 0 : 1;
+
+    std::array<VECTOR2I,4> pts = { aSegA.A, aSegA.B, aSegB.A, aSegB.B };
+
+    std::sort( pts.begin(), pts.end(), [axis]( const VECTOR2I& p, const VECTOR2I& q )
+    {
+        if( axis == 0 )
+            return p.x < q.x || ( p.x == q.x && p.y < q.y );
+        else
+            return p.y < q.y || ( p.y == q.y && p.x < q.x );
+    } );
+
+    VECTOR2I s = pts[1];
+    VECTOR2I e = pts[2];
+
+    // Check if there is polygon material on either side of the overlapping segments
+    // Get the midpoint between s and e for testing
+    VECTOR2I midpoint = ( s + e ) / 2;
+
+    // Create perpendicular offset vector to check both sides
+    VECTOR2I segDir = e - s;
+
+    if( segDir.EuclideanNorm() > 25 )
+    {
+        VECTOR2I perp = segDir.Perpendicular().Resize( 10 );
+
+        // Test points on both sides of the overlapping segment
+        bool side1 = PointInside( midpoint + perp );
+        bool side2 = PointInside( midpoint - perp );
+
+        // Only return true if both sides are outside the polygon
+        // This is the case for non-fractured segments
+        if( !side1 && !side2 )
+        {
+            wxLogTrace( wxT( "collinear" ), wxT( "Found exterior waist between (%d,%d)-(%d,%d) and (%d,%d)-(%d,%d)" ),
+                        aSegA.A.x, aSegA.A.y, aSegA.B.x, aSegA.B.y,
+                        aSegB.A.x, aSegB.A.y, aSegB.B.x, aSegB.B.y );
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+void SHAPE_POLY_SET::splitCollinearOutlines()
+{
+    for( size_t polyIdx = 0; polyIdx < m_polys.size(); ++polyIdx )
+    {
+        bool changed = true;
+
+        while( changed )
+        {
+            changed = false;
+
+            SHAPE_LINE_CHAIN& outline = m_polys[polyIdx][0];
+            intptr_t count = outline.PointCount();
+
+            RTree<intptr_t, intptr_t, 2, intptr_t> rtree;
+
+            for( intptr_t i = 0; i < count; ++i )
+            {
+                const VECTOR2I& a = outline.CPoint( i );
+                const VECTOR2I& b = outline.CPoint( ( i + 1 ) % count );
+                intptr_t min[2] = { std::min( a.x, b.x ), std::min( a.y, b.y ) };
+                intptr_t max[2] = { std::max( a.x, b.x ), std::max( a.y, b.y ) };
+                rtree.Insert( min, max, i );
+            }
+
+            bool found = false;
+            int segA = -1;
+            int segB = -1;
+
+            for( intptr_t i = 0; i < count && !found; ++i )
+            {
+                const VECTOR2I& a = outline.CPoint( i );
+                const VECTOR2I& b = outline.CPoint( ( i + 1 ) % count );
+                SEG seg( a, b );
+                intptr_t min[2] = { std::min( a.x, b.x ), std::min( a.y, b.y ) };
+                intptr_t max[2] = { std::max( a.x, b.x ), std::max( a.y, b.y ) };
+
+                auto visitor =
+                        [&]( const int& j ) -> bool
+                        {
+                            if( j == i || j == ( ( i + 1 ) % count ) || j == ( ( i + count - 1 ) % count ) )
+                                return true;
+
+                            VECTOR2I oa = outline.CPoint( j );
+                            VECTOR2I ob = outline.CPoint( ( j + 1 ) % count );
+                            SEG other( oa, ob );
+
+                            // Skip segments that share start/end points.  This is the case for
+                            // fractured segments
+                            if( oa == a && ob == b )
+                                return true;
+
+                            if( oa == b && ob == a )
+                                return true;
+
+                            if( seg.ApproxCollinear( other, 10 ) && isExteriorWaist( seg, other ) )
+                            {
+                                segA = i;
+                                segB = j;
+                                found = true;
+                                return false;
+                            }
+
+                            return true;
+                        };
+
+                rtree.Search( min, max, visitor );
+            }
+
+            if( !found )
+                break;
+
+            int a0 = segA;
+            int a1 = ( segA + 1 ) % outline.PointCount();
+            int b0 = segB;
+            int b1 = ( segB + 1 ) % outline.PointCount();
+
+            SHAPE_LINE_CHAIN lc1;
+            int idx = a1;
+            lc1.Append( outline.CPoint( idx ) );
+
+            while( idx != b0 )
+            {
+                idx = ( idx + 1 ) % outline.PointCount();
+                lc1.Append( outline.CPoint( idx ) );
+            }
+
+            lc1.SetClosed( true );
+
+            SHAPE_LINE_CHAIN lc2;
+            idx = b1;
+            lc2.Append( outline.CPoint( idx ) );
+
+            while( idx != a0 )
+            {
+                idx = ( idx + 1 ) % outline.PointCount();
+                lc2.Append( outline.CPoint( idx ) );
+            }
+
+            lc2.SetClosed( true );
+
+            m_polys[polyIdx][0] = std::move( lc1 );
+
+            POLYGON np;
+            np.push_back( std::move( lc2 ) );
+            m_polys.push_back( std::move( np ) );
+
+            changed = true;
+        }
+    }
+}
+
+
+void SHAPE_POLY_SET::splitSelfTouchingOutlines()
+{
+    for( size_t polyIdx = 0; polyIdx < m_polys.size(); ++polyIdx )
+    {
+        bool changed = true;
+
+        while( changed )
+        {
+            changed = false;
+
+            SHAPE_LINE_CHAIN& outline = m_polys[polyIdx][0];
+            const int count = outline.PointCount();
+
+            if( count < 4 )
+                break;
+
+            int insertSegIdx = -1;
+            int insertVertIdx = -1;
+
+            // For small polygons, direct O(n²) search is faster than R-tree overhead
+            constexpr int RTREE_THRESHOLD = 32;
+
+            if( count < RTREE_THRESHOLD )
+            {
+                for( int vertIdx = 0; vertIdx < count && insertSegIdx < 0; ++vertIdx )
+                {
+                    const VECTOR2I& pt = outline.CPoint( vertIdx );
+                    const int prevSeg = ( vertIdx + count - 1 ) % count;
+
+                    for( int segIdx = 0; segIdx < count; ++segIdx )
+                    {
+                        // Skip adjacent segments
+                        if( segIdx == prevSeg || segIdx == vertIdx )
+                            continue;
+
+                        const VECTOR2I& a = outline.CPoint( segIdx );
+                        const VECTOR2I& b = outline.CPoint( ( segIdx + 1 ) % count );
+
+                        // SquaredDistance returns 0 only when pt lies exactly on the
+                        // segment.  Clipper2 rounds corridor-cut vertices to integer
+                        // coordinates; they can land within 1nm of an endpoint but are
+                        // not true pinch points.
+                        if( pt != a && pt != b && SEG( a, b ).SquaredDistance( pt ) == 0 )
+                        {
+                            insertSegIdx = segIdx;
+                            insertVertIdx = vertIdx;
+                            break;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                RTree<intptr_t, int, 2, double> rtree;
+
+                for( int i = 0; i < count; ++i )
+                {
+                    const VECTOR2I& a = outline.CPoint( i );
+                    const VECTOR2I& b = outline.CPoint( ( i + 1 ) % count );
+                    int bmin[2] = { std::min( a.x, b.x ), std::min( a.y, b.y ) };
+                    int bmax[2] = { std::max( a.x, b.x ), std::max( a.y, b.y ) };
+                    rtree.Insert( bmin, bmax, i );
+                }
+
+                for( int vertIdx = 0; vertIdx < count && insertSegIdx < 0; ++vertIdx )
+                {
+                    const VECTOR2I& pt = outline.CPoint( vertIdx );
+                    const int prevSeg = ( vertIdx + count - 1 ) % count;
+                    int bmin[2] = { pt.x, pt.y };
+                    int bmax[2] = { pt.x, pt.y };
+
+                    rtree.Search( bmin, bmax,
+                        [&]( const intptr_t& segIdx ) -> bool
+                        {
+                            if( segIdx == prevSeg || segIdx == vertIdx )
+                                return true;
+
+                            const VECTOR2I& a = outline.CPoint( segIdx );
+                            const VECTOR2I& b = outline.CPoint( ( segIdx + 1 ) % count );
+
+                            // SquaredDistance returns 0 only when pt lies exactly on the
+                            // segment.  Clipper2 rounds corridor-cut vertices to integer
+                            // coordinates; they can land within 1nm of an endpoint but
+                            // are not true pinch points.
+                            if( pt != a && pt != b && SEG( a, b ).SquaredDistance( pt ) == 0 )
+                            {
+                                insertSegIdx = segIdx;
+                                insertVertIdx = vertIdx;
+                                return false;
+                            }
+
+                            return true;
+                        } );
+                }
+            }
+
+            if( insertSegIdx < 0 )
+                break;
+
+            // Split the polygon at the pinch point into two separate polygons.
+            // Polygon 1: vertices from (insertSegIdx+1) to insertVertIdx
+            // Polygon 2: vertices from insertVertIdx to insertSegIdx
+
+            const int splitStart1 = ( insertSegIdx + 1 ) % count;
+
+            // Calculate sizes for each polygon
+            int size1, size2;
+
+            if( insertVertIdx >= splitStart1 )
+                size1 = insertVertIdx - splitStart1 + 1;
+            else
+                size1 = count - splitStart1 + insertVertIdx + 1;
+
+            if( insertSegIdx >= insertVertIdx )
+                size2 = insertSegIdx - insertVertIdx + 1;
+            else
+                size2 = count - insertVertIdx + insertSegIdx + 1;
+
+            if( size1 < 3 || size2 < 3 )
+                break;
+
+            SHAPE_LINE_CHAIN poly1;
+            SHAPE_LINE_CHAIN poly2;
+            poly1.ReservePoints( size1 );
+            poly2.ReservePoints( size2 );
+
+            int idx = splitStart1;
+
+            for( int i = 0; i < size1; ++i )
+            {
+                poly1.Append( outline.CPoint( idx ) );
+                idx = ( idx + 1 ) % count;
+            }
+
+            poly1.SetClosed( true );
+
+            idx = insertVertIdx;
+
+            for( int i = 0; i < size2; ++i )
+            {
+                poly2.Append( outline.CPoint( idx ) );
+                idx = ( idx + 1 ) % count;
+            }
+
+            poly2.SetClosed( true );
+
+            m_polys[polyIdx][0] = std::move( poly1 );
+
+            POLYGON np;
+            np.push_back( std::move( poly2 ) );
+            m_polys.push_back( std::move( np ) );
+
+            changed = true;
+        }
+    }
+}
+
+
+void SHAPE_POLY_SET::Simplify()
+{
+    splitCollinearOutlines();
+
     SHAPE_POLY_SET empty;
 
-    booleanOp( ClipperLibKiCad::ctUnion, empty, aFastMode );
+    booleanOp( Clipper2Lib::ClipType::Union, empty );
+}
+
+
+void SHAPE_POLY_SET::SimplifyOutlines( int aTolerance )
+{
+    for( POLYGON& paths : m_polys )
+    {
+        for( SHAPE_LINE_CHAIN& path : paths )
+        {
+            path.Simplify( aTolerance );
+        }
+    }
 }
 
 
@@ -1267,7 +2208,7 @@ int SHAPE_POLY_SET::NormalizeAreaOutlines()
 {
     // We are expecting only one main outline, but this main outline can have holes
     // if holes: combine holes and remove them from the main outline.
-    // Note also we are using SHAPE_POLY_SET::PM_STRICTLY_SIMPLE in polygon
+    // Note also we are usingin polygon
     // calculations, but it is not mandatory. It is used mainly
     // because there is usually only very few vertices in area outlines
     SHAPE_POLY_SET::POLYGON& outline = Polygon( 0 );
@@ -1281,22 +2222,24 @@ int SHAPE_POLY_SET::NormalizeAreaOutlines()
         outline.pop_back();
     }
 
-    Simplify( SHAPE_POLY_SET::PM_STRICTLY_SIMPLE );
+    Simplify();
 
     // If any hole, subtract it to main outline
     if( holesBuffer.OutlineCount() )
     {
-        holesBuffer.Simplify( SHAPE_POLY_SET::PM_FAST );
-        BooleanSubtract( holesBuffer, SHAPE_POLY_SET::PM_STRICTLY_SIMPLE );
+        holesBuffer.Simplify();
+        BooleanSubtract( holesBuffer );
     }
 
-    RemoveNullSegments();
+    // In degenerate cases, simplify might return no outlines
+    if( OutlineCount() > 0 )
+        RemoveNullSegments();
 
     return OutlineCount();
 }
 
 
-const std::string SHAPE_POLY_SET::Format() const
+const std::string SHAPE_POLY_SET::Format( bool aCplusPlus ) const
 {
     std::stringstream ss;
 
@@ -1376,10 +2319,10 @@ bool SHAPE_POLY_SET::Parse( std::stringstream& aStream )
                 outline.Append( p );
             }
 
-            paths.push_back( outline );
+            paths.push_back( std::move( outline ) );
         }
 
-        m_polys.push_back( paths );
+        m_polys.push_back( std::move( paths ) );
     }
 
     return true;
@@ -1419,7 +2362,7 @@ const BOX2I SHAPE_POLY_SET::BBoxFromCaches() const
 }
 
 
-bool SHAPE_POLY_SET::PointOnEdge( const VECTOR2I& aP ) const
+bool SHAPE_POLY_SET::PointOnEdge( const VECTOR2I& aP, int aAccuracy ) const
 {
     // Iterate through all the polygons in the set
     for( const POLYGON& polygon : m_polys )
@@ -1427,7 +2370,7 @@ bool SHAPE_POLY_SET::PointOnEdge( const VECTOR2I& aP ) const
         // Iterate through all the line chains in the polygon
         for( const SHAPE_LINE_CHAIN& lineChain : polygon )
         {
-            if( lineChain.PointOnEdge( aP ) )
+            if( lineChain.PointOnEdge( aP, aAccuracy ) )
                 return true;
         }
     }
@@ -1440,7 +2383,7 @@ bool SHAPE_POLY_SET::Collide( const SEG& aSeg, int aClearance, int* aActual,
                               VECTOR2I* aLocation ) const
 {
     VECTOR2I nearest;
-    ecoord dist_sq = SquaredDistance( aSeg, aLocation ? &nearest : nullptr );
+    ecoord dist_sq = SquaredDistanceToSeg( aSeg, aLocation ? &nearest : nullptr );
 
     if( dist_sq == 0 || dist_sq < SEG::Square( aClearance ) )
     {
@@ -1464,7 +2407,7 @@ bool SHAPE_POLY_SET::Collide( const VECTOR2I& aP, int aClearance, int* aActual,
         return false;
 
     VECTOR2I nearest;
-    ecoord dist_sq = SquaredDistance( aP, aLocation ? &nearest : nullptr );
+    ecoord dist_sq = SquaredDistance( aP, false, aLocation ? &nearest : nullptr );
 
     if( dist_sq == 0 || dist_sq < SEG::Square( aClearance ) )
     {
@@ -1567,6 +2510,8 @@ bool SHAPE_POLY_SET::Collide( const SHAPE* aShape, int aClearance, int* aActual,
 void SHAPE_POLY_SET::RemoveAllContours()
 {
     m_polys.clear();
+    m_triangulatedPolys.clear();
+    m_triangulationValid = false;
 }
 
 
@@ -1580,6 +2525,12 @@ void SHAPE_POLY_SET::RemoveContour( int aContourIdx, int aPolygonIdx )
 }
 
 
+void SHAPE_POLY_SET::RemoveOutline( int aOutlineIdx )
+{
+    m_polys.erase( m_polys.begin() + aOutlineIdx );
+}
+
+
 int SHAPE_POLY_SET::RemoveNullSegments()
 {
     int removed = 0;
@@ -1590,6 +2541,7 @@ int SHAPE_POLY_SET::RemoveNullSegments()
     VECTOR2I    segmentStart, segmentEnd;
 
     VERTEX_INDEX indexStart;
+    std::vector<VERTEX_INDEX> indices_to_remove;
 
     while( iterator )
     {
@@ -1605,6 +2557,8 @@ int SHAPE_POLY_SET::RemoveNullSegments()
             // Advance
             iterator++;
 
+            // If we have rolled into the next contour, remember its position
+            // segmentStart and segmentEnd remain valid for comparison here
             if( iterator )
                 contourStart = *iterator;
         }
@@ -1613,21 +2567,24 @@ int SHAPE_POLY_SET::RemoveNullSegments()
             // Advance
             iterator++;
 
-            if( iterator )
-                segmentEnd = *iterator;
+            // If we have reached the end of the SHAPE_POLY_SET, something is broken here
+            wxCHECK_MSG( iterator, removed, wxT( "Invalid polygon.  Reached end without noticing.  Please report this error" ) );
+
+            segmentEnd = *iterator;
         }
 
         // Remove segment start if both points are equal
         if( segmentStart == segmentEnd )
         {
-            RemoveVertex( indexStart );
+            indices_to_remove.push_back( indexStart );
             removed++;
-
-            // Advance the iterator one position, as there is one vertex less.
-            if( iterator )
-                iterator++;
         }
     }
+
+    // Proceed in reverse direction to remove the vertices because they are stored as absolute indices in a vector
+    // Removing in reverse order preserves the remaining index values
+    for( auto it = indices_to_remove.rbegin(); it != indices_to_remove.rend(); ++it )
+        RemoveVertex( *it );
 
     return removed;
 }
@@ -1636,6 +2593,38 @@ int SHAPE_POLY_SET::RemoveNullSegments()
 void SHAPE_POLY_SET::DeletePolygon( int aIdx )
 {
     m_polys.erase( m_polys.begin() + aIdx );
+}
+
+
+void SHAPE_POLY_SET::DeletePolygonAndTriangulationData( int aIdx, bool aUpdateHash )
+{
+    m_polys.erase( m_polys.begin() + aIdx );
+
+    if( m_triangulationValid )
+    {
+        for( int ii = m_triangulatedPolys.size() - 1; ii >= 0; --ii )
+        {
+            std::unique_ptr<TRIANGULATED_POLYGON>& triangleSet = m_triangulatedPolys[ii];
+
+            if( triangleSet->GetSourceOutlineIndex() == aIdx )
+                m_triangulatedPolys.erase( m_triangulatedPolys.begin() + ii );
+            else if( triangleSet->GetSourceOutlineIndex() > aIdx )
+                triangleSet->SetSourceOutlineIndex( triangleSet->GetSourceOutlineIndex() - 1 );
+        }
+
+        if( aUpdateHash )
+        {
+            m_hash = checksum();
+            m_hashValid = true;
+        }
+    }
+}
+
+
+void SHAPE_POLY_SET::UpdateTriangulationDataHash()
+{
+    m_hash = checksum();
+    m_hashValid = true;
 }
 
 
@@ -1652,7 +2641,7 @@ void SHAPE_POLY_SET::Append( const VECTOR2I& aP, int aOutline, int aHole )
 
 
 bool SHAPE_POLY_SET::CollideVertex( const VECTOR2I& aPoint,
-                                    SHAPE_POLY_SET::VERTEX_INDEX& aClosestVertex,
+                                    SHAPE_POLY_SET::VERTEX_INDEX* aClosestVertex,
                                     int aClearance ) const
 {
     // Shows whether there was a collision
@@ -1660,10 +2649,8 @@ bool SHAPE_POLY_SET::CollideVertex( const VECTOR2I& aPoint,
 
     // Difference vector between each vertex and aPoint.
     VECTOR2D    delta;
-    double      distance, clearance;
-
-    // Convert clearance to double for precision when comparing distances
-    clearance = aClearance;
+    ecoord      distance_squared;
+    ecoord      clearance_squared = SEG::Square( aClearance );
 
     for( CONST_ITERATOR iterator = CIterateWithHoles(); iterator; iterator++ )
     {
@@ -1671,18 +2658,21 @@ bool SHAPE_POLY_SET::CollideVertex( const VECTOR2I& aPoint,
         delta = *iterator - aPoint;
 
         // Compute distance
-        distance = delta.EuclideanNorm();
+        distance_squared = delta.SquaredEuclideanNorm();
 
         // Check for collisions
-        if( distance <= clearance )
+        if( distance_squared <= clearance_squared )
         {
+            if( !aClosestVertex )
+                return true;
+
             collision = true;
 
-            // Update aClearance to look for closer vertices
-            clearance = distance;
+            // Update clearance to look for closer vertices
+            clearance_squared = distance_squared;
 
             // Store the indices that identify the vertex
-            aClosestVertex = iterator.GetIndex();
+            *aClosestVertex = iterator.GetIndex();
         }
     }
 
@@ -1691,27 +2681,31 @@ bool SHAPE_POLY_SET::CollideVertex( const VECTOR2I& aPoint,
 
 
 bool SHAPE_POLY_SET::CollideEdge( const VECTOR2I& aPoint,
-                                  SHAPE_POLY_SET::VERTEX_INDEX& aClosestVertex,
+                                  SHAPE_POLY_SET::VERTEX_INDEX* aClosestVertex,
                                   int aClearance ) const
 {
     // Shows whether there was a collision
-    bool collision = false;
+    bool   collision = false;
+    ecoord clearance_squared = SEG::Square( aClearance );
 
     for( CONST_SEGMENT_ITERATOR iterator = CIterateSegmentsWithHoles(); iterator; iterator++ )
     {
         const SEG currentSegment = *iterator;
-        int distance = currentSegment.Distance( aPoint );
+        ecoord    distance_squared = currentSegment.SquaredDistance( aPoint );
 
         // Check for collisions
-        if( distance <= aClearance )
+        if( distance_squared <= clearance_squared )
         {
+            if( !aClosestVertex )
+                return true;
+
             collision = true;
 
-            // Update aClearance to look for closer edges
-            aClearance = distance;
+            // Update clearance to look for closer edges
+            clearance_squared = distance_squared;
 
             // Store the indices that identify the vertex
-            aClosestVertex = iterator.GetIndex();
+            *aClosestVertex = iterator.GetIndex();
         }
     }
 
@@ -1823,15 +2817,16 @@ void SHAPE_POLY_SET::Move( const VECTOR2I& aVector )
         tri->Move( aVector );
 
     m_hash = checksum();
+    m_hashValid = true;
 }
 
 
-void SHAPE_POLY_SET::Mirror( bool aX, bool aY, const VECTOR2I& aRef )
+void SHAPE_POLY_SET::Mirror( const VECTOR2I& aRef, FLIP_DIRECTION aFlipDirection )
 {
     for( POLYGON& poly : m_polys )
     {
         for( SHAPE_LINE_CHAIN& path : poly )
-            path.Mirror( aX, aY, aRef );
+            path.Mirror( aRef, aFlipDirection );
     }
 
     if( m_triangulationValid )
@@ -1839,7 +2834,7 @@ void SHAPE_POLY_SET::Mirror( bool aX, bool aY, const VECTOR2I& aRef )
 }
 
 
-void SHAPE_POLY_SET::Rotate( double aAngle, const VECTOR2I& aCenter )
+void SHAPE_POLY_SET::Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter )
 {
     for( POLYGON& poly : m_polys )
     {
@@ -1899,6 +2894,9 @@ SEG::ecoord SHAPE_POLY_SET::SquaredDistanceToPolygon( VECTOR2I aPoint, int aPoly
 
     SEG::ecoord minDistance = (*iterator).SquaredDistance( aPoint );
 
+    if( aNearest )
+        *aNearest = ( *iterator ).NearestPoint( aPoint );
+
     for( iterator++; iterator && minDistance > 0; iterator++ )
     {
         SEG::ecoord currentDistance = (*iterator).SquaredDistance( aPoint );
@@ -1932,7 +2930,7 @@ SEG::ecoord SHAPE_POLY_SET::SquaredDistanceToPolygon( const SEG& aSegment, int a
     CONST_SEGMENT_ITERATOR iterator = CIterateSegmentsWithHoles( aPolygonIndex );
     SEG::ecoord            minDistance = (*iterator).SquaredDistance( aSegment );
 
-    if( aNearest && minDistance == 0 )
+    if( aNearest )
         *aNearest = ( *iterator ).NearestPoint( aSegment );
 
     for( iterator++; iterator && minDistance > 0; iterator++ )
@@ -1953,8 +2951,12 @@ SEG::ecoord SHAPE_POLY_SET::SquaredDistanceToPolygon( const SEG& aSegment, int a
 }
 
 
-SEG::ecoord SHAPE_POLY_SET::SquaredDistance( VECTOR2I aPoint, VECTOR2I* aNearest ) const
+SEG::ecoord SHAPE_POLY_SET::SquaredDistance( const VECTOR2I& aPoint, bool aOutlineOnly,
+                                             VECTOR2I* aNearest ) const
 {
+    wxASSERT_MSG( !aOutlineOnly, wxT( "Warning: SHAPE_POLY_SET::SquaredDistance does not yet "
+                                      "support aOutlineOnly==true" ) );
+
     SEG::ecoord currentDistance_sq;
     SEG::ecoord minDistance_sq = VECTOR2I::ECOORD_MAX;
     VECTOR2I    nearest;
@@ -1978,7 +2980,7 @@ SEG::ecoord SHAPE_POLY_SET::SquaredDistance( VECTOR2I aPoint, VECTOR2I* aNearest
 }
 
 
-SEG::ecoord SHAPE_POLY_SET::SquaredDistance( const SEG& aSegment, VECTOR2I* aNearest ) const
+SEG::ecoord SHAPE_POLY_SET::SquaredDistanceToSeg( const SEG& aSegment, VECTOR2I* aNearest ) const
 {
     SEG::ecoord currentDistance_sq;
     SEG::ecoord minDistance_sq = VECTOR2I::ECOORD_MAX;
@@ -2038,194 +3040,41 @@ SHAPE_POLY_SET SHAPE_POLY_SET::Fillet( int aRadius, int aErrorMax )
 }
 
 
-SHAPE_POLY_SET::POLYGON SHAPE_POLY_SET::chamferFilletPolygon( CORNER_MODE aMode,
-                                                              unsigned int aDistance,
-                                                              int aIndex, int aErrorMax )
-{
-    // Null segments create serious issues in calculations. Remove them:
-    RemoveNullSegments();
-
-    SHAPE_POLY_SET::POLYGON currentPoly = Polygon( aIndex );
-    SHAPE_POLY_SET::POLYGON newPoly;
-
-    // If the chamfering distance is zero, then the polygon remain intact.
-    if( aDistance == 0 )
-    {
-        return currentPoly;
-    }
-
-    // Iterate through all the contours (outline and holes) of the polygon.
-    for( SHAPE_LINE_CHAIN& currContour : currentPoly )
-    {
-        // Generate a new contour in the new polygon
-        SHAPE_LINE_CHAIN newContour;
-
-        // Iterate through the vertices of the contour
-        for( int currVertex = 0; currVertex < currContour.PointCount(); currVertex++ )
-        {
-            // Current vertex
-            int x1 = currContour.CPoint( currVertex ).x;
-            int y1 = currContour.CPoint( currVertex ).y;
-
-            // Indices for previous and next vertices.
-            int prevVertex;
-            int nextVertex;
-
-            // Previous and next vertices indices computation. Necessary to manage the edge cases.
-
-            // Previous vertex is the last one if the current vertex is the first one
-            prevVertex = currVertex == 0 ? currContour.PointCount() - 1 : currVertex - 1;
-
-            // next vertex is the first one if the current vertex is the last one.
-            nextVertex = currVertex == currContour.PointCount() - 1 ? 0 : currVertex + 1;
-
-            // Previous vertex computation
-            double xa = currContour.CPoint( prevVertex ).x - x1;
-            double ya = currContour.CPoint( prevVertex ).y - y1;
-
-            // Next vertex computation
-            double xb = currContour.CPoint( nextVertex ).x - x1;
-            double yb = currContour.CPoint( nextVertex ).y - y1;
-
-            // Compute the new distances
-            double  lena    = hypot( xa, ya );
-            double  lenb    = hypot( xb, yb );
-
-            // Make the final computations depending on the mode selected, chamfered or filleted.
-            if( aMode == CORNER_MODE::CHAMFERED )
-            {
-                double distance = aDistance;
-
-                // Chamfer one half of an edge at most
-                if( 0.5 * lena < distance )
-                    distance = 0.5 * lena;
-
-                if( 0.5 * lenb < distance )
-                    distance = 0.5 * lenb;
-
-                int nx1 = KiROUND( distance * xa / lena );
-                int ny1 = KiROUND( distance * ya / lena );
-
-                newContour.Append( x1 + nx1, y1 + ny1 );
-
-                int nx2 = KiROUND( distance * xb / lenb );
-                int ny2 = KiROUND( distance * yb / lenb );
-
-                newContour.Append( x1 + nx2, y1 + ny2 );
-            }
-            else    // CORNER_MODE = FILLETED
-            {
-                double cosine = ( xa * xb + ya * yb ) / ( lena * lenb );
-
-                double  radius  = aDistance;
-                double  denom   = sqrt( 2.0 / ( 1 + cosine ) - 1 );
-
-                // Do nothing in case of parallel edges
-                if( std::isinf( denom ) )
-                    continue;
-
-                // Limit rounding distance to one half of an edge
-                if( 0.5 * lena * denom < radius )
-                    radius = 0.5 * lena * denom;
-
-                if( 0.5 * lenb * denom < radius )
-                    radius = 0.5 * lenb * denom;
-
-                // Calculate fillet arc absolute center point (xc, yx)
-                double  k = radius / sqrt( .5 * ( 1 - cosine ) );
-                double  lenab = sqrt( ( xa / lena + xb / lenb ) * ( xa / lena + xb / lenb ) +
-                        ( ya / lena + yb / lenb ) * ( ya / lena + yb / lenb ) );
-                double  xc  = x1 + k * ( xa / lena + xb / lenb ) / lenab;
-                double  yc  = y1 + k * ( ya / lena + yb / lenb ) / lenab;
-
-                // Calculate arc start and end vectors
-                k = radius / sqrt( 2 / ( 1 + cosine ) - 1 );
-                double  xs  = x1 + k * xa / lena - xc;
-                double  ys  = y1 + k * ya / lena - yc;
-                double  xe  = x1 + k * xb / lenb - xc;
-                double  ye  = y1 + k * yb / lenb - yc;
-
-                // Cosine of arc angle
-                double argument = ( xs * xe + ys * ye ) / ( radius * radius );
-
-                // Make sure the argument is in [-1,1], interval in which the acos function is
-                // defined
-                if( argument < -1 )
-                    argument = -1;
-                else if( argument > 1 )
-                    argument = 1;
-
-                double arcAngle = acos( argument );
-                double arcAngleDegrees = arcAngle * 180.0 / M_PI;
-                int    segments = GetArcToSegmentCount( radius, aErrorMax, arcAngleDegrees );
-
-                double  deltaAngle  = arcAngle / segments;
-                double  startAngle  = atan2( -ys, xs );
-
-                // Flip arc for inner corners
-                if( xa * yb - ya * xb <= 0 )
-                    deltaAngle *= -1;
-
-                double  nx  = xc + xs;
-                double  ny  = yc + ys;
-
-                newContour.Append( KiROUND( nx ), KiROUND( ny ) );
-
-                // Store the previous added corner to make a sanity check
-                int prevX   = KiROUND( nx );
-                int prevY   = KiROUND( ny );
-
-                for( int j = 0; j < segments; j++ )
-                {
-                    nx = xc + cos( startAngle + ( j + 1 ) * deltaAngle ) * radius;
-                    ny = yc - sin( startAngle + ( j + 1 ) * deltaAngle ) * radius;
-
-                    // Sanity check: the rounding can produce repeated corners; do not add them.
-                    if( KiROUND( nx ) != prevX || KiROUND( ny ) != prevY )
-                    {
-                        newContour.Append( KiROUND( nx ), KiROUND( ny ) );
-                        prevX   = KiROUND( nx );
-                        prevY   = KiROUND( ny );
-                    }
-                }
-            }
-        }
-
-        // Close the current contour and add it the new polygon
-        newContour.SetClosed( true );
-        newPoly.push_back( newContour );
-    }
-
-    return newPoly;
-}
-
-
 SHAPE_POLY_SET &SHAPE_POLY_SET::operator=( const SHAPE_POLY_SET& aOther )
 {
-    static_cast<SHAPE&>(*this) = aOther;
+    SHAPE::operator=( aOther );
     m_polys = aOther.m_polys;
+
     m_triangulatedPolys.clear();
-    m_triangulationValid = false;
 
     if( aOther.IsTriangulationUpToDate() )
     {
+        m_triangulatedPolys.reserve( aOther.TriangulatedPolyCount() );
+
         for( unsigned i = 0; i < aOther.TriangulatedPolyCount(); i++ )
         {
             const TRIANGULATED_POLYGON* poly = aOther.TriangulatedPolygon( i );
             m_triangulatedPolys.push_back( std::make_unique<TRIANGULATED_POLYGON>( *poly ) );
         }
 
-        m_hash = aOther.GetHash();
-        m_triangulationValid = true;
+        m_hash = aOther.m_hash;
+        m_hashValid = aOther.m_hashValid;
+        m_triangulationValid = aOther.m_triangulationValid.load();
+    }
+    else
+    {
+        m_hash.Clear();
+        m_hashValid = false;
+        m_triangulationValid = false;
     }
 
     return *this;
 }
 
 
-MD5_HASH SHAPE_POLY_SET::GetHash() const
+HASH_128 SHAPE_POLY_SET::GetHash() const
 {
-    if( !m_hash.IsValid() )
+    if( !m_hashValid )
         return checksum();
 
     return m_hash;
@@ -2237,17 +3086,16 @@ bool SHAPE_POLY_SET::IsTriangulationUpToDate() const
     if( !m_triangulationValid )
         return false;
 
-    if( !m_hash.IsValid() )
+    if( !m_hashValid )
         return false;
 
-    MD5_HASH hash = checksum();
+    HASH_128 hash = checksum();
 
     return hash == m_hash;
 }
 
 
-static void partitionPolyIntoRegularCellGrid( const SHAPE_POLY_SET& aPoly, int aSize,
-                                              SHAPE_POLY_SET& aOut )
+static SHAPE_POLY_SET partitionPolyIntoRegularCellGrid( const SHAPE_POLY_SET& aPoly, int aSize )
 {
     BOX2I bb = aPoly.BBox();
 
@@ -2255,7 +3103,7 @@ static void partitionPolyIntoRegularCellGrid( const SHAPE_POLY_SET& aPoly, int a
     double h = bb.GetHeight();
 
     if( w == 0.0 || h == 0.0 )
-        return;
+        return aPoly;
 
     int n_cells_x, n_cells_y;
 
@@ -2301,116 +3149,178 @@ static void partitionPolyIntoRegularCellGrid( const SHAPE_POLY_SET& aPoly, int a
         }
     }
 
-    ps1.BooleanIntersection( maskSetOdd, SHAPE_POLY_SET::PM_FAST );
-    ps2.BooleanIntersection( maskSetEven, SHAPE_POLY_SET::PM_FAST );
-    ps1.Fracture( SHAPE_POLY_SET::PM_FAST );
-    ps2.Fracture( SHAPE_POLY_SET::PM_FAST );
-
-    aOut = ps1;
+    ps1.BooleanIntersection( maskSetOdd );
+    ps2.BooleanIntersection( maskSetEven );
+    ps1.Fracture();
+    ps2.Fracture();
 
     for( int i = 0; i < ps2.OutlineCount(); i++ )
-        aOut.AddOutline( ps2.COutline( i ) );
+        ps1.AddOutline( ps2.COutline( i ) );
 
-    if( !aOut.OutlineCount() )
-        aOut = aPoly;
+    if( ps1.OutlineCount() )
+        return ps1;
+    else
+        return aPoly;
 }
 
 
-void SHAPE_POLY_SET::CacheTriangulation( bool aPartition )
+void SHAPE_POLY_SET::cacheTriangulation( bool aPartition, bool aSimplify,
+                                         std::vector<std::unique_ptr<TRIANGULATED_POLYGON>>* aHintData )
 {
-    bool recalculate = !m_hash.IsValid();
-    MD5_HASH hash;
+    std::unique_lock<std::mutex> lock( m_triangulationMutex );
 
-    if( !m_triangulationValid )
-        recalculate = true;
-
-    if( !recalculate )
+    if( m_triangulationValid && m_hashValid )
     {
-        hash = checksum();
-
-        if( m_hash != hash )
-        {
-            m_hash = hash;
-            recalculate = true;
-        }
+        if( m_hash == checksum() )
+            return;
     }
 
-    if( !recalculate )
-        return;
+    // Invalidate, in case anything goes wrong below
+    m_triangulationValid = false;
+    m_hashValid = false;
 
-    SHAPE_POLY_SET tmpSet;
+    auto triangulate =
+            []( SHAPE_POLY_SET& polySet, int forOutline,
+                std::vector<std::unique_ptr<TRIANGULATED_POLYGON>>& dest,
+                std::vector<std::unique_ptr<TRIANGULATED_POLYGON>>* hintData )
+            {
+                bool triangulationValid = false;
+                int pass = 0;
+                int index = 0;
+
+                if( hintData && hintData->size() != (unsigned) polySet.OutlineCount() )
+                    hintData = nullptr;
+
+                while( polySet.OutlineCount() > 0 )
+                {
+                    if( !dest.empty() && dest.back()->GetTriangleCount() == 0 )
+                        dest.erase( dest.end() - 1 );
+
+                    dest.push_back( std::make_unique<TRIANGULATED_POLYGON>( forOutline ) );
+                    POLYGON_TRIANGULATION tess( *dest.back() );
+
+                    // If the tessellation fails, we re-fracture the polygon, which will
+                    // first simplify the system before fracturing and removing the holes
+                    // This may result in multiple, disjoint polygons.
+                    if( !tess.TesselatePolygon( polySet.Polygon( 0 ).front(),
+                                                hintData ? hintData->at( index ).get() : nullptr ) )
+                    {
+                        ++pass;
+
+                        if( pass == 1 )
+                        {
+                            polySet.SimplifyOutlines( TRIANGULATESIMPLIFICATIONLEVEL );
+                        }
+                        // In Clipper2, there is only one type of simplification
+                        else
+                        {
+                            break;
+                        }
+
+                        triangulationValid = false;
+                        hintData = nullptr;
+                        continue;
+                    }
+
+                    polySet.DeletePolygon( 0 );
+                    index++;
+                    triangulationValid = true;
+                }
+
+                return triangulationValid;
+            };
+
+    m_triangulatedPolys.clear();
 
     if( aPartition )
     {
-        // This partitions into regularly-sized grids (1cm in Pcbnew)
-        SHAPE_POLY_SET flattened( *this );
-        flattened.ClearArcs();
-        partitionPolyIntoRegularCellGrid( flattened, 1e7, tmpSet );
+        for( int ii = 0; ii < OutlineCount(); ++ii )
+        {
+            // This partitions into regularly-sized grids (1cm in Pcbnew)
+            SHAPE_POLY_SET flattened( Outline( ii ) );
+
+            for( int jj = 0; jj < HoleCount( ii ); ++jj )
+                flattened.AddHole( Hole( ii, jj ) );
+
+            flattened.ClearArcs();
+
+            if( flattened.HasHoles() || flattened.IsSelfIntersecting() )
+            {
+                // Fracture first to merge holes into the outline before splitting
+                // self-touching outlines.  If splitSelfTouchingOutlines runs first,
+                // the new split polygon gets no holes and its triangles span the
+                // knockout areas.
+                flattened.Fracture();
+                flattened.splitSelfTouchingOutlines();
+            }
+            else if( aSimplify )
+                flattened.Simplify();
+
+            SHAPE_POLY_SET partitions = partitionPolyIntoRegularCellGrid( flattened, 1e7 );
+
+            // This pushes the triangulation for all polys in partitions
+            // to be referenced to the ii-th polygon
+            if( !triangulate( partitions, ii , m_triangulatedPolys, aHintData ) )
+            {
+                wxLogTrace( TRIANGULATE_TRACE, "Failed to triangulate partitioned polygon %d", ii );
+            }
+            else
+            {
+                m_hash = checksum();
+                m_hashValid = true;
+                // Set valid flag only after everything has been updated
+                m_triangulationValid = true;
+            }
+        }
     }
     else
     {
-        tmpSet = *this;
+        SHAPE_POLY_SET tmpSet( *this );
 
-        if( tmpSet.HasHoles() )
-            tmpSet.Fracture( PM_FAST );
-    }
+        tmpSet.ClearArcs();
+        tmpSet.Fracture();
+        tmpSet.splitSelfTouchingOutlines();
 
-    m_triangulatedPolys.clear();
-    m_triangulationValid = false;
-
-    while( tmpSet.OutlineCount() > 0 )
-    {
-
-        if( !m_triangulatedPolys.empty() && m_triangulatedPolys.back()->GetTriangleCount() == 0 )
-            m_triangulatedPolys.erase( m_triangulatedPolys.end() - 1 );
-
-        m_triangulatedPolys.push_back( std::make_unique<TRIANGULATED_POLYGON>() );
-        PolygonTriangulation tess( *m_triangulatedPolys.back() );
-
-        // If the tessellation fails, we re-fracture the polygon, which will
-        // first simplify the system before fracturing and removing the holes
-        // This may result in multiple, disjoint polygons.
-        if( !tess.TesselatePolygon( tmpSet.Polygon( 0 ).front() ) )
+        if( !triangulate( tmpSet, -1, m_triangulatedPolys, aHintData ) )
         {
-            tmpSet.Fracture( PM_FAST );
-            m_triangulationValid = false;
-            continue;
+            wxLogTrace( TRIANGULATE_TRACE, "Failed to triangulate polygon" );
         }
-
-        tmpSet.DeletePolygon( 0 );
-        m_triangulationValid = true;
+        else
+        {
+            m_hash = checksum();
+            m_hashValid = true;
+            // Set valid flag only after everything has been updated
+            m_triangulationValid = true;
+        }
     }
-
-    if( m_triangulationValid )
-        m_hash = checksum();
 }
 
 
-MD5_HASH SHAPE_POLY_SET::checksum() const
+HASH_128 SHAPE_POLY_SET::checksum() const
 {
-    MD5_HASH hash;
+    MMH3_HASH hash( 0x68AF835D ); // Arbitrary seed
 
-    hash.Hash( m_polys.size() );
+    hash.add( m_polys.size() );
 
     for( const POLYGON& outline : m_polys )
     {
-        hash.Hash( outline.size() );
+        hash.add( outline.size() );
 
         for( const SHAPE_LINE_CHAIN& lc : outline )
         {
-            hash.Hash( lc.PointCount() );
+            hash.add( lc.PointCount() );
 
             for( int i = 0; i < lc.PointCount(); i++ )
             {
-                hash.Hash( lc.CPoint( i ).x );
-                hash.Hash( lc.CPoint( i ).y );
+                VECTOR2I pt = lc.CPoint( i );
+
+                hash.add( pt.x );
+                hash.add( pt.y );
             }
         }
     }
 
-    hash.Finalize();
-
-    return hash;
+    return hash.digest();
 }
 
 
@@ -2464,13 +3374,13 @@ size_t SHAPE_POLY_SET::GetIndexableSubshapeCount() const
 }
 
 
-void SHAPE_POLY_SET:: GetIndexableSubshapes( std::vector<SHAPE*>& aSubshapes )
+void SHAPE_POLY_SET::GetIndexableSubshapes( std::vector<const SHAPE*>& aSubshapes ) const
 {
     aSubshapes.reserve( GetIndexableSubshapeCount() );
 
     for( const std::unique_ptr<TRIANGULATED_POLYGON>& tpoly : m_triangulatedPolys )
     {
-        for( TRIANGULATED_POLYGON::TRI& tri : tpoly->Triangles() )
+        for( const TRIANGULATED_POLYGON::TRI& tri : tpoly->Triangles() )
             aSubshapes.push_back( &tri );
     }
 }
@@ -2497,6 +3407,7 @@ void SHAPE_POLY_SET::TRIANGULATED_POLYGON::AddTriangle( int a, int b, int c )
 
 SHAPE_POLY_SET::TRIANGULATED_POLYGON::TRIANGULATED_POLYGON( const TRIANGULATED_POLYGON& aOther )
 {
+    m_sourceOutline = aOther.m_sourceOutline;
     m_vertices = aOther.m_vertices;
     m_triangles = aOther.m_triangles;
 
@@ -2507,6 +3418,7 @@ SHAPE_POLY_SET::TRIANGULATED_POLYGON::TRIANGULATED_POLYGON( const TRIANGULATED_P
 
 SHAPE_POLY_SET::TRIANGULATED_POLYGON& SHAPE_POLY_SET::TRIANGULATED_POLYGON::operator=( const TRIANGULATED_POLYGON& aOther )
 {
+    m_sourceOutline = aOther.m_sourceOutline;
     m_vertices = aOther.m_vertices;
     m_triangles = aOther.m_triangles;
 
@@ -2517,7 +3429,8 @@ SHAPE_POLY_SET::TRIANGULATED_POLYGON& SHAPE_POLY_SET::TRIANGULATED_POLYGON::oper
 }
 
 
-SHAPE_POLY_SET::TRIANGULATED_POLYGON::TRIANGULATED_POLYGON()
+SHAPE_POLY_SET::TRIANGULATED_POLYGON::TRIANGULATED_POLYGON( int aSourceOutline ) :
+        m_sourceOutline( aSourceOutline )
 {
 }
 
@@ -2527,53 +3440,204 @@ SHAPE_POLY_SET::TRIANGULATED_POLYGON::~TRIANGULATED_POLYGON()
 }
 
 
-const SHAPE_POLY_SET
-SHAPE_POLY_SET::BuildPolysetFromOrientedPaths( const std::vector<SHAPE_LINE_CHAIN>& aPaths,
-                                               bool aReverseOrientation, bool aEvenOdd )
+void SHAPE_POLY_SET::Scale( double aScaleFactorX, double aScaleFactorY, const VECTOR2I& aCenter )
 {
-    ClipperLibKiCad::Clipper  clipper;
-    ClipperLibKiCad::PolyTree tree;
+    for( POLYGON& poly : m_polys )
+    {
+        for( SHAPE_LINE_CHAIN& path : poly )
+        {
+            for( int i = 0; i < path.PointCount(); i++ )
+            {
+                VECTOR2I pt = path.CPoint( i );
+                VECTOR2D vec;
+                vec.x = ( pt.x - aCenter.x ) * aScaleFactorX;
+                vec.y = ( pt.y - aCenter.y ) * aScaleFactorY;
+                pt.x = KiROUND<double, int>( aCenter.x + vec.x );
+                pt.y = KiROUND<double, int>( aCenter.y + vec.y );
+                path.SetPoint( i, pt );
+            }
+        }
+    }
 
-    // fixme: do we need aReverseOrientation?
+    if( m_triangulationValid )
+        CacheTriangulation();
+}
+
+
+void
+SHAPE_POLY_SET::BuildPolysetFromOrientedPaths( const std::vector<SHAPE_LINE_CHAIN>& aPaths,
+                                               bool                                 aEvenOdd )
+{
+    Clipper2Lib::Clipper64 clipper;
+    Clipper2Lib::PolyTree64 tree;
+    Clipper2Lib::Paths64 paths;
 
     for( const SHAPE_LINE_CHAIN& path : aPaths )
     {
-        ClipperLibKiCad::Path lc;
+        Clipper2Lib::Path64 lc;
+        lc.reserve( path.PointCount() );
 
         for( int i = 0; i < path.PointCount(); i++ )
-        {
             lc.emplace_back( path.CPoint( i ).x, path.CPoint( i ).y );
-        }
 
-        clipper.AddPath( lc, ClipperLibKiCad::ptSubject, true );
+        paths.push_back( std::move( lc ) );
     }
 
-    clipper.StrictlySimple( true );
-    clipper.Execute( ClipperLibKiCad::ctUnion, tree,
-                     aEvenOdd ? ClipperLibKiCad::pftEvenOdd : ClipperLibKiCad::pftNonZero,
-                     ClipperLibKiCad::pftNonZero );
-    SHAPE_POLY_SET result;
+    clipper.AddSubject( paths );
+    clipper.Execute( Clipper2Lib::ClipType::Union, aEvenOdd ? Clipper2Lib::FillRule::EvenOdd
+                                                            : Clipper2Lib::FillRule::NonZero, tree );
 
-    for( ClipperLibKiCad::PolyNode* n = tree.GetFirst(); n; n = n->GetNext() )
+    std::vector<CLIPPER_Z_VALUE> zValues;
+    std::vector<SHAPE_ARC> arcBuffer;
+
+    importTree( tree, zValues, arcBuffer );
+    tree.Clear(); // Free used memory (not done in dtor)
+}
+
+
+bool SHAPE_POLY_SET::PointInside( const VECTOR2I& aPt, int aAccuracy, bool aUseBBoxCache ) const
+{
+    for( int idx = 0; idx < OutlineCount(); idx++ )
     {
-        if( !n->IsHole() )
-        {
-            int outl = result.NewOutline();
+        if( COutline( idx ).PointInside( aPt, aAccuracy, aUseBBoxCache ) )
+            return true;
+    }
 
-            for( unsigned int i = 0; i < n->Contour.size(); i++ )
-                result.Outline( outl ).Append( n->Contour[i].X, n->Contour[i].Y );
+    return false;
+}
 
-            for( unsigned int i = 0; i < n->Childs.size(); i++ )
+
+const std::vector<SEG> SHAPE_POLY_SET::GenerateHatchLines( const std::vector<double>& aSlopes,
+                                                           int aSpacing, int aLineLength ) const
+{
+    std::vector<SEG> hatchLines;
+
+    if( OutlineCount() == 0 || TotalVertices() == 0 )
+        return hatchLines;
+
+    // define range for hatch lines
+    int min_x = CVertex( 0 ).x;
+    int max_x = CVertex( 0 ).x;
+    int min_y = CVertex( 0 ).y;
+    int max_y = CVertex( 0 ).y;
+
+    for( auto iterator = CIterateWithHoles(); iterator; iterator++ )
+    {
+        if( iterator->x < min_x )
+            min_x = iterator->x;
+
+        if( iterator->x > max_x )
+            max_x = iterator->x;
+
+        if( iterator->y < min_y )
+            min_y = iterator->y;
+
+        if( iterator->y > max_y )
+            max_y = iterator->y;
+    }
+
+    auto sortEndsByDescendingX =
+            []( const VECTOR2I& ref, const VECTOR2I& tst )
             {
-                int outh = result.NewHole( outl );
-                for( unsigned int j = 0; j < n->Childs[i]->Contour.size(); j++ )
+                return tst.x < ref.x;
+            };
+
+    for( double slope : aSlopes )
+    {
+        int64_t max_a, min_a;
+
+        if( slope > 0 )
+        {
+            max_a = KiROUND<double, int64_t>( max_y - slope * min_x );
+            min_a = KiROUND<double, int64_t>( min_y - slope * max_x );
+        }
+        else
+        {
+            max_a = KiROUND<double, int64_t>( max_y - slope * max_x );
+            min_a = KiROUND<double, int64_t>( min_y - slope * min_x );
+        }
+
+        min_a = ( min_a / aSpacing ) * aSpacing;
+
+        // loop through hatch lines
+        std::vector<VECTOR2I> pointbuffer;
+        pointbuffer.reserve( 256 );
+
+        for( int64_t a = min_a; a < max_a; a += aSpacing )
+        {
+            pointbuffer.clear();
+
+            // Iterate through all vertices
+            for( auto iterator = CIterateSegmentsWithHoles(); iterator; iterator++ )
+            {
+                const SEG seg = *iterator;
+                VECTOR2I  pt;
+
+                if( seg.IntersectsLine( slope, a, pt ) )
                 {
-                    result.Hole( outl, outh )
-                            .Append( n->Childs[i]->Contour[j].X, n->Childs[i]->Contour[j].Y );
+                    // If the intersection point is outside the polygon, skip it
+                    if( pt.x < min_x || pt.x > max_x || pt.y < min_y || pt.y > max_y )
+                        continue;
+
+                    // Add the intersection point to the buffer
+                    pointbuffer.emplace_back( KiROUND( pt.x ), KiROUND( pt.y ) );
+                }
+            }
+
+            // sort points in order of descending x (if more than 2) to
+            // ensure the starting point and the ending point of the same segment
+            // are stored one just after the other.
+            if( pointbuffer.size() > 2 )
+                sort( pointbuffer.begin(), pointbuffer.end(), sortEndsByDescendingX );
+
+            // creates lines or short segments inside the complex polygon
+            for( size_t ip = 0; ip + 1 < pointbuffer.size(); ip++ )
+            {
+                const VECTOR2I& p1 = pointbuffer[ip];
+                const VECTOR2I& p2 = pointbuffer[ip + 1];
+
+                // Avoid duplicated intersections or segments
+                if( p1 == p2 )
+                    continue;
+
+                SEG candidate( p1, p2 );
+
+                VECTOR2I mid( ( candidate.A.x + candidate.B.x ) / 2, ( candidate.A.y + candidate.B.y ) / 2 );
+
+                // Check if segment is inside the polygon by checking its middle point
+                if( Contains( mid, -1, 1, true ) )
+                {
+                    int dx = p2.x - p1.x;
+
+                    // Push only one line for diagonal hatch or for small lines < twice
+                    // the line length; else push 2 small lines
+                    if( aLineLength == -1 || std::abs( dx ) < 2 * aLineLength )
+                    {
+                        hatchLines.emplace_back( candidate );
+                    }
+                    else
+                    {
+                        double dy = p2.y - p1.y;
+                        slope = dy / dx;
+
+                        if( dx > 0 )
+                            dx = aLineLength;
+                        else
+                            dx = -aLineLength;
+
+                        int x1 = KiROUND( p1.x + dx );
+                        int x2 = KiROUND( p2.x - dx );
+                        int y1 = KiROUND( p1.y + dx * slope );
+                        int y2 = KiROUND( p2.y - dx * slope );
+
+                        hatchLines.emplace_back( SEG( p1.x, p1.y, x1, y1 ) );
+
+                        hatchLines.emplace_back( SEG( p2.x, p2.y, x2, y2 ) );
+                    }
                 }
             }
         }
     }
 
-    return result;
+    return hatchLines;
 }

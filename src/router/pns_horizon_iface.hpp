@@ -26,7 +26,7 @@ template <typename T> class Coord;
 } // namespace horizon
 
 namespace PNS {
-class PNS_HORIZON_PARENT_ITEM {
+class PNS_HORIZON_PARENT_ITEM : public BOARD_ITEM {
 public:
     PNS_HORIZON_PARENT_ITEM()
     {
@@ -55,6 +55,17 @@ public:
                && hole == other.hole && keepout == other.keepout;
     }
 
+    KICAD_T Type() const override
+    {
+        if (via)
+            return PCB_VIA_T;
+        if (pad)
+            return PCB_PAD_T;
+        if (keepout)
+            return PCB_ZONE_T;
+        return PCB_TRACE_T;
+    }
+
     const horizon::Track *track = nullptr;
     const horizon::Via *via = nullptr;
     const horizon::BoardPackage *package = nullptr;
@@ -77,44 +88,57 @@ public:
     void SyncWorld(PNS::NODE *aWorld) override;
     void EraseView() override;
     void HideItem(PNS::ITEM *aItem) override;
-    void DisplayItem(const PNS::ITEM *aItem, int aClearance = 0, bool aEdit = false) override;
+    void DisplayItem(const PNS::ITEM *aItem, int aClearance = 0, bool aEdit = false, int aFlags = 0) override;
+    void DisplayPathLine(const SHAPE_LINE_CHAIN &, int) override {}
     void AddItem(PNS::ITEM *aItem) override;
     void RemoveItem(PNS::ITEM *aItem) override;
     void Commit() override;
 
     void UpdateItem(ITEM *aItem) override;
     bool IsFlashedOnLayer(const PNS::ITEM *aItem, int aLayer) const override;
-    bool ImportSizes(SIZES_SETTINGS &aSizes, ITEM *aStartItem, int aNet) override;
+    bool ImportSizes(SIZES_SETTINGS &aSizes, ITEM *aStartItem, NET_HANDLE aNet, VECTOR2D aStartPosition) override;
     int StackupHeight(int aFirstLayer, int aSecondLayer) const override;
-    void DisplayRatline(const SHAPE_LINE_CHAIN &aRatline, int aColor = -1) override;
+    void DisplayRatline(const SHAPE_LINE_CHAIN &aRatline, NET_HANDLE aNet) override;
 
     PNS::NODE *GetWorld() const override
     {
         return m_world;
     }
 
-    bool IsAnyLayerVisible(const LAYER_RANGE &aLayer) const override;
+    bool IsAnyLayerVisible(const PNS_LAYER_RANGE &aLayer) const override;
     bool IsItemVisible(const PNS::ITEM *aItem) const override;
+    bool IsFlashedOnLayer(const PNS::ITEM *aItem, const PNS_LAYER_RANGE &aLayer) const override;
+    bool IsPNSCopperLayer(int aLayer) const override;
 
-    void UpdateNet(int aNetCode) override;
+    void UpdateNet(NET_HANDLE aNet) override;
+    int GetNetCode(NET_HANDLE aNet) const override;
+    wxString GetNetName(NET_HANDLE aNet) const override;
+    NET_HANDLE GetOrphanedNetHandle() override { return nullptr; }
 
     PNS::RULE_RESOLVER *GetRuleResolver() override;
     PNS::DEBUG_DECORATOR *GetDebugDecorator() override;
 
     static int layer_to_router(int l);
     static int layer_from_router(int l);
-    horizon::Net *get_net_for_code(int code);
-    int get_net_code(const horizon::UUID &uu);
+    horizon::Net *get_net_for_code(NET_HANDLE code) const;
+    NET_HANDLE get_net_code(const horizon::UUID &uu);
 
     horizon::UUID get_via_definition_for_code(int code);
     int get_via_definition_code(const horizon::UUID &uu);
 
-    const PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::Track *track);
-    const PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::Via *via);
-    const PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::BoardHole *hole);
-    const PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::BoardPackage *pkg, const horizon::Pad *pad);
-    const PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::Keepout *keepout,
+    PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::Track *track);
+    PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::Via *via);
+    PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::BoardHole *hole);
+    PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::BoardPackage *pkg, const horizon::Pad *pad);
+    PNS_HORIZON_PARENT_ITEM *get_parent(const horizon::Keepout *keepout,
                                               const horizon::BoardPackage *pkg = nullptr);
+
+    long long CalculateRoutedPathLength(const ITEM_SET &, const SOLID *, const SOLID *, const NETCLASS *) override { return 0; }
+    int64_t CalculateRoutedPathDelay(const ITEM_SET &, const SOLID *, const SOLID *, const NETCLASS *) override { return 0; }
+    int64_t CalculateLengthForDelay(int64_t value, int, bool, int, int, const NETCLASS *) override { return value; }
+    int64_t CalculateDelayForShapeLineChain(const SHAPE_LINE_CHAIN &, int, bool, int, int, const NETCLASS *) override { return 0; }
+    PCB_LAYER_ID GetBoardLayerFromPNSLayer(int layer) const override { return static_cast<PCB_LAYER_ID>(layer_from_router(layer)); }
+    int GetPNSLayerFromBoardLayer(PCB_LAYER_ID layer) const override { return layer_to_router(static_cast<int>(layer)); }
 
     int64_t get_override_routing_offset() const
     {
@@ -127,7 +151,7 @@ public:
     }
 
 private:
-    const PNS_HORIZON_PARENT_ITEM *get_or_create_parent(const PNS_HORIZON_PARENT_ITEM &it);
+    PNS_HORIZON_PARENT_ITEM *get_or_create_parent(const PNS_HORIZON_PARENT_ITEM &it);
 
     class PNS_HORIZON_RULE_RESOLVER *m_ruleResolver = nullptr;
     std::set<horizon::ObjectRef> m_preview_items;

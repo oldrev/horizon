@@ -2,6 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2020 CERN
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software; you can redistribute it and/or
@@ -67,7 +68,7 @@ public:
     {
     }
 
-    void Rotate( double aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override
+    void Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override
     {
     }
 
@@ -75,6 +76,9 @@ public:
     {
         return false;
     }
+
+    void TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aError,
+                             ERROR_LOC aErrorLoc ) const override {}
 };
 
 #endif

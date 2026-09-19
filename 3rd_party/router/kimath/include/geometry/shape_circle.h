@@ -3,7 +3,7 @@
  *
  * Copyright (C) 2013 CERN
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
- * Copyright (C) 2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -30,6 +30,7 @@
 #include <geometry/circle.h>
 #include <math/box2.h>
 #include <math/vector2d.h>
+#include <trigo.h>
 
 #include <algorithm>
 
@@ -83,7 +84,17 @@ public:
         if( dist_sq == 0 || dist_sq < SEG::Square( minDist ) )
         {
             if( aLocation )
-                *aLocation = pn;
+            {
+                if( std::vector<VECTOR2I> pts = m_circle.Intersect( aSeg );
+                    !pts.empty() && dist_sq == 0 )
+                {
+                    *aLocation = m_circle.Intersect( aSeg )[0];
+                }
+                else
+                {
+                    *aLocation = pn;
+                }
+            }
 
             if( aActual )
                 *aActual = std::max( 0, (int) sqrt( dist_sq ) - m_circle.Radius );
@@ -124,17 +135,20 @@ public:
         m_circle.Center += aVector;
     }
 
-    void Rotate( double aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override
+    void Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override
     {
-        m_circle.Center -= aCenter;
-        m_circle.Center = m_circle.Center.Rotate( aAngle );
-        m_circle.Center += aCenter;
+        RotatePoint( m_circle.Center, aCenter, aAngle );
     }
 
     bool IsSolid() const override
     {
         return true;
     }
+
+    virtual const std::string Format( bool aCplusPlus = true ) const override;
+
+    void TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aError,
+                             ERROR_LOC aErrorLoc ) const override;
 
 private:
     CIRCLE m_circle;

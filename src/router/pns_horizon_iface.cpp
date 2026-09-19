@@ -97,15 +97,17 @@ public:
                               PNS_HORIZON_IFACE *aIface);
     virtual ~PNS_HORIZON_RULE_RESOLVER();
 
-    int Clearance(const PNS::ITEM *aA, const PNS::ITEM *aB) override;
-    int HoleClearance(const PNS::ITEM *aA, const PNS::ITEM *aB) override;
-    int HoleToHoleClearance(const PNS::ITEM *aA, const PNS::ITEM *aB) override;
-    int DpCoupledNet(int aNet) override;
-    int DpNetPolarity(int aNet) override;
-    bool DpNetPair(const PNS::ITEM *aItem, int &aNetP, int &aNetN) override;
-    wxString NetName(int aNet) override;
-
-    bool IsDiffPair(const PNS::ITEM *aA, const PNS::ITEM *aB) override;
+    int Clearance(const PNS::ITEM *aA, const PNS::ITEM *aB, bool = true) override;
+    NET_HANDLE DpCoupledNet(NET_HANDLE aNet) override;
+    int DpNetPolarity(NET_HANDLE aNet) override;
+    bool DpNetPair(const PNS::ITEM *aItem, NET_HANDLE &aNetP, NET_HANDLE &aNetN) override;
+    int NetCode(NET_HANDLE aNet) override { return m_iface->GetNetCode(aNet); }
+    wxString NetName(NET_HANDLE aNet) override;
+    bool IsInNetTie(const ITEM *) override { return false; }
+    bool IsNetTieExclusion(const ITEM *, const VECTOR2I &, const ITEM *) override { return false; }
+    bool IsDrilledHole(const ITEM *aItem) override;
+    bool IsNonPlatedSlot(const ITEM *aItem) override;
+    bool IsKeepout(const ITEM *aObstacle, const ITEM *, bool *aEnforce) override;
 
     bool QueryConstraint(CONSTRAINT_TYPE aType, const PNS::ITEM *aItemA, const PNS::ITEM *aItemB, int aLayer,
                          PNS::CONSTRAINT *aConstraint) override;
@@ -138,9 +140,12 @@ static horizon::PatchType patch_type_from_kind(PNS::ITEM::PnsKind kind)
         return horizon::PatchType::VIA;
     case PNS::ITEM::SOLID_T:
         return horizon::PatchType::PAD;
+    case PNS::ITEM::HOLE_T:
+        return horizon::PatchType::HOLE_PTH;
     case PNS::ITEM::LINE_T:
     case PNS::ITEM::SEGMENT_T:
     case PNS::ITEM::ARC_T:
+    case PNS::ITEM::DIFF_PAIR_T:
         return horizon::PatchType::TRACK;
     default:;
     }
@@ -148,9 +153,9 @@ static horizon::PatchType patch_type_from_kind(PNS::ITEM::PnsKind kind)
     return horizon::PatchType::OTHER;
 }
 
-static const PNS_HORIZON_PARENT_ITEM parent_dummy_outline;
+static PNS_HORIZON_PARENT_ITEM parent_dummy_outline;
 
-int PNS_HORIZON_RULE_RESOLVER::Clearance(const PNS::ITEM *aA, const PNS::ITEM *aB)
+int PNS_HORIZON_RULE_RESOLVER::Clearance(const PNS::ITEM *aA, const PNS::ITEM *aB, bool)
 {
     if (aB == nullptr)
         return 1e6;
@@ -161,8 +166,8 @@ int PNS_HORIZON_RULE_RESOLVER::Clearance(const PNS::ITEM *aA, const PNS::ITEM *a
     auto pt_a = patch_type_from_kind(aA->Kind());
     auto pt_b = patch_type_from_kind(aB->Kind());
 
-    auto parent_a = aA->Parent();
-    auto parent_b = aB->Parent();
+    auto parent_a = static_cast<PNS_HORIZON_PARENT_ITEM *>(aA->Parent());
+    auto parent_b = static_cast<PNS_HORIZON_PARENT_ITEM *>(aB->Parent());
 
     auto layers_a = aA->Layers();
     auto layers_b = aB->Layers();
@@ -269,28 +274,25 @@ int PNS_HORIZON_RULE_RESOLVER::Clearance(const PNS::ITEM *aA, const PNS::ITEM *a
     return clearance.get_clearance(pt_a, pt_b) + routing_offset;
 }
 
-int PNS_HORIZON_RULE_RESOLVER::HoleClearance(const PNS::ITEM *aA, const PNS::ITEM *aB)
+bool PNS_HORIZON_RULE_RESOLVER::IsDrilledHole(const PNS::ITEM *aItem)
 {
-    return 0;
-    if (!(aA && aB))
-        return 0;
-    // std::cout << "HoleClearance " << aA->KindStr() << " " << aB->KindStr() << std::endl;
-    // throw std::runtime_error("HoleClearance not implemented");
-    return 0;
+    const auto parent = aItem ? static_cast<PNS_HORIZON_PARENT_ITEM *>(aItem->Parent()) : nullptr;
+    return parent && (parent->hole || parent->via);
 }
 
-int PNS_HORIZON_RULE_RESOLVER::HoleToHoleClearance(const PNS::ITEM *aA, const PNS::ITEM *aB)
+bool PNS_HORIZON_RULE_RESOLVER::IsNonPlatedSlot(const PNS::ITEM *aItem)
 {
-    // throw std::runtime_error("HoleToHoleClearance not implemented");
-    // good enough for now
-    return 0;
+    const auto parent = aItem ? static_cast<PNS_HORIZON_PARENT_ITEM *>(aItem->Parent()) : nullptr;
+    return parent && parent->hole && parent->hole->padstack.type == horizon::Padstack::Type::MECHANICAL;
 }
 
-bool PNS_HORIZON_RULE_RESOLVER::IsDiffPair(const PNS::ITEM *aA, const PNS::ITEM *aB)
+bool PNS_HORIZON_RULE_RESOLVER::IsKeepout(const ITEM *aObstacle, const ITEM *, bool *aEnforce)
 {
-    // not used anywhere
-    throw std::runtime_error("IsDiffPair not implemented");
-    return false;
+    const auto parent = aObstacle ? static_cast<PNS_HORIZON_PARENT_ITEM *>(aObstacle->Parent()) : nullptr;
+    const bool result = parent && parent->keepout;
+    if (aEnforce)
+        *aEnforce = result;
+    return result;
 }
 
 bool PNS_HORIZON_RULE_RESOLVER::QueryConstraint(CONSTRAINT_TYPE aType, const PNS::ITEM *aItemA, const PNS::ITEM *aItemB,
@@ -305,16 +307,16 @@ bool PNS_HORIZON_RULE_RESOLVER::QueryConstraint(CONSTRAINT_TYPE aType, const PNS
     return false;
 }
 
-int PNS_HORIZON_RULE_RESOLVER::DpCoupledNet(int aNet)
+NET_HANDLE PNS_HORIZON_RULE_RESOLVER::DpCoupledNet(NET_HANDLE aNet)
 {
     auto net = m_iface->get_net_for_code(aNet);
     if (net->diffpair) {
         return m_iface->get_net_code(net->diffpair->uuid);
     }
-    return -1;
+    return nullptr;
 }
 
-int PNS_HORIZON_RULE_RESOLVER::DpNetPolarity(int aNet)
+int PNS_HORIZON_RULE_RESOLVER::DpNetPolarity(NET_HANDLE aNet)
 {
     if (m_iface->get_net_for_code(aNet)->diffpair_primary)
         return 1;
@@ -322,7 +324,7 @@ int PNS_HORIZON_RULE_RESOLVER::DpNetPolarity(int aNet)
         return -1;
 }
 
-bool PNS_HORIZON_RULE_RESOLVER::DpNetPair(const PNS::ITEM *aItem, int &aNetP, int &aNetN)
+bool PNS_HORIZON_RULE_RESOLVER::DpNetPair(const PNS::ITEM *aItem, NET_HANDLE &aNetP, NET_HANDLE &aNetN)
 {
     if (!aItem)
         return false;
@@ -341,7 +343,7 @@ bool PNS_HORIZON_RULE_RESOLVER::DpNetPair(const PNS::ITEM *aItem, int &aNetP, in
     return false;
 }
 
-wxString PNS_HORIZON_RULE_RESOLVER::NetName(int aNet)
+wxString PNS_HORIZON_RULE_RESOLVER::NetName(NET_HANDLE aNet)
 {
     auto net = m_iface->get_net_for_code(aNet);
     if (net)
@@ -374,23 +376,23 @@ void PNS_HORIZON_IFACE::SetPool(horizon::IPool *p)
     pool = p;
 }
 
-int PNS_HORIZON_IFACE::get_net_code(const horizon::UUID &uu)
+NET_HANDLE PNS_HORIZON_IFACE::get_net_code(const horizon::UUID &uu)
 {
+    int code;
     if (net_code_map.count(uu)) {
-        return net_code_map.at(uu);
+        code = net_code_map.at(uu);
     }
     else {
         net_code_map_r.emplace_back(&board->block->nets.at(uu));
-        auto nc = net_code_map_r.size() - 1;
-        net_code_map.emplace(uu, nc);
-        return nc;
+        code = static_cast<int>(net_code_map_r.size() - 1);
+        net_code_map.emplace(uu, code);
     }
+    return reinterpret_cast<NET_HANDLE>(static_cast<intptr_t>(code + 1));
 }
 
-horizon::Net *PNS_HORIZON_IFACE::get_net_for_code(int code)
+horizon::Net *PNS_HORIZON_IFACE::get_net_for_code(NET_HANDLE handle) const
 {
-    if (code == PNS::ITEM::UnusedNet)
-        return nullptr;
+    const auto code = static_cast<int>(reinterpret_cast<intptr_t>(handle)) - 1;
     if (code < 0)
         return nullptr;
     if (code >= (int)net_code_map_r.size())
@@ -420,33 +422,33 @@ int PNS_HORIZON_IFACE::get_via_definition_code(const horizon::UUID &uu)
     }
 }
 
-const PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::Track *track)
+PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::Track *track)
 {
     return get_or_create_parent(PNS_HORIZON_PARENT_ITEM(track));
 }
 
-const PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::BoardHole *hole)
+PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::BoardHole *hole)
 {
     return get_or_create_parent(PNS_HORIZON_PARENT_ITEM(hole));
 }
 
-const PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::Via *via)
+PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::Via *via)
 {
     return get_or_create_parent(PNS_HORIZON_PARENT_ITEM(via));
 }
 
-const PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::BoardPackage *pkg, const horizon::Pad *pad)
+PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::BoardPackage *pkg, const horizon::Pad *pad)
 {
     return get_or_create_parent(PNS_HORIZON_PARENT_ITEM(pkg, pad));
 }
 
-const PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::Keepout *k,
+PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_parent(const horizon::Keepout *k,
                                                              const horizon::BoardPackage *pkg)
 {
     return get_or_create_parent(PNS_HORIZON_PARENT_ITEM(k, pkg));
 }
 
-const PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_or_create_parent(const PNS_HORIZON_PARENT_ITEM &it)
+PNS_HORIZON_PARENT_ITEM *PNS_HORIZON_IFACE::get_or_create_parent(const PNS_HORIZON_PARENT_ITEM &it)
 {
     auto r = std::find(parents.begin(), parents.end(), it);
     if (r != parents.end())
@@ -460,7 +462,7 @@ std::unique_ptr<PNS::SEGMENT> PNS_HORIZON_IFACE::syncTrack(const horizon::Track 
 {
     auto from = track->from.get_position();
     auto to = track->to.get_position();
-    int net = PNS::ITEM::UnusedNet;
+    NET_HANDLE net = nullptr;
     if (track->net)
         net = get_net_code(track->net->uuid);
     std::unique_ptr<PNS::SEGMENT> segment(new PNS::SEGMENT(SEG(from.x, from.y, to.x, to.y), net));
@@ -479,7 +481,7 @@ std::unique_ptr<PNS::ARC> PNS_HORIZON_IFACE::syncTrackArc(const horizon::Track *
 {
     auto from = track->from.get_position();
     auto to = track->to.get_position();
-    int net = PNS::ITEM::UnusedNet;
+    NET_HANDLE net = nullptr;
     if (track->net)
         net = get_net_code(track->net->uuid);
     SHAPE_ARC sarc;
@@ -510,7 +512,7 @@ void PNS_HORIZON_IFACE::syncOutline(const horizon::Polygon *ipoly, PNS::NODE *aW
         }
         for (const auto layer : layers) {
             std::unique_ptr<PNS::SEGMENT> segment(
-                    new PNS::SEGMENT(SEG(from.x, from.y, to.x, to.y), PNS::ITEM::UnusedNet));
+                    new PNS::SEGMENT(SEG(from.x, from.y, to.x, to.y), nullptr));
             segment->SetWidth(10); // very small
             segment->SetLayers(layer_to_router(layer));
             segment->SetParent(&parent_dummy_outline);
@@ -546,7 +548,7 @@ void PNS_HORIZON_IFACE::syncKeepout(const horizon::KeepoutContour *keepout_conto
             auto to = contour[(i + 1) % contour.size()];
 
             std::unique_ptr<PNS::SEGMENT> segment(
-                    new PNS::SEGMENT(SEG(from.X, from.Y, to.X, to.Y), PNS::ITEM::UnusedNet));
+                    new PNS::SEGMENT(SEG(from.X, from.Y, to.X, to.Y), nullptr));
             segment->SetWidth(10); // very small
             segment->SetLayers(layer_to_router(layer));
             segment->SetParent(get_parent(keepout_contour->keepout, keepout_contour->pkg));
@@ -629,7 +631,7 @@ std::unique_ptr<PNS::SOLID> PNS_HORIZON_IFACE::syncPadstack(const horizon::Padst
                 if (shape.form == horizon::Shape::Form::CIRCLE) {
                     std::unique_ptr<PNS::SOLID> solid(new PNS::SOLID);
 
-                    solid->SetLayers(LAYER_RANGE(layer_to_router(shape.layer)));
+                    solid->SetLayers(PNS_LAYER_RANGE(layer_to_router(shape.layer)));
 
                     solid->SetOffset(VECTOR2I(0, 0));
                     solid->SetPos(VECTOR2I(tr.shift.x, tr.shift.y));
@@ -643,7 +645,7 @@ std::unique_ptr<PNS::SOLID> PNS_HORIZON_IFACE::syncPadstack(const horizon::Padst
                 else if (shape.form == horizon::Shape::Form::RECTANGLE && angle_is_rect(angle)) {
                     std::unique_ptr<PNS::SOLID> solid(new PNS::SOLID);
 
-                    solid->SetLayers(LAYER_RANGE(layer_to_router(shape.layer)));
+                    solid->SetLayers(PNS_LAYER_RANGE(layer_to_router(shape.layer)));
 
                     solid->SetOffset(VECTOR2I(0, 0));
                     const auto c = VECTOR2I(tr.shift.x, tr.shift.y);
@@ -719,7 +721,7 @@ std::unique_ptr<PNS::SOLID> PNS_HORIZON_IFACE::syncPadstack(const horizon::Padst
 
     std::unique_ptr<PNS::SOLID> solid(new PNS::SOLID);
 
-    solid->SetLayers(LAYER_RANGE(layer_to_router(layer_max), layer_to_router(layer_min)));
+    solid->SetLayers(PNS_LAYER_RANGE(layer_to_router(layer_max), layer_to_router(layer_min)));
 
     solid->SetOffset(VECTOR2I(0, 0));
     solid->SetPos(VECTOR2I(tr.shift.x, tr.shift.y));
@@ -737,15 +739,15 @@ std::unique_ptr<PNS::SOLID> PNS_HORIZON_IFACE::syncPadstack(const horizon::Padst
 std::unique_ptr<PNS::VIA> PNS_HORIZON_IFACE::syncVia(const horizon::Via *via)
 {
     auto pos = via->junction->position;
-    int net = PNS::ITEM::UnusedNet;
+    NET_HANDLE net = nullptr;
     const auto &span = via->span;
     if (via->junction->net)
         net = get_net_code(via->junction->net->uuid);
     std::unique_ptr<PNS::VIA> pvia(new PNS::VIA(
-            VECTOR2I(pos.x, pos.y), LAYER_RANGE(layer_to_router(span.start()), layer_to_router(span.end())),
+            VECTOR2I(pos.x, pos.y), PNS_LAYER_RANGE(layer_to_router(span.start()), layer_to_router(span.end())),
             via->parameter_set.at(horizon::ParameterID::VIA_DIAMETER),
             via->parameter_set.at(horizon::ParameterID::HOLE_DIAMETER), net,
-            span == horizon::BoardLayers::layer_range_through ? VIATYPE::THROUGH : VIATYPE::BLIND_BURIED));
+            span == horizon::BoardLayers::layer_range_through ? VIATYPE::THROUGH : VIATYPE::BLIND));
 
     // via->SetParent( aVia );
     pvia->SetParent(get_parent(via));
@@ -837,7 +839,7 @@ void PNS_HORIZON_IFACE::EraseView()
     m_preview_items.clear();
 }
 
-void PNS_HORIZON_IFACE::DisplayItem(const PNS::ITEM *aItem, int aClearance, bool aEdit)
+void PNS_HORIZON_IFACE::DisplayItem(const PNS::ITEM *aItem, int aClearance, bool aEdit, int)
 {
     if (aItem->IsVirtual())
         return;
@@ -875,7 +877,7 @@ void PNS_HORIZON_IFACE::DisplayItem(const PNS::ITEM *aItem, int aClearance, bool
         auto layers = board->get_layers_for_range(
                 {layer_from_router(via_layers.Start()), layer_from_router(via_layers.End())});
         for (const auto la : layers) {
-            m_preview_items.insert(canvas->add_line(pts, via_item->Diameter(), horizon::ColorP::LAYER_HIGHLIGHT, la));
+            m_preview_items.insert(canvas->add_line(pts, via_item->Diameter(via_item->Layers().Start()), horizon::ColorP::LAYER_HIGHLIGHT, la));
         }
     }
     else if (aItem->Kind() == PNS::ITEM::ARC_T) {
@@ -904,7 +906,7 @@ void PNS_HORIZON_IFACE::DisplayItem(const PNS::ITEM *aItem, int aClearance, bool
 
 void PNS_HORIZON_IFACE::HideItem(PNS::ITEM *aItem)
 {
-    auto parent = aItem->Parent();
+    auto parent = static_cast<PNS_HORIZON_PARENT_ITEM *>(aItem->Parent());
     if (parent) {
         if (parent->track) {
             horizon::ObjectRef ref(horizon::ObjectType::TRACK, parent->track->uuid);
@@ -920,15 +922,19 @@ void PNS_HORIZON_IFACE::HideItem(PNS::ITEM *aItem)
 void PNS_HORIZON_IFACE::RemoveItem(PNS::ITEM *aItem)
 {
 
-    auto parent = aItem->Parent();
+    auto parent = static_cast<PNS_HORIZON_PARENT_ITEM *>(aItem->Parent());
     // std::cout << "!!!iface remove item " << parent << " " << aItem->KindStr() << std::endl;
     if (parent) {
         if (parent->track) {
+            const auto track_uuid = parent->track->uuid;
             for (auto &it_ft : {parent->track->from, parent->track->to}) {
-                if (it_ft.junc)
+                if (it_ft.junc) {
+                    auto &connected = it_ft.junc->connected_tracks;
+                    connected.erase(std::remove(connected.begin(), connected.end(), track_uuid), connected.end());
                     junctions_maybe_erased.insert(it_ft.junc);
+                }
             }
-            board->tracks.erase(parent->track->uuid);
+            board->tracks.erase(track_uuid);
         }
         else if (parent->via) {
             board->vias.erase(parent->via->uuid);
@@ -1051,7 +1057,7 @@ void PNS_HORIZON_IFACE::AddItem(PNS::ITEM *aItem)
         auto uu = horizon::UUID::random();
         auto net = get_net_for_code(pvia->Net());
         const horizon::ViaDefinition *vdef = nullptr;
-        if (auto def_uu = get_via_definition_for_code(pvia->Definition())) {
+        if (auto def_uu = get_via_definition_for_code(m_router->Sizes().ViaDefinition())) {
             vdef = &rules->get_rule_t<horizon::RuleViaDefinitions>().via_definitions.at(def_uu);
         }
         horizon::UUID padstack_uuid;
@@ -1132,6 +1138,9 @@ void PNS_HORIZON_IFACE::Commit()
 {
     board->update_junction_connections();
     for (auto ju : junctions_maybe_erased) {
+        auto it = board->junctions.find(ju->uuid);
+        if (it == board->junctions.end() || &it->second != ju)
+            continue;
         if (!(ju->connected_arcs.size() || ju->connected_lines.size() || ju->connected_vias.size()
               || ju->connected_tracks.size())) {
             for (auto &it : ju->connected_connection_lines)
@@ -1146,7 +1155,7 @@ void PNS_HORIZON_IFACE::Commit()
     EraseView();
 }
 
-void PNS_HORIZON_IFACE::UpdateNet(int aNetCode)
+void PNS_HORIZON_IFACE::UpdateNet(NET_HANDLE aNetCode)
 {
     if (const auto net = get_net_for_code(aNetCode)) {
         board->update_airwires(false, {net->uuid});
@@ -1174,15 +1183,13 @@ void PNS_HORIZON_IFACE::SetRouter(PNS::ROUTER *aRouter)
     m_router = aRouter;
 }
 
-bool PNS_HORIZON_IFACE::IsAnyLayerVisible(const LAYER_RANGE &aLayer) const
+bool PNS_HORIZON_IFACE::IsAnyLayerVisible(const PNS_LAYER_RANGE &aLayer) const
 {
-    throw std::runtime_error("IsAnyLayerVisible not implemented");
     return true;
 }
 
 bool PNS_HORIZON_IFACE::IsItemVisible(const PNS::ITEM *aItem) const
 {
-    throw std::runtime_error("IsItemVisible not implemented");
     return true;
 }
 
@@ -1192,7 +1199,7 @@ void PNS_HORIZON_IFACE::UpdateItem(ITEM *aItem)
     switch (aItem->Kind()) {
     case PNS::ITEM::VIA_T: {
         PNS::VIA *pvia = static_cast<PNS::VIA *>(aItem);
-        auto via = aItem->Parent()->via;
+        auto via = static_cast<PNS_HORIZON_PARENT_ITEM *>(aItem->Parent())->via;
         assert(via);
         via->junction->position.x = pvia->Pos().x;
         via->junction->position.y = pvia->Pos().y;
@@ -1227,7 +1234,28 @@ bool PNS_HORIZON_IFACE::IsFlashedOnLayer(const PNS::ITEM *aItem, int aLayer) con
     return true;
 }
 
-bool PNS_HORIZON_IFACE::ImportSizes(SIZES_SETTINGS &aSizes, ITEM *aStartItem, int aNet)
+bool PNS_HORIZON_IFACE::IsFlashedOnLayer(const PNS::ITEM *aItem, const PNS_LAYER_RANGE &aLayer) const
+{
+    return true;
+}
+
+bool PNS_HORIZON_IFACE::IsPNSCopperLayer(int aLayer) const
+{
+    return aLayer >= 0 && aLayer < 32;
+}
+
+int PNS_HORIZON_IFACE::GetNetCode(NET_HANDLE aNet) const
+{
+    return static_cast<int>(reinterpret_cast<intptr_t>(aNet)) - 1;
+}
+
+wxString PNS_HORIZON_IFACE::GetNetName(NET_HANDLE aNet) const
+{
+    const auto net = get_net_for_code(aNet);
+    return net ? net->name : "";
+}
+
+bool PNS_HORIZON_IFACE::ImportSizes(SIZES_SETTINGS &aSizes, ITEM *aStartItem, NET_HANDLE aNet, VECTOR2D)
 {
     return true;
 }
@@ -1237,7 +1265,7 @@ int PNS_HORIZON_IFACE::StackupHeight(int aFirstLayer, int aSecondLayer) const
     return 0;
 }
 
-void PNS_HORIZON_IFACE::DisplayRatline(const SHAPE_LINE_CHAIN &aRatline, int aColor)
+void PNS_HORIZON_IFACE::DisplayRatline(const SHAPE_LINE_CHAIN &aRatline, NET_HANDLE)
 {
     auto npts = aRatline.PointCount();
     std::deque<horizon::Coordi> pts;

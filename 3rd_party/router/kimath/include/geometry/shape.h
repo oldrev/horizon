@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2013 CERN
- * Copyright (C) 2021-2022 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software; you can redistribute it and/or
@@ -29,10 +29,14 @@
 #include <sstream>
 #include <vector>
 #include <geometry/seg.h>
+#include <geometry/eda_angle.h>
+#include <geometry/approximation.h>
 #include <math/vector2d.h>
 #include <math/box2.h>
+#include <wx/string.h>
 
 class SHAPE_LINE_CHAIN;
+class SHAPE_POLY_SET;
 
 /**
  * Lists all supported shapes.
@@ -108,7 +112,7 @@ public:
 
     virtual size_t GetIndexableSubshapeCount() const { return 0; }
 
-    virtual void GetIndexableSubshapes( std::vector<SHAPE*>& aSubshapes ) { }
+    virtual void GetIndexableSubshapes( std::vector<const SHAPE*>& aSubshapes ) const { }
 
 protected:
     ///< type of our shape
@@ -148,6 +152,13 @@ public:
     };
 
     /**
+     * Return the actual minimum distance between two shapes
+     *
+     * @retval distance in IU
+     */
+    int GetClearance( const SHAPE* aOther ) const;
+
+    /**
      * Return true if the shape is a null shape.
      *
      * @retval true if null :-)
@@ -179,7 +190,7 @@ public:
      *
      * @param aShape shape to check collision against
      * @param aClearance minimum clearance
-     * @param aMTV minimum translation vector
+     * @param aMTV [out] minimum translation vector
      * @param aActual [out] an optional pointer to an int to store the actual distance in the
      *                event of a collision.
      * @param aLocation [out] an option pointer to a point to store a nearby location in the
@@ -224,10 +235,59 @@ public:
     }
 
     /**
-     * @param aCenter is the rotation center.
-     * @param aAngle rotation angle in radians.
+     * Returns the minimum distance from a given point to this shape.
+     * Always returns zero if the point is inside a closed shape and aOutlineOnly is false.
+     *
+     * @param aP is the point to test
+     * @return the distance from the shape to aP
      */
-    virtual void Rotate( double aAngle, const VECTOR2I& aCenter = { 0, 0 } ) = 0;
+    virtual int Distance( const VECTOR2I& aP ) const;
+
+    /**
+     * @see SHAPE::Distance
+     */
+    virtual SEG::ecoord SquaredDistance( const VECTOR2I& aP, bool aOutlineOnly = false ) const;
+
+    /**
+     * Return the two points that mark the closest distance between this shape and \a aOther.
+     * If the shapes are overlapping, the points will be the same.
+     *
+     * @param aOther the other shape to compare with
+     * @param aPtThis [out] the point on this shape closest to \a aOther
+     * @param aPtOther [out] the point on \a aOther closest to this shape
+     * @return true if the points were found
+     */
+    bool NearestPoints( const SHAPE* aOther, VECTOR2I& aPtThis, VECTOR2I& aPtOther ) const;
+
+    /**
+     * Check if point \a aP lies inside a closed shape.  Always returns false if this shape is not closed.
+     *
+     * @param aPt point to check
+     * @param aUseBBoxCache gives better performance if the bounding box caches have been
+     *                      generated.
+     * @return true if the point is inside the shape (edge is not treated as being inside).
+     */
+    virtual bool PointInside( const VECTOR2I& aPt, int aAccuracy = 0, bool aUseBBoxCache = false ) const;
+
+    /**
+     * Fills a SHAPE_POLY_SET with a polygon representation of this shape.
+     * @param aBuffer [out] will be filled with the polygonal representation of this shape.
+     * @param aError controls the maximum allowed deviation when converting rounded shapes to segments
+     * @param aErrorLoc controls where the error is placed when approximating rounded shapes
+     */
+    virtual void TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aError, ERROR_LOC aErrorLoc ) const = 0;
+
+    /**
+     * @param aCenter is the rotation center.
+     * @param aAngle rotation angle.
+     */
+    virtual void Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter = { 0, 0 } ) = 0;
+
+    virtual VECTOR2I GetStart() const { return {}; }
+    virtual VECTOR2I GetEnd() const { return {}; }
+
+    virtual int GetWidth() const { return 0; }
+    virtual void SetWidth( int aWidth ) {}
 
     virtual void Move( const VECTOR2I& aVector ) = 0;
 
@@ -235,7 +295,7 @@ public:
 
     virtual bool Parse( std::stringstream& aStream );
 
-    virtual const std::string Format( ) const;
+    virtual const std::string Format( bool aCplusPlus = true ) const;
 
 protected:
     typedef VECTOR2I::extended_type ecoord;
@@ -279,18 +339,9 @@ public:
     virtual bool Collide( const SEG& aSeg, int aClearance = 0, int* aActual = nullptr,
                           VECTOR2I* aLocation = nullptr ) const override;
 
-    SEG::ecoord SquaredDistance( const VECTOR2I& aP, bool aOutlineOnly = false ) const;
+    SEG::ecoord SquaredDistance( const VECTOR2I& aP, bool aOutlineOnly = false ) const override;
 
-    /**
-     * Check if point \a aP lies inside a polygon (any type) defined by the line chain.
-     * For closed shapes only.
-     *
-     * @param aPt point to check
-     * @param aUseBBoxCache gives better performance if the bounding box caches have been
-     *                      generated.
-     * @return true if the point is inside the shape (edge is not treated as being inside).
-     */
-    bool PointInside( const VECTOR2I& aPt, int aAccuracy = 0, bool aUseBBoxCache = false ) const;
+    bool PointInside( const VECTOR2I& aPt, int aAccuracy = 0, bool aUseBBoxCache = false ) const override;
 
     /**
      * Check if point \a aP lies on an edge or vertex of the line chain.
@@ -315,6 +366,10 @@ public:
     virtual bool IsClosed() const = 0;
 
     virtual BOX2I* GetCachedBBox() const { return nullptr; }
+
+    void TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aError,
+                             ERROR_LOC aErrorLoc ) const override
+    {}
 };
 
 #endif // __SHAPE_H

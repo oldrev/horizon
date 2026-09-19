@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2020 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -23,13 +23,11 @@
 
 #include <geometry/shape.h>
 #include <geometry/shape_line_chain.h>
-#include <geometry/shape_rect.h>
 #include <geometry/shape_circle.h>
-#include <geometry/shape_simple.h>
 #include <geometry/shape_compound.h>
 #include <geometry/shape_poly_set.h>
 
-#include "wx_compat.h"
+#include <wx/log.h>
 
 #include "pns_router.h"
 #include "pns_solid.h"
@@ -37,68 +35,9 @@
 
 namespace PNS {
 
-static const SHAPE_LINE_CHAIN buildHullForPrimitiveShape( const SHAPE* aShape, int aClearance,
-                                                          int aWalkaroundThickness )
-{
-    int cl = aClearance + ( aWalkaroundThickness + 1 )/ 2;
-
-    switch( aShape->Type() )
-    {
-    case SH_RECT:
-    {
-        const SHAPE_RECT* rect = static_cast<const SHAPE_RECT*>( aShape );
-        return OctagonalHull( rect->GetPosition(),
-                              rect->GetSize(),
-                              cl + 1,
-                              0 );
-    }
-
-    case SH_CIRCLE:
-    {
-        const SHAPE_CIRCLE* circle = static_cast<const SHAPE_CIRCLE*>( aShape );
-        int r = circle->GetRadius();
-        return OctagonalHull( circle->GetCenter() - VECTOR2I( r, r ),
-                              VECTOR2I( 2 * r, 2 * r ),
-                              cl + 1,
-                              2.0 * ( 1.0 - M_SQRT1_2 ) * ( r + cl ) );
-    }
-
-    case SH_SEGMENT:
-    {
-        const SHAPE_SEGMENT* seg = static_cast<const SHAPE_SEGMENT*>( aShape );
-        return SegmentHull( *seg, aClearance, aWalkaroundThickness );
-    }
-
-    case SH_ARC:
-    {
-        const SHAPE_ARC* arc = static_cast<const SHAPE_ARC*>( aShape );
-        return ArcHull( *arc, aClearance, aWalkaroundThickness );
-    }
-
-    case SH_SIMPLE:
-    {
-        const SHAPE_SIMPLE* convex = static_cast<const SHAPE_SIMPLE*>( aShape );
-
-        return ConvexHull( *convex, cl );
-    }
-    default:
-    {
-        wxFAIL_MSG( wxString::Format( wxT( "Unsupported hull shape: %d (%s)." ),
-                                      aShape->Type(),
-                                      SHAPE_TYPE_asString( aShape->Type() ) ) );
-        break;
-    }
-    }
-
-    return SHAPE_LINE_CHAIN();
-}
-
 
 const SHAPE_LINE_CHAIN SOLID::Hull( int aClearance, int aWalkaroundThickness, int aLayer ) const
 {
-    if( !ROUTER::GetInstance()->GetInterface()->IsFlashedOnLayer( this, aLayer ) )
-        return HoleHull( aClearance, aWalkaroundThickness, aLayer );
-
     if( !m_shape )
         return SHAPE_LINE_CHAIN();
 
@@ -108,7 +47,7 @@ const SHAPE_LINE_CHAIN SOLID::Hull( int aClearance, int aWalkaroundThickness, in
 
         if ( cmpnd->Shapes().size() == 1 )
         {
-            return buildHullForPrimitiveShape( cmpnd->Shapes()[0], aClearance,
+            return BuildHullForPrimitiveShape( cmpnd->Shapes()[0], aClearance,
                                                aWalkaroundThickness );
         }
         else
@@ -117,52 +56,17 @@ const SHAPE_LINE_CHAIN SOLID::Hull( int aClearance, int aWalkaroundThickness, in
 
             for( SHAPE* shape : cmpnd->Shapes() )
             {
-                hullSet.AddOutline( buildHullForPrimitiveShape( shape, aClearance,
+                hullSet.AddOutline( BuildHullForPrimitiveShape( shape, aClearance,
                                                                 aWalkaroundThickness ) );
             }
 
-            hullSet.Simplify( SHAPE_POLY_SET::PM_STRICTLY_SIMPLE );
+            hullSet.Simplify();
             return hullSet.Outline( 0 );
         }
     }
     else
     {
-        return buildHullForPrimitiveShape( m_shape, aClearance, aWalkaroundThickness );
-    }
-}
-
-
-const SHAPE_LINE_CHAIN SOLID::HoleHull( int aClearance, int aWalkaroundThickness, int aLayer ) const
-{
-    if( !m_hole )
-        return SHAPE_LINE_CHAIN();
-
-    if( m_hole->Type() == SH_COMPOUND )
-    {
-        SHAPE_COMPOUND* cmpnd = static_cast<SHAPE_COMPOUND*>( m_hole );
-
-        if ( cmpnd->Shapes().size() == 1 )
-        {
-            return buildHullForPrimitiveShape( cmpnd->Shapes()[0], aClearance,
-                                               aWalkaroundThickness );
-        }
-        else
-        {
-            SHAPE_POLY_SET hullSet;
-
-            for( SHAPE* shape : cmpnd->Shapes() )
-            {
-                hullSet.AddOutline( buildHullForPrimitiveShape( shape, aClearance,
-                                                                aWalkaroundThickness ) );
-            }
-
-            hullSet.Simplify( SHAPE_POLY_SET::PM_STRICTLY_SIMPLE );
-            return hullSet.Outline( 0 );
-        }
-    }
-    else
-    {
-        return buildHullForPrimitiveShape( m_hole, aClearance, aWalkaroundThickness );
+        return BuildHullForPrimitiveShape( m_shape, aClearance, aWalkaroundThickness );
     }
 }
 
@@ -172,6 +76,7 @@ ITEM* SOLID::Clone() const
     ITEM* solid = new SOLID( *this );
     return solid;
 }
+
 
 void SOLID::SetPos( const VECTOR2I& aCenter )
 {
@@ -184,6 +89,17 @@ void SOLID::SetPos( const VECTOR2I& aCenter )
         m_hole->Move( delta );
 
     m_pos = aCenter;
+}
+
+
+VECTOR2I SOLID::Anchor( int aN ) const
+{
+    return m_anchorPoints.empty() ? m_pos : m_anchorPoints[aN];
+}
+
+ int SOLID::AnchorCount() const
+{
+    return m_anchorPoints.empty() ? 1 : m_anchorPoints.size();
 }
 
 

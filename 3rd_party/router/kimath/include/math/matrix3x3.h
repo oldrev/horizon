@@ -2,7 +2,7 @@
  * This program source code file is part of KICAD, a free EDA CAD application.
  *
  * Copyright (C) 2012 Torsten Hueter, torstenhtr <at> gmx.de
- * Copyright (C) 2012-2021 Kicad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * Matrix class (3x3)
  *
@@ -28,6 +28,7 @@
 #define MATRIX3X3_H_
 
 #include <math/vector2d.h>
+#include <math/vector3.h>
 
 /**
  * MATRIX3x3 describes a general 3x3 matrix.
@@ -67,6 +68,11 @@ public:
      * Initialize all matrix members to zero.
      */
     MATRIX3x3();
+
+    /**
+     * Initialize with 3 vectors
+     */
+    MATRIX3x3( VECTOR3<T> a1, VECTOR3<T> a2, VECTOR3<T> a3 );
 
     /**
      * Initialize with given matrix members
@@ -158,6 +164,11 @@ public:
      */
     friend std::ostream& operator<<<T>( std::ostream& aStream, const MATRIX3x3<T>& aMatrix );
 
+    ///< Equality operator
+    bool operator==( const MATRIX3x3<T>& aOtherMatrix ) const;
+
+    ///< Not equality operator
+    bool operator!=( const MATRIX3x3<T>& aOtherMatrix ) const;
 };
 
 // Operators
@@ -167,6 +178,8 @@ template <class T> MATRIX3x3<T> const operator*( MATRIX3x3<T> const& aA, MATRIX3
 
 //! Multiplication with a 2D vector, the 3rd z-component is assumed to be 1
 template <class T> VECTOR2<T> const operator*( MATRIX3x3<T> const& aA, VECTOR2<T> const& aB );
+
+template <class T> VECTOR3<T> const operator*( MATRIX3x3<T> const& aA, VECTOR3<T> const& aB );
 
 //! Multiplication with a scalar
 template <class T, class S> MATRIX3x3<T> const operator*( MATRIX3x3<T> const& aA, T aScalar );
@@ -186,6 +199,23 @@ MATRIX3x3<T>::MATRIX3x3()
             m_data[i][j] = 0.0;
         }
     }
+}
+
+
+template <class T>
+MATRIX3x3<T>::MATRIX3x3( VECTOR3<T> a1, VECTOR3<T> a2, VECTOR3<T> a3 )
+{
+    m_data[0][0] = a1.x;
+    m_data[0][1] = a1.y;
+    m_data[0][2] = a1.z;
+
+    m_data[1][0] = a2.x;
+    m_data[1][1] = a2.y;
+    m_data[1][2] = a2.z;
+
+    m_data[2][0] = a3.x;
+    m_data[2][1] = a3.y;
+    m_data[2][2] = a3.z;
 }
 
 
@@ -303,6 +333,21 @@ VECTOR2<T> const operator*( MATRIX3x3<T> const& aMatrix, VECTOR2<T> const& aVect
 
 
 template <class T>
+VECTOR3<T> const operator*( MATRIX3x3<T> const& aMatrix, VECTOR3<T> const& aVector )
+{
+    VECTOR3<T> result( 0, 0, 0 );
+    result.x = aMatrix.m_data[0][0] * aVector.x + aMatrix.m_data[0][1] * aVector.y
+               + aMatrix.m_data[0][2] * aVector.z;
+    result.y = aMatrix.m_data[1][0] * aVector.x + aMatrix.m_data[1][1] * aVector.y
+               + aMatrix.m_data[1][2] * aVector.z;
+    result.z = aMatrix.m_data[2][0] * aVector.x + aMatrix.m_data[2][1] * aVector.y
+               + aMatrix.m_data[2][2] * aVector.z;
+
+    return result;
+}
+
+
+template <class T>
 T MATRIX3x3<T>::Determinant() const
 {
     return m_data[0][0] * ( m_data[1][1] * m_data[2][2] - m_data[1][2] * m_data[2][1] )
@@ -391,6 +436,36 @@ std::ostream& operator<<( std::ostream& aStream, const MATRIX3x3<T>& aMatrix )
     }
 
     return aStream;
+}
+
+
+template <class T>
+bool MATRIX3x3<T>::operator==( MATRIX3x3<T> const& aOtherMatrix ) const
+{
+    return aOtherMatrix.m_data[0][0] == m_data[0][0] &&
+        aOtherMatrix.m_data[0][1] == m_data[0][1] &&
+        aOtherMatrix.m_data[0][2] == m_data[0][2] &&
+        aOtherMatrix.m_data[1][0] == m_data[1][0] &&
+        aOtherMatrix.m_data[1][1] == m_data[1][1] &&
+        aOtherMatrix.m_data[1][2] == m_data[1][2] &&
+        aOtherMatrix.m_data[2][0] == m_data[2][0] &&
+        aOtherMatrix.m_data[2][1] == m_data[2][1] &&
+        aOtherMatrix.m_data[2][2] == m_data[2][2];
+}
+
+
+template <class T>
+bool MATRIX3x3<T>::operator!=( MATRIX3x3<T> const& aOtherMatrix ) const
+{
+    return aOtherMatrix.m_data[0][0] != m_data[0][0] ||
+        aOtherMatrix.m_data[0][1] != m_data[0][1] ||
+        aOtherMatrix.m_data[0][2] != m_data[0][2] ||
+        aOtherMatrix.m_data[1][0] != m_data[1][0] ||
+        aOtherMatrix.m_data[1][1] != m_data[1][1] ||
+        aOtherMatrix.m_data[1][2] != m_data[1][2] ||
+        aOtherMatrix.m_data[2][0] != m_data[2][0] ||
+        aOtherMatrix.m_data[2][1] != m_data[2][1] ||
+        aOtherMatrix.m_data[2][2] != m_data[2][2];
 }
 
 

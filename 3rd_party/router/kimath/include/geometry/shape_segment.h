@@ -2,6 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2013 CERN
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software; you can redistribute it and/or
@@ -29,6 +30,7 @@
 #include <geometry/shape.h>
 #include <math/box2.h>
 #include <math/vector2d.h>
+#include <trigo.h>
 
 #include <algorithm>
 
@@ -51,6 +53,8 @@ public:
         m_seg( aSeg ),
         m_width( aWidth )
     {};
+
+    static SHAPE_SEGMENT BySizeAndCenter( const VECTOR2I& aSize, const VECTOR2I& aCenter, const EDA_ANGLE& aRotation );
 
     ~SHAPE_SEGMENT() {};
 
@@ -128,14 +132,35 @@ public:
         return m_seg;
     }
 
-    void SetWidth( int aWidth )
+    VECTOR2I GetStart() const override { return m_seg.A; }
+    VECTOR2I GetEnd() const override { return m_seg.B; }
+
+    void SetWidth( int aWidth ) override
     {
         m_width = aWidth;
     }
 
-    int GetWidth() const
+    int GetWidth() const override
     {
         return m_width;
+    }
+
+    /**
+     * Get the total length of the segment, from tip to tip.
+     */
+    int GetTotalLength() const
+    {
+        return m_seg.Length() + m_width;
+    }
+
+    VECTOR2I GetCenter() const
+    {
+        return m_seg.Center();
+    }
+
+    EDA_ANGLE GetAngle() const
+    {
+        return EDA_ANGLE( m_seg.B - m_seg.A );
     }
 
     bool IsSolid() const override
@@ -143,16 +168,10 @@ public:
         return true;
     }
 
-    void Rotate( double aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override
+    void Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override
     {
-        m_seg.A -= aCenter;
-        m_seg.B -= aCenter;
-
-        m_seg.A = m_seg.A.Rotate( aAngle );
-        m_seg.B = m_seg.B.Rotate( aAngle );
-
-        m_seg.A += aCenter;
-        m_seg.B += aCenter;
+        RotatePoint( m_seg.A, aCenter, aAngle );
+        RotatePoint( m_seg.B, aCenter, aAngle );
     }
 
     void Move( const VECTOR2I& aVector ) override
@@ -161,7 +180,12 @@ public:
         m_seg.B += aVector;
     }
 
-    virtual const std::string Format( ) const override;
+    bool Is45Degree( EDA_ANGLE aTollerance = EDA_ANGLE( 1.0, DEGREES_T ) ) const;
+
+    virtual const std::string Format( bool aCplusPlus = true ) const override;
+
+    void TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aError,
+                             ERROR_LOC aErrorLoc ) const override;
 
 private:
     SEG m_seg;

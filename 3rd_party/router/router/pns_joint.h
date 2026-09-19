@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -42,14 +42,12 @@ namespace PNS {
 class JOINT : public ITEM
 {
 public:
-    typedef ITEM_SET::ENTRIES LINKED_ITEMS;
-
     ///< Joints are hashed by their position, layers and net.
     ///<  Linked items are, obviously, not hashed.
     struct HASH_TAG
     {
         VECTOR2I pos;
-        int net;
+        NET_HANDLE net;
     };
 
     struct JOINT_TAG_HASH
@@ -62,14 +60,14 @@ public:
 
             return ( (hash<int>()( aP.pos.x )
                       ^ (hash<int>()( aP.pos.y ) << 1) ) >> 1 )
-                   ^ (hash<int>()( aP.net ) << 1);
+                   ^ (hash<void*>()( aP.net ) << 1);
         }
     };
 
     JOINT() :
         ITEM( JOINT_T ), m_tag(), m_locked( false ) {}
 
-    JOINT( const VECTOR2I& aPos, const LAYER_RANGE& aLayers, int aNet = -1 ) :
+    JOINT( const VECTOR2I& aPos, const PNS_LAYER_RANGE& aLayers, NET_HANDLE aNet = nullptr ) :
         ITEM( JOINT_T )
     {
         m_tag.pos = aPos;
@@ -102,43 +100,72 @@ public:
      */
     bool IsLineCorner( bool aAllowLockedSegs = false ) const
     {
-        if( m_linkedItems.Size() != 2 || m_linkedItems.Count( SEGMENT_T | ARC_T ) != 2 )
+        if( m_linkedItems.Size() == 2 && m_linkedItems.Count( SEGMENT_T | ARC_T ) == 2 )
+        {
+            LINKED_ITEM* seg1 = static_cast<LINKED_ITEM*>( m_linkedItems[0] );
+            LINKED_ITEM* seg2 = static_cast<LINKED_ITEM*>( m_linkedItems[1] );
+
+            if( !aAllowLockedSegs && ( seg1->IsLocked() || seg2->IsLocked() ) )
+                return false;
+
+            // joints between segments of different widths are not considered trivial.
+            return seg1->Width() == seg2->Width();
+        }
+        else if( m_linkedItems.Size() > 2 && m_linkedItems.Count( SEGMENT_T | ARC_T ) == 2 )
         {
             if( !aAllowLockedSegs )
-            {
                 return false;
-            }
-            else if( m_linkedItems.Size() == 3
-                        && m_linkedItems.Count( SEGMENT_T | ARC_T ) == 2
-                        && m_linkedItems.Count( VIA_T ) == 1 )
+
+            // There will be multiple VVIAs on joints between two locked segments, because we
+            // naively add a VVIA to each end of a locked segment.
+            const LINKED_ITEM* seg1 = nullptr;
+            const LINKED_ITEM* seg2 = nullptr;
+
+            for( const ITEM* item : m_linkedItems.CItems() )
             {
-                assert( static_cast<const ITEM*>( m_linkedItems[2] )->Kind() == VIA_T );
+                if( item->IsVirtual() )
+                    continue;
 
-                const VIA* via = static_cast<const VIA*>( m_linkedItems[2] );
-
-                if( !via->IsVirtual() )
+                if( item->Kind() == SEGMENT_T || item->Kind() == ARC_T )
+                {
+                    if( !seg1 )
+                        seg1 = static_cast<const LINKED_ITEM*>( item );
+                    else
+                        seg2 = static_cast<const LINKED_ITEM*>( item );
+                }
+                else
+                {
                     return false;
+                }
             }
-            else
-            {
-                return false;
-            }
+
+            if( seg1 && seg2 )
+                return seg1->Width() == seg2->Width();
         }
 
-        auto seg1 = static_cast<LINKED_ITEM*>( m_linkedItems[0] );
-        auto seg2 = static_cast<LINKED_ITEM*>( m_linkedItems[1] );
-
-        // joints between segments of different widths are not considered trivial.
-        return seg1->Width() == seg2->Width();
+        return false;
     }
 
     bool IsNonFanoutVia() const
     {
-        int vias = m_linkedItems.Count( VIA_T );
-        int segs = m_linkedItems.Count( SEGMENT_T );
-        segs += m_linkedItems.Count( ARC_T );
+        int vias = 0;
+        int segs = 0;
+        int realItems = 0;
 
-        return ( m_linkedItems.Size() == 3 && vias == 1 && segs == 2 );
+        for( const ITEM* item : m_linkedItems.CItems() )
+        {
+            if( item->IsVirtual() )
+                continue;
+
+            if( item->Kind() == VIA_T )
+                vias++;
+            else if( item->Kind() == SEGMENT_T || item->Kind() == ARC_T )
+                segs++;
+
+            realItems++;
+        }
+
+        return ( realItems == 3 && vias == 1 && segs == 2 );
     }
 
     bool IsStitchingVia() const
@@ -146,16 +173,40 @@ public:
         return ( m_linkedItems.Size() == 1 && m_linkedItems.Count( VIA_T ) == 1 );
     }
 
+    bool IsTrivialEndpoint() const
+    {
+        // fixme: Arcs & trivial endpoint vias
+        return m_linkedItems.Size() == 1 && m_linkedItems.Count( SEGMENT_T ) == 1;
+    }
+
+
     bool IsTraceWidthChange() const
     {
-        if( m_linkedItems.Size() != 2 )
+        if( m_linkedItems.Count( SEGMENT_T ) != 2 )
             return false;
 
-        if( m_linkedItems.Count( SEGMENT_T ) != 2)
-            return false;
+        const LINKED_ITEM* seg1 = nullptr;
+        const LINKED_ITEM* seg2 = nullptr;
 
-        SEGMENT* seg1 = static_cast<SEGMENT*>( m_linkedItems[0] );
-        SEGMENT* seg2 = static_cast<SEGMENT*>( m_linkedItems[1] );
+        for( const ITEM* item : m_linkedItems.CItems() )
+        {
+            if( item->IsVirtual() )
+                continue;
+
+            if( item->Kind() == VIA_T )
+            {
+                return false;
+            }
+            else if( item->Kind() == SEGMENT_T || item->Kind() == ARC_T )
+            {
+                if( !seg1 )
+                    seg1 = static_cast<const LINKED_ITEM*>( item );
+                else
+                    seg2 = static_cast<const LINKED_ITEM*>( item );
+            }
+        }
+
+        wxCHECK( seg1 && seg2, false );
 
         return seg1->Width() != seg2->Width();
     }
@@ -174,25 +225,59 @@ public:
     bool Unlink( ITEM* aItem )
     {
         m_linkedItems.Erase( aItem );
+        if( m_linkedItems.Size() == 0 )
+            m_layers = PNS_LAYER_RANGE( -1 );
         return m_linkedItems.Size() == 0;
     }
 
     ///< For trivial joints, return the segment adjacent to (aCurrent). For non-trival ones,
     ///< return NULL, indicating the end of line.
-    LINKED_ITEM* NextSegment( ITEM* aCurrent, bool aAllowLockedSegs = false ) const
+    LINKED_ITEM* NextSegment( LINKED_ITEM* aCurrent, bool aAllowLockedSegs = false ) const
     {
-        if( !IsLineCorner( aAllowLockedSegs ) )
-            return nullptr;
+        const std::vector<ITEM*>& citems = m_linkedItems.CItems();
+        const size_t              size = citems.size();
 
-        return static_cast<LINKED_ITEM*>( m_linkedItems[m_linkedItems[0] == aCurrent ? 1 : 0] );
+        LINKED_ITEM* otherItem = nullptr;
+
+        for( size_t i = 0; i < size; i++ )
+        {
+            ITEM* item = m_linkedItems[i];
+
+            if( item != aCurrent )
+            {
+                if ( item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) )
+                {
+                    if ( item->Net() == aCurrent->Net() && item->Layers().Overlaps( aCurrent->Layers() ) )
+                    {
+                        if( otherItem )
+                            return nullptr;
+
+                        if( !item->IsLocked() || aAllowLockedSegs )
+                            otherItem = static_cast<LINKED_ITEM*>( item );
+                    }
+                }
+                else if ( item->OfKind( ITEM::SOLID_T | ITEM::VIA_T ) )
+                {
+                    if( item->Kind() == ITEM::VIA_T && item->IsVirtual() && aAllowLockedSegs )
+                    {
+                        // Virtual via will be added at the joint between an unlocked and locked seg
+                        continue;
+                    }
+
+                    return nullptr;
+                }
+            }
+        }
+
+        return otherItem;
     }
 
-    VIA* Via()
+    VIA* Via() const
     {
-        for( ITEM* item : m_linkedItems.Items() )
+        for( ITEM* item : m_linkedItems.CItems() )
         {
             if( item->OfKind( VIA_T ) )
-                return static_cast<VIA*>( item );
+                return static_cast<VIA*>( item ); // fixme: const correctness
         }
 
         return nullptr;
@@ -210,12 +295,12 @@ public:
         return m_tag.pos;
     }
 
-    int Net() const
+    NET_HANDLE Net() const override
     {
         return m_tag.net;
     }
 
-    const LINKED_ITEMS& LinkList() const
+    const std::vector<ITEM*>& LinkList() const
     {
         return m_linkedItems.CItems();
     }

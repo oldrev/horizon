@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -26,10 +26,12 @@
 #include <vector>
 #include <string>
 #include <sstream>
-
-#include "wx_compat.h"
+#include <set>
 
 #include <math/vector2d.h>
+#include <kiid.h>
+
+#include "pns_sizes_settings.h"
 
 class SHAPE_LINE_CHAIN;
 class SHAPE;
@@ -47,26 +49,60 @@ public:
         EVT_START_DRAG,
         EVT_FIX,
         EVT_MOVE,
-        EVT_ABORT
+        EVT_ABORT,
+        EVT_TOGGLE_VIA,
+        EVT_UNFIX,
+        EVT_START_MULTIDRAG
     };
 
     struct EVENT_ENTRY {
         VECTOR2I p;
         EVENT_TYPE type;
-        wxString uuid;
+        std::vector<KIID> uuids;
+        SIZES_SETTINGS sizes;
+        int layer;
+
+        EVENT_ENTRY() :
+                type( EVT_START_ROUTE ),
+                layer( 0 )
+        {
+        }
+
+        EVENT_ENTRY( const EVENT_ENTRY& aE ) :
+                p( aE.p ),
+                type( aE.type ),
+                uuids( aE.uuids ),
+                sizes( aE.sizes ),
+                layer( aE.layer )
+        {
+        }
     };
 
     LOGGER();
     ~LOGGER();
 
-    void Save( const std::string& aFilename );
     void Clear();
-    void Log( EVENT_TYPE evt, const VECTOR2I& pos, const ITEM* item = nullptr );
+
+    void LogM( EVENT_TYPE evt, const VECTOR2I& pos = VECTOR2I(), std::vector<ITEM*> items = {},
+              const SIZES_SETTINGS* sizes = nullptr, int aLayer = 0 );
+
+    void Log( EVENT_TYPE evt, const VECTOR2I& pos = VECTOR2I(), const ITEM* item = nullptr,
+              const SIZES_SETTINGS* sizes = nullptr, int aLayer = 0 );
 
     const std::vector<EVENT_ENTRY>& GetEvents()
     {
         return m_events;
     }
+
+    static wxString FormatLogFileAsString( int aMode,
+                                           const std::vector<ITEM*>& aAddedItems,
+                                           const std::set<KIID>&     aRemovedItems,
+                                           const std::vector<ITEM*>& aHeads,
+                                           const std::vector<EVENT_ENTRY>& aEvents );
+
+    static wxString FormatEvent( const EVENT_ENTRY& aEvent );
+
+    static EVENT_ENTRY ParseEvent( const wxString& aLine );
 
 private:
     std::vector<EVENT_ENTRY> m_events;

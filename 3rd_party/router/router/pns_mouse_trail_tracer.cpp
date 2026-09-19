@@ -2,6 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2020 CERN
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  * Author: Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
  * This program is free software: you can redistribute it and/or modify it
@@ -51,7 +52,7 @@ void MOUSE_TRAIL_TRACER::AddTrailPoint( const VECTOR2I& aP )
     }
     else
     {
-        SEG s_new( m_trail.CPoint( -1 ), aP );
+        SEG s_new( m_trail.CLastPoint(), aP );
 
         if( m_trail.SegmentCount() > 2 )
         {
@@ -76,7 +77,7 @@ void MOUSE_TRAIL_TRACER::AddTrailPoint( const VECTOR2I& aP )
 
     DEBUG_DECORATOR *dbg = ROUTER::GetInstance()->GetInterface()->GetDebugDecorator();
 
-    PNS_DBG( dbg, AddLine, m_trail, CYAN, 50000, "mt-trail" );
+    PNS_DBG( dbg, AddShape, &m_trail, CYAN, 50000, wxT( "mt-trail" ) );
 }
 
 
@@ -92,10 +93,10 @@ DIRECTION_45 MOUSE_TRAIL_TRACER::GetPosture( const VECTOR2I& aP )
     const double minAreaCutoffDistanceFactor = 6;
 
     // Adjusts how far away from p0 we get before whatever posture we solved is locked in
-    const int lockDistanceFactor = 25;
+    const int lockDistanceFactor = 30;
 
     // Adjusts how close to p0 we unlock the posture again if one was locked already
-    const int unlockDistanceFactor = 4;
+    const int unlockDistanceFactor = 10;
 
     if( m_trail.PointCount() < 2 || m_manuallyForced )
     {
@@ -117,7 +118,7 @@ DIRECTION_45 MOUSE_TRAIL_TRACER::GetPosture( const VECTOR2I& aP )
     straight.Append( m_trail.Reverse() );
     straight.Simplify();
 
-    PNS_DBG( dbg, AddLine, straight, m_forced ? BLUE : GREEN, 100000, "mt-straight" );
+    PNS_DBG( dbg, AddShape, &straight, m_forced ? BLUE : GREEN, 100000, wxT( "mt-straight" ) );
 
     double areaS = straight.Area();
 
@@ -126,7 +127,7 @@ DIRECTION_45 MOUSE_TRAIL_TRACER::GetPosture( const VECTOR2I& aP )
     diag.SetClosed( true );
     diag.Simplify();
 
-    PNS_DBG( dbg, AddLine, diag, YELLOW, 100000, "mt-diag" );
+    PNS_DBG( dbg, AddShape, &diag, YELLOW, 100000, wxT( "mt-diag" ) );
 
     double areaDiag = diag.Area();
     double ratio    = areaS / ( areaDiag + 1.0 );
@@ -154,7 +155,9 @@ DIRECTION_45 MOUSE_TRAIL_TRACER::GetPosture( const VECTOR2I& aP )
 
         if( trail.Area() > areaCutoff )
             areaOk = true;
-}
+    }
+
+    PNS_DBG( dbg, Message, wxString::Format( "Posture: rl %.0f thr %d tol %d as %.3f area OK %d forced %d\n", refLength, (int)(unlockDistanceFactor * m_tolerance), m_tolerance, ratio, areaOk?1:0, m_forced?1:0 ) );
 
     DIRECTION_45 straightDirection;
     DIRECTION_45 diagDirection;
@@ -197,16 +200,16 @@ DIRECTION_45 MOUSE_TRAIL_TRACER::GetPosture( const VECTOR2I& aP )
         }
         else if( diagDirection == m_lastSegDirection )
         {
-            if( m_direction != straightDirection )
+            if( m_direction != diagDirection )
             {
                 PNS_DBG( dbg, Message, wxString::Format( wxT( "Posture: forcing diagonal => %s" ),
                                                          diagDirection.Format() ) );
             }
 
             m_direction = diagDirection;
-    }
-    else
-    {
+        }
+        else
+        {
             switch( m_direction.Angle( m_lastSegDirection ) )
             {
             case DIRECTION_45::ANG_HALF_FULL:
@@ -281,7 +284,7 @@ VECTOR2I MOUSE_TRAIL_TRACER::GetTrailLeadVector() const
     }
     else
     {
-        return m_trail.CPoint( -1 ) - m_trail.CPoint( 0 );
+        return m_trail.CLastPoint() - m_trail.CPoint( 0 );
     }
 }
 

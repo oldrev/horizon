@@ -1,7 +1,7 @@
 /*
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
- * Copyright (C) 2018-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -24,19 +24,15 @@
 #ifndef TRIGO_H
 #define TRIGO_H
 
-/**
- * @file trigo.h
- */
-
 #include <cmath>
 #include <math/vector2d.h>
-#include "wx_compat.h"
+#include <geometry/eda_angle.h>
 
 /**
  * Test if \a aTestPoint is on line defined by \a aSegStart and \a aSegEnd.
  *
  * This function is faster than #TestSegmentHit() because \a aTestPoint  should be exactly on
- * the line.  This works fine only for H, V and 45 degree line segments.
+ * the line.  This only works for horizontal, vertical, and 45 degree line segments.
  *
  * @param aSegStart The first point of the line segment.
  * @param aSegEnd The second point of the line segment.
@@ -44,8 +40,8 @@
  *
  * @return true if the point is on the line segment.
  */
-bool IsPointOnSegment( const wxPoint& aSegStart, const wxPoint& aSegEnd,
-                       const wxPoint& aTestPoint );
+bool IsPointOnSegment( const VECTOR2I& aSegStart, const VECTOR2I& aSegEnd,
+                       const VECTOR2I& aTestPoint );
 
 /**
  * Test if two lines intersect.
@@ -55,151 +51,105 @@ bool IsPointOnSegment( const wxPoint& aSegStart, const wxPoint& aSegEnd,
  * @param a_p1_l2 The first point of the second line.
  * @param a_p2_l2 The second point of the second line.
  * @param aIntersectionPoint is filled with the intersection point if it exists
- * @return bool - true if the two segments defined by four points intersect.
+ * @return bool true if the two segments defined by four points intersect.
  * (i.e. if the 2 segments have at least a common point)
  */
-bool SegmentIntersectsSegment( const wxPoint& a_p1_l1, const wxPoint& a_p2_l1,
-                               const wxPoint& a_p1_l2, const wxPoint& a_p2_l2,
-                               wxPoint* aIntersectionPoint = nullptr );
+bool SegmentIntersectsSegment( const VECTOR2I& a_p1_l1, const VECTOR2I& a_p2_l1,
+                               const VECTOR2I& a_p1_l2, const VECTOR2I& a_p2_l2,
+                               VECTOR2I* aIntersectionPoint = nullptr );
 
-/*
- * Calculate the new point of coord coord pX, pY,
- * for a rotation center 0, 0, and angle in (1 / 10 degree)
+/**
+ * Calculate the new point of coord coord pX, pY, for a rotation center 0, 0.
  */
-void RotatePoint( int *pX, int *pY, double angle );
+void RotatePoint( int *pX, int *pY, const EDA_ANGLE& aAngle );
 
-/*
- * Calculate the new point of coord coord pX, pY,
- * for a rotation center cx, cy, and angle in (1 / 10 degree)
+/**
+ * Rotate a VECTOR2I in place by aAngle.
  */
-void RotatePoint( int *pX, int *pY, int cx, int cy, double angle );
-
-/*
- * Calculate the new coord point point for a rotation angle in (1 / 10 degree).
- */
-inline void RotatePoint( wxPoint* point, double angle )
+inline void RotatePoint( VECTOR2I& point, const EDA_ANGLE& aAngle )
 {
-    RotatePoint( &point->x, &point->y, angle );
+    RotatePoint( &point.x, &point.y, aAngle );
 }
 
-inline void RotatePoint( VECTOR2I& point, double angle )
+/**
+ * Return a new VECTOR2I that is the result of rotating aVector by aAngle.
+ */
+inline VECTOR2I GetRotated( const VECTOR2I& aVector, const EDA_ANGLE& aAngle )
 {
-    RotatePoint( &point.x, &point.y, angle );
+    VECTOR2I result = aVector;
+    RotatePoint( &result.x, &result.y, aAngle );
+    return result;
 }
 
-void RotatePoint( VECTOR2I& point, const VECTOR2I& centre, double angle );
-
-/*
- * Calculate the new coord point point for a center rotation center and angle in (1 / 10 degree).
+/**
+ * Calculate the new point of coord coord pX, pY, for a rotation center cx, cy.
  */
-void RotatePoint( wxPoint *point, const wxPoint & centre, double angle );
+void RotatePoint( int *pX, int *pY, int cx, int cy, const EDA_ANGLE& aAngle );
 
-void RotatePoint( double *pX, double *pY, double angle );
+/**
+ * Rotate a VECTOR2I in place by aAngle about aCentre
+ */
+inline void RotatePoint( VECTOR2I& aPoint, const VECTOR2I& aCentre, const EDA_ANGLE& aAngle )
+{
+    RotatePoint( &aPoint.x, &aPoint.y, aCentre.x, aCentre.y, aAngle );
+}
 
-void RotatePoint( double *pX, double *pY, double cx, double cy, double angle );
+/**
+ * Return a new VECTOR2I that is the result of rotating aVector by aAngle.
+ */
+inline VECTOR2I GetRotated( const VECTOR2I& aVector, const VECTOR2I& aCentre,
+                            const EDA_ANGLE& aAngle )
+{
+    VECTOR2I result = aVector;
+    RotatePoint( &result.x, &result.y, aCentre.x, aCentre.y, aAngle );
+    return result;
+}
+
+
+/**
+ * Calculate the new coord point point for a rotation center 0, 0.
+ */
+void RotatePoint( double* pX, double* pY, const EDA_ANGLE& aAngle );
+
+inline void RotatePoint( VECTOR2D& point, const EDA_ANGLE& aAngle )
+{
+    RotatePoint( &point.x, &point.y, aAngle );
+}
+
+void RotatePoint( double* pX, double* pY, double cx, double cy, const EDA_ANGLE& aAngle );
+
+inline void RotatePoint( VECTOR2D& point, const VECTOR2D& aCenter, const EDA_ANGLE& aAngle )
+{
+    RotatePoint( &point.x, &point.y, aCenter.x, aCenter.y, aAngle );
+}
 
 /**
  * Determine the center of an arc or circle given three points on its circumference.
  *
- * @param aStart The starting point of the circle (equivalent to aEnd)
- * @param aMid The point on the arc, half-way between aStart and aEnd
- * @param aEnd The ending point of the circle (equivalent to aStart)
- * @return The center of the circle
+ * @param aStart The starting point of the circle (equivalent to aEnd).
+ * @param aMid The point on the arc, half-way between aStart and aEnd.
+ * @param aEnd The ending point of the circle (equivalent to aStart).
+ * @return The center of the circle.
  */
 const VECTOR2I CalcArcCenter( const VECTOR2I& aStart, const VECTOR2I& aMid, const VECTOR2I& aEnd );
 const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aMid, const VECTOR2D& aEnd );
-const wxPoint CalcArcCenter( const wxPoint& aStart, const wxPoint& aMid, const wxPoint& aEnd );
-const wxPoint CalcArcCenter( const VECTOR2I& aStart, const VECTOR2I& aEnd, double aAngle );
+const VECTOR2D CalcArcCenter( const VECTOR2D& aStart, const VECTOR2D& aEnd,
+                              const EDA_ANGLE& aAngle );
 
 /**
- * Return the subtended angle for a given arc.
- */
-double CalcArcAngle( const VECTOR2I& aStart, const VECTOR2I& aMid, const VECTOR2I& aEnd );
-
-/**
- * Return the middle point of an arc, half-way between aStart and aEnd. There are two possible
- * solutions which can be found by toggling aMinArcAngle. The behaviour is undefined for
- * semicircles (i.e. 180 degree arcs).
+ * Return the middle point of an arc, half-way between aStart and aEnd.
  *
- * @param aStart The starting point of the arc (for calculating the radius)
- * @param aEnd The end point of the arc (for determining the arc angle)
- * @param aCenter The center point of the arc
+ * There are two possible solutions which can be found by toggling aMinArcAngle. The behavior
+ * is undefined for semicircles (i.e. 180 degree arcs).
+ *
+ * @param aStart The starting point of the arc (for calculating the radius).
+ * @param aEnd The end point of the arc (for determining the arc angle).
+ * @param aCenter The center point of the arc.
  * @param aMinArcAngle If true, returns the point that results in the smallest arc angle.
- * @return The middle point of the arc
+ * @return The middle point of the arc.
 */
 const VECTOR2I CalcArcMid( const VECTOR2I& aStart, const VECTOR2I& aEnd, const VECTOR2I& aCenter,
                            bool aMinArcAngle = true );
-
-/* Return the arc tangent of 0.1 degrees coord vector dx, dy
- * between -1800 and 1800
- * Equivalent to atan2 (but faster for calculations if
- * the angle is 0 to -1800, or + - 900)
- * Lorenzo: In fact usually atan2 already has to do these optimizations
- * (due to the discontinuity in tan) but this function also returns
- * in decidegrees instead of radians, so it's handier
- */
-double ArcTangente( int dy, int dx );
-
-//! @brief Euclidean norm of a 2D vector
-//! @param vector Two-dimensional vector
-//! @return Euclidean norm of the vector
-inline double EuclideanNorm( const wxPoint &vector )
-{
-    // this is working with doubles
-    return hypot( vector.x, vector.y );
-}
-
-inline double EuclideanNorm( const wxSize &vector )
-{
-    // this is working with doubles, too
-    return hypot( vector.x, vector.y );
-}
-
-//! @brief Compute the distance between a line and a reference point
-//! Reference: http://mathworld.wolfram.com/Point-LineDistance2-Dimensional.html
-//! @param linePointA Point on line
-//! @param linePointB Point on line
-//! @param referencePoint Reference point
-inline double DistanceLinePoint( const wxPoint& linePointA,
-                                 const wxPoint& linePointB,
-                                 const wxPoint& referencePoint )
-{
-    // Some of the multiple double casts are redundant. However in the previous
-    // definition the cast was (implicitly) done too late, just before
-    // the division (EuclideanNorm gives a double so from int it would
-    // be promoted); that means that the whole expression were
-    // vulnerable to overflow during int multiplications
-    return fabs( ( static_cast<double>( linePointB.x - linePointA.x ) *
-                   static_cast<double>( linePointA.y - referencePoint.y ) -
-                   static_cast<double>( linePointA.x  - referencePoint.x ) *
-                   static_cast<double>( linePointB.y - linePointA.y) )
-            / EuclideanNorm( linePointB - linePointA ) );
-}
-
-//! @brief Test, if two points are near each other
-//! @param pointA First point
-//! @param pointB Second point
-//! @param threshold The maximum distance
-//! @return True or false
-inline bool HitTestPoints( const wxPoint& pointA, const wxPoint& pointB, double threshold )
-{
-    wxPoint vectorAB = pointB - pointA;
-
-    // Compare the distances squared. The double is needed to avoid
-    // overflow during int multiplication
-    double sqdistance = (double)vectorAB.x * vectorAB.x + (double)vectorAB.y * vectorAB.y;
-
-    return sqdistance < threshold * threshold;
-}
-
-//! @brief Determine the cross product
-//! @param vectorA Two-dimensional vector
-//! @param vectorB Two-dimensional vector
-inline double CrossProduct( const wxPoint& vectorA, const wxPoint& vectorB )
-{
-    // As before the cast is to avoid int overflow
-    return (double)vectorA.x * vectorB.y - (double)vectorA.y * vectorB.x;
-}
 
 /**
  * Test if \a aRefPoint is with \a aDistance on the line defined by \a aStart and \a aEnd..
@@ -209,75 +159,22 @@ inline double CrossProduct( const wxPoint& vectorA, const wxPoint& vectorB )
  * @param aEnd is the second end-point of the line segment
  * @param aDist = maximum distance for hit
 */
-bool TestSegmentHit( const wxPoint& aRefPoint, const wxPoint& aStart, const wxPoint& aEnd,
+bool TestSegmentHit( const VECTOR2I& aRefPoint, const VECTOR2I& aStart, const VECTOR2I& aEnd,
                      int aDist );
-
-/**
- * Return the length of a line segment defined by \a aPointA and \a aPointB.
- *
- * See also EuclideanNorm and Distance for the single vector or four scalar versions.
- *
- * @return Length of a line (as double)
- */
-inline double GetLineLength( const wxPoint& aPointA, const wxPoint& aPointB )
-{
-    // Implicitly casted to double
-    return hypot( aPointA.x - aPointB.x, aPointA.y - aPointB.y );
-}
 
 // These are the usual degrees <-> radians conversion routines
 inline double DEG2RAD( double deg ) { return deg * M_PI / 180.0; }
 inline double RAD2DEG( double rad ) { return rad * 180.0 / M_PI; }
 
 // These are the same *but* work with the internal 'decidegrees' unit
-inline double DECIDEG2RAD( double deg ) { return deg * M_PI / 1800.0; }
 inline double RAD2DECIDEG( double rad ) { return rad * 1800.0 / M_PI; }
 
 /* These are templated over T (and not simply double) because Eeschema
    is still using int for angles in some place */
 
-/// Normalize angle to be  >=-360.0 and <= 360.0
-/// Angle can be equal to -360 or +360
-template <class T> inline T NormalizeAngle360Max( T Angle )
-{
-    while( Angle < -3600 )
-        Angle += 3600;
-
-    while( Angle > 3600 )
-        Angle -= 3600;
-
-    return Angle;
-}
-
-/// Normalize angle to be > -360.0 and < 360.0
-/// Angle equal to -360 or +360 are set to 0
-template <class T> inline T NormalizeAngle360Min( T Angle )
-{
-    while( Angle <= -3600 )
-        Angle += 3600;
-
-    while( Angle >= 3600 )
-        Angle -= 3600;
-
-    return Angle;
-}
-
-
-/// Normalize angle to be in the 0.0 .. -360.0 range: angle is in 1/10 degrees.
-template <class T>
-inline T NormalizeAngleNeg( T Angle )
-{
-    while( Angle <= -3600 )
-        Angle += 3600;
-
-    while( Angle > 0 )
-        Angle -= 3600;
-
-    return Angle;
-}
-
-
-/// Normalize angle to be in the 0.0 .. 360.0 range: angle is in 1/10 degrees.
+/**
+ * Normalize angle to be in the 0.0 .. 360.0 range: angle is in 1/10 degrees.
+ */
 template <class T> inline T NormalizeAnglePos( T Angle )
 {
     while( Angle < 0 )
@@ -293,97 +190,9 @@ template <class T> inline void NORMALIZE_ANGLE_POS( T& Angle )
 }
 
 
-/// Normalize angle to be in the 0.0 .. 360.0 range: angle is in degrees.
-inline double NormalizeAngleDegreesPos( double Angle )
-{
-    while( Angle < 0 )
-        Angle += 360.0;
-
-    while( Angle >= 360.0 )
-        Angle -= 360.0;
-
-    return Angle;
-}
-
-
-inline void NORMALIZE_ANGLE_DEGREES_POS( double& Angle )
-{
-    Angle = NormalizeAngleDegreesPos( Angle );
-}
-
-
-inline double NormalizeAngleRadiansPos( double Angle )
-{
-    while( Angle < 0 )
-        Angle += (2 * M_PI );
-
-    while( Angle >= ( 2 * M_PI ) )
-        Angle -= ( 2 * M_PI );
-
-    return Angle;
-}
-
-/// Normalize angle to be aMin < angle <= aMax angle is in degrees.
-inline double NormalizeAngleDegrees( double Angle, double aMin, double aMax )
-{
-    while( Angle < aMin )
-        Angle += 360.0;
-
-    while( Angle >= aMax )
-        Angle -= 360.0;
-
-    return Angle;
-}
-
-/// Add two angles (keeping the result normalized). T2 is here
-// because most of the time it's an int (and templates don't promote in
-// that way)
-template <class T, class T2> inline T AddAngles( T a1, T2 a2 )
-{
-    a1 += a2;
-    NORMALIZE_ANGLE_POS( a1 );
-    return a1;
-}
-
-
-template <class T> inline T NegateAndNormalizeAnglePos( T Angle )
-{
-    Angle = -Angle;
-
-    while( Angle < 0 )
-        Angle += 3600;
-
-    while( Angle >= 3600 )
-        Angle -= 3600;
-
-    return Angle;
-}
-
-template <class T> inline void NEGATE_AND_NORMALIZE_ANGLE_POS( T& Angle )
-{
-    Angle = NegateAndNormalizeAnglePos( Angle );
-}
-
-
-/// Normalize angle to be in the -90.0 .. 90.0 range
-template <class T> inline T NormalizeAngle90( T Angle )
-{
-    while( Angle < -900 )
-        Angle += 1800;
-
-    while( Angle > 900 )
-        Angle -= 1800;
-
-    return Angle;
-}
-
-template <class T> inline void NORMALIZE_ANGLE_90( T& Angle )
-{
-    Angle = NormalizeAngle90( Angle );
-}
-
-
-/// Normalize angle to be in the -180.0 .. 180.0 range
+/**
+ * Normalize angle to be in the -180.0 .. 180.0 range.
+ */
 template <class T> inline T NormalizeAngle180( T Angle )
 {
     while( Angle <= -1800 )
@@ -393,11 +202,6 @@ template <class T> inline T NormalizeAngle180( T Angle )
         Angle -= 3600;
 
     return Angle;
-}
-
-template <class T> inline void NORMALIZE_ANGLE_180( T& Angle )
-{
-    Angle = NormalizeAngle180( Angle );
 }
 
 /**
@@ -434,24 +238,6 @@ inline bool InterceptsNegativeX( double aStartAngle, double aEndAngle )
         end += 360.0;
 
     return aStartAngle < 180.0 && end > 180.0;
-}
-
-/**
- * Circle generation utility: computes r * sin(a)
- * Where a is in decidegrees, not in radians.
- */
-inline double sindecideg( double r, double a )
-{
-    return r * sin( DECIDEG2RAD( a ) );
-}
-
-/**
- * Circle generation utility: computes r * cos(a)
- * Where a is in decidegrees, not in radians.
- */
-inline double cosdecideg( double r, double a )
-{
-    return r * cos( DECIDEG2RAD( a ) );
 }
 
 #endif

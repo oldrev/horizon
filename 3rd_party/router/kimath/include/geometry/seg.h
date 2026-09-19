@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2013 CERN
- * Copyright (C) 2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -29,11 +29,12 @@
 
 #include <math.h>                       // for sqrt
 #include <stdlib.h>                     // for abs
+#include <optional>
 #include <ostream>                      // for operator<<, ostream, basic_os...
 #include <type_traits>                  // for swap
 
-#include <optional>
 #include <math/vector2d.h>
+#include <geometry/eda_angle.h>
 
 typedef std::optional<VECTOR2I> OPT_VECTOR2I;
 
@@ -158,12 +159,12 @@ public:
     int LineDistance( const VECTOR2I& aP, bool aDetermineSide = false ) const;
 
     /**
-      * Determine the smallest angle between two segments (result in degrees)
+      * Determine the smallest angle between two segments
       *
       * @param aOther point to determine the orientation wrs to self
-      * @return smallest angle between this and aOther (degrees)
+      * @return smallest angle between this and aOther
       */
-    double AngleDegrees( const SEG& aOther ) const;
+    EDA_ANGLE Angle( const SEG& aOther ) const;
 
     /**
       * Compute a point on the segment (this) that is closest to point \a aP.
@@ -178,6 +179,16 @@ public:
       * @return the nearest point
       */
     const VECTOR2I NearestPoint( const SEG &aSeg ) const;
+
+    /**
+      * Compute closest points between this segment and \a aSeg.
+      *
+      * @param aPtA point on this segment (output)
+      * @param aPtB point on the other segment (output)
+      * @param aDistSq squared distance between points (output)
+      * @return true if the operation was successful
+      */
+    bool NearestPoints( const SEG& aSeg, VECTOR2I& aPtA, VECTOR2I& aPtB, int64_t& aDistSq ) const;
 
     /**
       * Reflect a point using this segment as axis.
@@ -212,6 +223,16 @@ public:
     }
 
     /**
+     * Check if this segment intersects a line defined by slope \a aSlope and offset \a aOffset.
+     *
+     * @param aSlope slope of the line
+     * @param aOffset offset of the line
+     * @param aIntersection output intersection point, if exists
+     * @return true if the segment intersects the line, false otherwise
+     */
+    bool IntersectsLine( double aSlope, double aOffset, VECTOR2I& aIntersection ) const;
+
+    /**
      * Compute a segment perpendicular to this one, passing through point \a aP.
      *
      * @param aP Point through which the new segment will pass
@@ -239,10 +260,7 @@ public:
      */
     int Distance( const SEG& aSeg ) const;
 
-    ecoord SquaredDistance( const VECTOR2I& aP ) const
-    {
-        return ( NearestPoint( aP ) - aP ).SquaredEuclideanNorm();
-    }
+    ecoord SquaredDistance( const VECTOR2I& aP ) const;
 
     /**
      * Compute minimum Euclidean distance to point \a aP.
@@ -276,34 +294,9 @@ public:
         return ( d1 <= 1 && d2 <= 1 );
     }
 
-    bool ApproxCollinear( const SEG& aSeg ) const
-    {
-        ecoord p, q, r;
-        CanonicalCoefs( p, q, r );
-
-        ecoord dist1 = ( p * aSeg.A.x + q * aSeg.A.y + r ) / sqrt( p * p + q * q );
-        ecoord dist2 = ( p * aSeg.B.x + q * aSeg.B.y + r ) / sqrt( p * p + q * q );
-
-        return std::abs( dist1 ) <= 1 && std::abs( dist2 ) <= 1;
-    }
-
-    bool ApproxParallel( const SEG& aSeg, int aDistanceThreshold = 1 ) const
-    {
-        ecoord p, q, r;
-        CanonicalCoefs( p, q, r );
-
-        ecoord dist1 = ( p * aSeg.A.x + q * aSeg.A.y + r ) / sqrt( p * p + q * q );
-        ecoord dist2 = ( p * aSeg.B.x + q * aSeg.B.y + r ) / sqrt( p * p + q * q );
-
-        return std::abs( dist1 - dist2 ) <= aDistanceThreshold;
-    }
-
-    bool ApproxPerpendicular( const SEG& aSeg ) const
-    {
-        SEG perp = PerpendicularSeg( A );
-
-        return aSeg.ApproxParallel( perp );
-    }
+    bool ApproxCollinear( const SEG& aSeg, int aDistanceThreshold = 1 ) const;
+    bool ApproxParallel( const SEG& aSeg, int aDistanceThreshold = 1 ) const;
+    bool ApproxPerpendicular( const SEG& aSeg ) const;
 
     bool Overlaps( const SEG& aSeg ) const
     {
@@ -388,11 +381,21 @@ public:
         return A + ( B - A ) / 2;
     }
 
-private:
-    bool ccw( const VECTOR2I& aA, const VECTOR2I& aB, const VECTOR2I &aC ) const;
+    bool operator<( const SEG& aSeg ) const
+    {
+        if( A == aSeg.A )
+            return B < aSeg.B;
 
+        return A < aSeg.A;
+    }
+
+private:
+
+    bool checkCollinearOverlap( const SEG& aSeg, bool useXAxis, bool aIgnoreEndpoints, VECTOR2I* aPt ) const;
     bool intersects( const SEG& aSeg, bool aIgnoreEndpoints = false, bool aLines = false,
                      VECTOR2I* aPt = nullptr ) const;
+
+    bool mutualDistanceSquared( const SEG& aSeg, ecoord& aD1, ecoord& aD2 ) const;
 
 private:
     ///< index within the parent shape (used when m_is_local == false)

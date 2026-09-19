@@ -2,7 +2,7 @@
  * This program source code file is part of KiCad, a free EDA CAD application.
  *
  * Copyright (C) 2013 CERN
- * Copyright (C) 2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -30,8 +30,10 @@
 #include <geometry/seg.h>
 #include <geometry/shape.h>
 #include <geometry/shape_line_chain.h>
+#include <geometry/shape_poly_set.h>
 #include <math/box2.h>
 #include <math/vector2d.h>
+#include <trigo.h>
 
 class SHAPE_RECT : public SHAPE
 {
@@ -42,7 +44,19 @@ public:
     SHAPE_RECT() :
         SHAPE( SH_RECT ),
         m_w( 0 ),
-        m_h( 0 )
+        m_h( 0 ),
+        m_radius( 0 )
+    {}
+
+    /**
+     * Create a rectangle defined by a BOX2.
+     */
+    SHAPE_RECT( const BOX2I& aBox ) :
+        SHAPE( SH_RECT ),
+        m_p0( aBox.GetPosition() ),
+        m_w( aBox.GetWidth() ),
+        m_h( aBox.GetHeight() ),
+        m_radius( 0 )
     {}
 
     /**
@@ -52,7 +66,8 @@ public:
         SHAPE( SH_RECT ),
         m_p0( aX0, aY0 ),
         m_w( aW ),
-        m_h( aH )
+        m_h( aH ),
+        m_radius( 0 )
     {}
 
     /**
@@ -62,14 +77,27 @@ public:
         SHAPE( SH_RECT ),
         m_p0( aP0 ),
         m_w( aW ),
-        m_h( aH )
+        m_h( aH ),
+        m_radius( 0 )
+    {}
+
+    /**
+     * Create by two corners.
+     */
+    SHAPE_RECT( const VECTOR2I& aP0, const VECTOR2I& aP1 ) :
+        SHAPE( SH_RECT ),
+        m_p0( aP0 ),
+        m_w( aP1.x - aP0.x ),
+        m_h( aP1.y - aP0.y ),
+        m_radius( 0 )
     {}
 
     SHAPE_RECT( const SHAPE_RECT& aOther ) :
         SHAPE( SH_RECT ),
         m_p0( aOther.m_p0 ),
         m_w( aOther.m_w ),
-        m_h( aOther.m_h )
+        m_h( aOther.m_h ),
+        m_radius( aOther.m_radius )
     {};
 
     SHAPE* Clone() const override
@@ -86,6 +114,21 @@ public:
     }
 
     /**
+     * Return a rectangle that is larger by aOffset in all directions,
+     * but still centered on the original rectangle.
+     */
+    SHAPE_RECT GetInflated( int aOffset ) const
+    {
+        SHAPE_RECT r{
+            m_p0 - VECTOR2I( aOffset, aOffset ),
+            m_w + 2 * aOffset,
+            m_h + 2 * aOffset,
+        };
+        r.SetRadius( m_radius + aOffset );
+        return r;
+    }
+
+    /**
      * Return length of the diagonal of the rectangle.
      *
      * @return diagonal length
@@ -93,6 +136,16 @@ public:
     int Diagonal() const
     {
         return VECTOR2I( m_w, m_h ).EuclideanNorm();
+    }
+
+    int MajorDimension() const
+    {
+        return std::max( m_w, m_h );
+    }
+
+    int MinorDimension() const
+    {
+        return std::min( m_w, m_h );
     }
 
     bool Collide( const SHAPE* aShape, int aClearance, VECTOR2I* aMTV ) const override
@@ -129,7 +182,7 @@ public:
     /**
      * @return the width of the rectangle.
      */
-     const int GetWidth() const
+     int GetWidth() const override
      {
          return m_w;
      }
@@ -137,9 +190,22 @@ public:
     /**
      * @return the height of the rectangle.
      */
-    const int GetHeight() const
+    int GetHeight() const
     {
         return m_h;
+    }
+
+    /**
+     * @return the corner radius of the rectangle.
+     */
+    int GetRadius() const
+    {
+        return m_radius;
+    }
+
+    void SetRadius( int aRadius )
+    {
+        m_radius = aRadius;
     }
 
     void Move( const VECTOR2I& aVector ) override
@@ -149,17 +215,20 @@ public:
 
     /**
      * This function has limited utility for SHAPE_RECT as non-cartesian rotations will distort
-     * the rectangle.  If you might need to handle non-90º rotations then the SHAPE_RECT should
+     * the rectangle.  If you might need to handle non-90° rotations then the SHAPE_RECT should
      * first be converted to a SHAPE_SIMPLE which can then be free-rotated.
      */
-    void Rotate( double aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override
+    void Rotate( const EDA_ANGLE& aAngle, const VECTOR2I& aCenter = { 0, 0 } ) override
     {
-        m_p0 -= aCenter;
-        m_p0 = m_p0.Rotate( aAngle );
-        m_p0 += aCenter;
+        VECTOR2I c1 = m_p0;
+        VECTOR2I c2 = m_p0 + VECTOR2I( m_w, m_h );
 
-        if( abs( sin( aAngle ) ) == 1 )
-            std::swap( m_h, m_w );
+        RotatePoint( c1, aCenter, aAngle );
+        RotatePoint( c2, aCenter, aAngle );
+
+        m_p0 = VECTOR2I( std::min( c1.x, c2.x ), std::min( c1.y, c2.y ) );
+        m_w = std::abs( c2.x - c1.x );
+        m_h = std::abs( c2.y - c1.y );
     }
 
     bool IsSolid() const override
@@ -167,24 +236,24 @@ public:
         return true;
     }
 
-    const SHAPE_LINE_CHAIN Outline() const
-    {
-        SHAPE_LINE_CHAIN rv;
-        rv.Append( m_p0 );
-        rv.Append( m_p0.x, m_p0.y + m_h );
-        rv.Append( m_p0.x + m_w, m_p0.y + m_h );
-        rv.Append( m_p0.x + m_w, m_p0.y );
-        rv.Append( m_p0 );
-        rv.SetClosed( true );
-        return rv;
-    }
+    const SHAPE_LINE_CHAIN Outline() const;
 
-    virtual const std::string Format( ) const override;
+    virtual const std::string Format( bool aCplusPlus = true ) const override;
+
+    void TransformToPolygon( SHAPE_POLY_SET& aBuffer, int aError,
+                             ERROR_LOC aErrorLoc ) const override;
+
+    /**
+     * Ensure that the height and width are positive.
+     */
+    void Normalize();
+
 
 private:
     VECTOR2I m_p0;      ///< Top-left corner
     int      m_w;       ///< Width
     int      m_h;       ///< Height
+    int      m_radius;  ///< Corner radius
 };
 
 #endif // __SHAPE_RECT_H

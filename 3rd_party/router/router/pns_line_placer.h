@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2017 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -34,6 +34,7 @@
 #include "pns_placement_algo.h"
 #include "pns_sizes_settings.h"
 #include "pns_via.h"
+#include "pns_walkaround.h"
 
 namespace PNS {
 
@@ -60,6 +61,35 @@ public:
 
     struct STAGE
     {
+        STAGE() :
+            commit( nullptr )
+        {}
+
+        STAGE( const STAGE& aOther )
+        {
+            *this = aOther;
+        }
+
+        // Copy operator
+        STAGE& operator=( const STAGE& aOther )
+        {
+            commit = aOther.commit;
+            pts = aOther.pts;
+            return *this;
+        }
+
+        // Move assignment operator
+        STAGE& operator=( STAGE&& aOther ) noexcept
+        {
+            if (this != &aOther)
+            {
+                commit = aOther.commit;
+                pts = std::move( aOther.pts );
+            }
+
+            return *this;
+        }
+
         NODE*                  commit;
         std::vector<FIX_POINT> pts;
     };
@@ -73,7 +103,6 @@ public:
 private:
     std::vector<STAGE> m_stages;
 };
-
 
 
 /**
@@ -108,7 +137,7 @@ public:
      */
     bool FixRoute( const VECTOR2I& aP, ITEM* aEndItem, bool aForceFinish ) override;
 
-    bool UnfixRoute() override;
+    std::optional<VECTOR2I> UnfixRoute() override;
 
     bool CommitPlacement() override;
 
@@ -149,6 +178,14 @@ public:
     const ITEM_SET Traces() override;
 
     /**
+     * Return the current start of the line being placed.
+     */
+    const VECTOR2I& CurrentStart() const override
+    {
+        return m_currentStart;
+    }
+
+    /**
      * Return the current end of the line being placed. It may not be equal to the cursor
      * position due to collisions.
      */
@@ -158,11 +195,11 @@ public:
     }
 
     /**
-     * Return the net code of currently routed track.
+     * Return the net of currently routed track.
      */
-    const std::vector<int> CurrentNets() const override
+    const std::vector<NET_HANDLE> CurrentNets() const override
     {
-        return std::vector<int>( 1, m_currentNet );
+        return std::vector<NET_HANDLE>( 1, m_currentNet );
     }
 
     /**
@@ -195,13 +232,19 @@ public:
 
     bool IsPlacingVia() const override { return m_placingVia; }
 
-    void GetModifiedNets( std::vector<int>& aNets ) const override;
+    void GetModifiedNets( std::vector<NET_HANDLE>& aNets ) const override;
 
     /**
-     * Check if point \a aP lies on segment \a aSeg. If so, splits the segment in two, forming a
+     * Snaps the point \a aP to segment \a aSeg. Splits the segment in two, forming a
      * joint at \a aP and stores updated topology in node \a aNode.
      */
     bool SplitAdjacentSegments( NODE* aNode, ITEM* aSeg, const VECTOR2I& aP );
+
+    /**
+     * Snaps the point \a aP to arc \a aArc. Splits the arc in two, forming a
+     * joint at \a aP and stores updated topology in node \a aNode.
+     */
+    bool SplitAdjacentArcs( NODE* aNode, ITEM* aArc, const VECTOR2I& aP );
 
 private:
     /**
@@ -297,7 +340,7 @@ private:
      * colliding solid or non-movable items.  Movable segments are ignored, as they'll be
      * handled later by the shove algorithm.
      */
-    bool routeHead( const VECTOR2I& aP, LINE& aNewHead );
+    bool routeHead( const VECTOR2I& aP, LINE& aNewHead, LINE& aNewTail );
 
     /**
      * Perform a single routing algorithm step, for the end point \a aP.
@@ -308,17 +351,25 @@ private:
     void routeStep( const VECTOR2I& aP );
 
     ///< Route step walk around mode.
-    bool rhWalkOnly( const VECTOR2I& aP, LINE& aNewHead );
+    bool rhWalkOnly( const VECTOR2I& aP, LINE& aNewHead, LINE& aNewTail );
+    bool rhWalkBase( const VECTOR2I& aP, LINE& aWalkLine, int aCollisionMask, PNS::PNS_MODE aMode, bool& aViaOk );
+    bool splitHeadTail( const LINE& aNewLine, const LINE& aOldTail, LINE& aNewHead, LINE& aNewTail );
+    bool cursorDistMinimum( const SHAPE_LINE_CHAIN& aL, const VECTOR2I& aCursor,  double lengthThreshold, SHAPE_LINE_CHAIN& aOut );
+    bool clipAndCheckCollisions( const VECTOR2I& aP, const SHAPE_LINE_CHAIN& aL, SHAPE_LINE_CHAIN& aOut, int &thresholdDist );
+
+    void updatePStart( const LINE& tail );
+
+    //bool rhPostSplitHeadTail( )
 
     ///< Route step shove mode.
-    bool rhShoveOnly( const VECTOR2I& aP, LINE& aNewHead );
+    bool rhShoveOnly( const VECTOR2I& aP, LINE& aNewHead, LINE& aNewTail );
 
     ///< Route step mark obstacles mode.
-    bool rhMarkObstacles( const VECTOR2I& aP, LINE& aNewHead );
+    bool rhMarkObstacles( const VECTOR2I& aP, LINE& aNewHead, LINE& aNewTail );
 
     const VIA makeVia( const VECTOR2I& aP );
 
-    bool buildInitialLine( const VECTOR2I& aP, LINE& aHead, bool aForceNoVia = false );
+    bool buildInitialLine( const VECTOR2I& aP, LINE& aHead, PNS::PNS_MODE aMode, bool aForceNoVia = false );
 
 
     DIRECTION_45   m_direction;         ///< current routing direction
@@ -327,13 +378,14 @@ private:
     LINE           m_head;          ///< the volatile part of the track from the previously
                                     ///< analyzed point to the current routing destination
 
-    LINE           m_last_head;     ///< Most recent successful (non-colliding) head
-
     LINE           m_tail;          ///< routing "tail": part of the track that has been already
                                     ///< fixed due to collisions with obstacles
 
     NODE*          m_world;         ///< pointer to world to search colliding items
     VECTOR2I       m_p_start;       ///< current routing start (end of tail, beginning of head)
+    VECTOR2I       m_fixStart;       ///< start point of the last 'fix'
+
+    std::optional<VECTOR2I>       m_last_p_end;
 
     std::unique_ptr<SHOVE> m_shove; ///< The shove engine
 
@@ -345,7 +397,7 @@ private:
 
     bool           m_placingVia;
 
-    int            m_currentNet;
+    NET_HANDLE     m_currentNet;
     int            m_currentLayer;
 
     VECTOR2I       m_currentEnd;

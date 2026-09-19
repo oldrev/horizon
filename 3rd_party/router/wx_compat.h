@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <cassert>
+#include <cstdarg>
 
 template <class... Args> void wxLogTrace(const char *mask, const char *formatString, Args &&...args)
 {
@@ -27,11 +28,33 @@ public:
         return *this;
     }
 
+    static wxString FromAscii(const char *value) { return value; }
+
+    bool IsEmpty() const
+    {
+        return empty();
+    }
+
+    void Append(const wxString &value)
+    {
+        append(value);
+    }
+
+    void RemoveLast()
+    {
+        if (!empty())
+            pop_back();
+    }
+
     template <class... Args> static wxString Format(const wxString &format, Args &&...args)
     {
         return format;
     }
 };
+
+inline void wxLogTrace(const char *, const wxString &)
+{
+}
 
 const wxString wxEmptyString;
 
@@ -91,3 +114,22 @@ public:
 
 #define wxFAIL_MSG(msg) assert(false)
 #define wxT(x) x
+
+inline int wxAtoi(const wxString &value)
+{
+    return std::stoi(value);
+}
+
+class wxLog
+{
+public:
+    static void EnableLogging(bool = true) {}
+    static bool IsLevelEnabled(int, const wxString &) { return false; }
+};
+
+constexpr int wxLOG_Debug = 0;
+#define wxLOG_COMPONENT "horizon-router"
+
+inline void wxVLogWarning(const char *, va_list)
+{
+}

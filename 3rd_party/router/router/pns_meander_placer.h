@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2014 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -73,33 +73,45 @@ public:
     /// @copydoc PLACEMENT_ALGO::Traces()
     const ITEM_SET Traces() override;
 
+    /// @copydoc PNS_MEANDER_PLACER_BASE::TunedPath()
+    const ITEM_SET TunedPath() override;
+
+    /// @copydoc PLACEMENT_ALGO::CurrentStart()
+    const VECTOR2I& CurrentStart() const override;
+
     /// @copydoc PLACEMENT_ALGO::CurrentEnd()
     const VECTOR2I& CurrentEnd() const override;
 
     /// @copydoc PLACEMENT_ALGO::CurrentNets()
-    const std::vector<int> CurrentNets() const override
+    const std::vector<NET_HANDLE> CurrentNets() const override
     {
-        return std::vector<int> (1, m_originLine.Net() );
+        return std::vector<NET_HANDLE> (1, m_originLine.Net() );
     }
 
     /// @copydoc PLACEMENT_ALGO::CurrentLayer()
     int CurrentLayer() const override;
 
-    /// @copydoc MEANDER_PLACER_BASE::TuningInfo()
-    virtual const wxString TuningInfo( EDA_UNITS aUnits ) const override;
+    /// @copydoc MEANDER_PLACER_BASE::TuningLengthResult()
+    long long int TuningLengthResult() const override;
+
+    /// @copydoc MEANDER_PLACER_BASE::TuningDelayResult()
+    int64_t TuningDelayResult() const override;
 
     /// @copydoc MEANDER_PLACER_BASE::TuningStatus()
-    virtual TUNING_STATUS TuningStatus() const override;
+    TUNING_STATUS TuningStatus() const override;
 
     /// @copydoc MEANDER_PLACER_BASE::CheckFit()
     bool CheckFit ( MEANDER_SHAPE* aShape ) override;
 
 protected:
-    bool doMove( const VECTOR2I& aP, ITEM* aEndItem, long long int aTargetLength );
-
-    void setWorld( NODE* aWorld );
+    bool doMove( const VECTOR2I& aP, ITEM* aEndItem, long long int aTargetLength,
+                 long long int aTargetMin, long long int aTargetMax );
 
     virtual long long int origPathLength() const;
+
+    virtual int64_t origPathDelay() const;
+
+    virtual void calculateTimeDomainTargets();
 
     ///< current routing start point (end of tail, beginning of head)
     VECTOR2I m_currentStart;
@@ -115,7 +127,17 @@ protected:
     MEANDERED_LINE   m_result;
     LINKED_ITEM*     m_initialSegment;
 
+    ///< Total length added by pad to die size.
+    int m_padToDieLength;
+
+    ///< Total length added by pad to die size.
+    int m_padToDieDelay;
+
+    ///< The netclass for the placed segments
+    NETCLASS* m_netClass;
+
     long long int m_lastLength;
+    int64_t       m_lastDelay;
     TUNING_STATUS m_lastStatus;
 };
 

@@ -2,7 +2,7 @@
  * KiRouter - a push-and-(sometimes-)shove PCB router
  *
  * Copyright (C) 2013-2015 CERN
- * Copyright (C) 2016-2021 KiCad Developers, see AUTHORS.txt for contributors.
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
  *
  * @author Tomasz Wlostowski <tomasz.wlostowski@cern.ch>
  *
@@ -24,9 +24,12 @@
 #define __PNS_MEANDER_H
 
 #include <math/vector2d.h>
+#include <core/minoptmax.h>
 
 #include <geometry/shape.h>
 #include <geometry/shape_line_chain.h>
+
+class NETCLASS;
 
 namespace PNS {
 
@@ -52,26 +55,41 @@ enum MEANDER_STYLE {
     MEANDER_STYLE_CHAMFER             // chamfered (45 degree segment)
 };
 
+///< Initial side the meander is placed on.
+enum MEANDER_SIDE
+{
+    MEANDER_SIDE_LEFT = -1,
+    MEANDER_SIDE_DEFAULT = 0,
+    MEANDER_SIDE_RIGHT = 1
+};
+
 /**
  * Dimensions for the meandering algorithm.
  */
 class MEANDER_SETTINGS
 {
 public:
+    static const long long int DEFAULT_LENGTH_TOLERANCE;
+    static const long long int LENGTH_UNCONSTRAINED;
 
-    MEANDER_SETTINGS()
-    {
-        m_minAmplitude = 100000;
-        m_maxAmplitude = 1000000;
-        m_step = 50000;
-        m_lenPadToDie = 0;
-        m_spacing = 600000;
-        m_targetLength = 100000000;
-        m_targetSkew = 0;
-        m_cornerStyle = MEANDER_STYLE_ROUND;
-        m_cornerRadiusPercentage = 100;
-        m_lengthTolerance = 100000;
-    }
+    static const long long int DEFAULT_DELAY_TOLERANCE;
+    static const long long int DELAY_UNCONSTRAINED;
+
+    static const int SKEW_UNCONSTRAINED;
+
+    MEANDER_SETTINGS();
+
+    void SetTargetLength( long long int aOpt );
+    void SetTargetLength( const MINOPTMAX<int>& aConstraint );
+
+    void SetTargetLengthDelay( long long int aOpt );
+    void SetTargetLengthDelay( const MINOPTMAX<int>& aConstraint );
+
+    void SetTargetSkew( int aOpt );
+    void SetTargetSkew( const MINOPTMAX<int>& aConstraint );
+
+    void SetTargetSkewDelay( int aOpt );
+    void SetTargetSkewDelay( const MINOPTMAX<int>& aConstraint );
 
     ///< Minimum meandering amplitude.
     int m_minAmplitude;
@@ -89,7 +107,18 @@ public:
     int m_lenPadToDie;
 
     ///< Desired length of the tuned line/diff pair (this is in nm, so allow more than board width).
-    long long int m_targetLength;
+    MINOPTMAX<long long int> m_targetLength;
+
+    ///< Desired propagation delay of the tuned line
+    MINOPTMAX<long long int> m_targetLengthDelay;
+
+    ///< Target skew value for diff pair de-skewing.
+    MINOPTMAX<int>           m_targetSkew;
+
+    ///< Target skew value for diff pair de-skewing.
+    MINOPTMAX<int> m_targetSkewDelay;
+
+    bool                     m_overrideCustomRules;
 
     ///< Type of corners for the meandered line.
     MEANDER_STYLE m_cornerStyle;
@@ -97,11 +126,23 @@ public:
     ///< Rounding percentage (0 - 100).
     int m_cornerRadiusPercentage;
 
+    ///< Place meanders on one side.
+    bool m_singleSided;
+
+    ///< Initial side when placing meanders at segment
+    MEANDER_SIDE m_initialSide;
+
     ///< Allowable tuning error.
     int m_lengthTolerance;
 
-    ///< Target skew value for diff pair de-skewing.
-    int m_targetSkew;
+    ///< Keep vertices between pre, tuned and post parts of the line.
+    bool m_keepEndpoints;
+
+    ///< Calculate tuning in the time domain
+    bool m_isTimeDomain;
+
+    ///< The net class this meander pattern belongs to
+    NETCLASS* m_netClass;
 };
 
 /**
@@ -125,6 +166,7 @@ public:
         // Do not leave uninitialized members, and keep static analyzer quiet:
         m_type = MT_SINGLE;
         m_amplitude = 0;
+        m_targetBaseLen = 0;
         m_side = false;
         m_baseIndex = 0;
         m_currentTarget = nullptr;
@@ -269,7 +311,17 @@ public:
     /**
      * @return the length of the fitted line chain.
      */
-    int MaxTunableLength() const;
+    long long int CurrentLength() const;
+
+    /**
+     * @return the minumum tunable length according to settings.
+     */
+    long long int MinTunableLength() const;
+
+    /**
+     * @return the minumum possible amplitude according to settings.
+     */
+    int MinAmplitude() const;
 
     /**
      * @return the current meandering settings.
@@ -295,6 +347,14 @@ public:
         m_baselineOffset = aOffset;
     }
 
+    /**
+     * Sets the target length of the baseline. When resizing, the meander will try to
+     * fit the baseline length into the specified value.
+     *
+     * @param aLength the minimum baseline length.
+     */
+    void SetTargetBaselineLength( int aLength ) { m_targetBaseLen = aLength; }
+
 private:
     friend class MEANDERED_LINE;
 
@@ -305,7 +365,7 @@ private:
     void forward( int aLength );
 
     ///< Turn the turtle by \a aAngle
-    void turn( int aAngle );
+    void turn( const EDA_ANGLE& aAngle );
 
     ///< Tell the turtle to draw a mitered corner of given radius and turn direction.
     void miter( int aRadius, bool aSide );
@@ -318,7 +378,7 @@ private:
 
     ///< Produce a meander shape of given type.
     SHAPE_LINE_CHAIN genMeanderShape( const VECTOR2D& aP, const VECTOR2D& aDir, bool aSide,
-                                      MEANDER_TYPE aType, int aAmpl, int aBaselineOffset = 0 );
+                                      MEANDER_TYPE aType, int aBaselineOffset = 0 );
 
     ///< Recalculate the clipped baseline after the parameters of the meander have been changed.
     void updateBaseSegment();
@@ -349,6 +409,9 @@ private:
 
     ///< Average radius of meander corners (for correction of DP meanders).
     int m_meanCornerRadius;
+
+    ///< Minimum length of the base segment to target when resizing.
+    int m_targetBaseLen;
 
     ///< First point of the meandered line.
     VECTOR2I m_p0;
@@ -504,6 +567,24 @@ public:
      * @return the current meandering settings.
      */
     const MEANDER_SETTINGS& Settings() const;
+
+    // Move assignment operator
+    MEANDERED_LINE& operator=( MEANDERED_LINE&& aOther ) noexcept
+    {
+        if (this != &aOther)
+        {
+            m_last = aOther.m_last;
+
+            m_placer = aOther.m_placer;
+            m_meanders = std::move( aOther.m_meanders );
+
+            m_dual = aOther.m_dual;
+            m_width = aOther.m_width;
+            m_baselineOffset = aOther.m_baselineOffset;
+        }
+
+        return *this;
+    }
 
 private:
     VECTOR2I m_last;
