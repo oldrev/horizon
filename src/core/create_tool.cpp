@@ -105,6 +105,8 @@
 #include "tools/tool_add_height_restriction.hpp"
 #include "tools/tool_edit_table.hpp"
 #include "tools/tool_place_table.hpp"
+#include "tools/tool_place_qrcode.hpp"
+#include "tools/tool_edit_qrcode.hpp"
 
 namespace horizon {
 
@@ -160,6 +162,9 @@ std::unique_ptr<ToolBase> Core::create_tool(ToolID tool_id)
 
     case ToolID::PLACE_TABLE:
         return std::make_unique<ToolPlaceTable>(this, tool_id);
+
+    case ToolID::PLACE_QRCODE:
+        return std::make_unique<ToolPlaceQRCode>(this, tool_id);
 
     case ToolID::PLACE_NET_LABEL:
         return std::make_unique<ToolPlaceNetLabel>(this, tool_id);
@@ -461,6 +466,9 @@ std::unique_ptr<ToolBase> Core::create_tool(ToolID tool_id)
 
     case ToolID::EDIT_TABLE:
         return std::make_unique<ToolEditTable>(this, tool_id);
+
+    case ToolID::EDIT_QRCODE:
+        return std::make_unique<ToolEditQRCode>(this, tool_id);
 
     case ToolID::EDIT_TEXT:
         return std::make_unique<ToolEditText>(this, tool_id);

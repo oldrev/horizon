@@ -178,5 +178,7 @@ enum class ToolID {
     DELETE_HEIGHT_RESTRICTION,
     PLACE_TABLE,
     EDIT_TABLE,
+    PLACE_QRCODE,
+    EDIT_QRCODE,
 };
 } // namespace horizon

@@ -26,6 +26,10 @@ public:
     virtual class Table *get_table(const UUID &uu) = 0;
     virtual void delete_table(const UUID &uu) = 0;
 
+    virtual class QRCode *insert_qrcode(const UUID &uu) = 0;
+    virtual class QRCode *get_qrcode(const UUID &uu) = 0;
+    virtual void delete_qrcode(const UUID &uu) = 0;
+
     virtual class Polygon *insert_polygon(const UUID &uu) = 0;
     virtual class Polygon *get_polygon(const UUID &uu) = 0;
     virtual void delete_polygon(const UUID &uu) = 0;

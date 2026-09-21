@@ -24,6 +24,10 @@ public:
     class Table *get_table(const UUID &uu) override;
     void delete_table(const UUID &uu) override;
 
+    class QRCode *insert_qrcode(const UUID &uu) override;
+    class QRCode *get_qrcode(const UUID &uu) override;
+    void delete_qrcode(const UUID &uu) override;
+
     class Polygon *insert_polygon(const UUID &uu) override;
     class Polygon *get_polygon(const UUID &uu) override;
     void delete_polygon(const UUID &uu) override;
@@ -65,6 +69,10 @@ protected:
         return nullptr;
     }
     virtual std::map<UUID, Table> *get_table_map()
+    {
+        return nullptr;
+    }
+    virtual std::map<UUID, QRCode> *get_qrcode_map()
     {
         return nullptr;
     }

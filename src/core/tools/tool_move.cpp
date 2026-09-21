@@ -289,6 +289,9 @@ Coordi ToolMove::get_selection_center()
         case ObjectType::TABLE:
             accu.accumulate(doc.r->get_table(it.uuid)->placement.shift);
             break;
+        case ObjectType::QRCODE:
+            accu.accumulate(doc.r->get_qrcode(it.uuid)->placement.shift);
+            break;
         case ObjectType::POLYGON_VERTEX:
             accu.accumulate(doc.r->get_polygon(it.uuid)->vertices.at(it.vertex).position);
             break;

@@ -197,6 +197,8 @@ src_common = files(
     'src/common/polygon.cpp',
     'src/common/shape.cpp',
     'src/common/text.cpp',
+    'src/common/qrcode.cpp',
+    '3rd_party/qrcodegen/qrcodegen.cpp',
     'src/common/table.cpp',
     'src/frame/frame.cpp',
     'src/logger/logger.cpp',
@@ -514,6 +516,7 @@ src_imp = files(
     'src/dialogs/edit_shape.cpp',
     'src/dialogs/edit_stackup.cpp',
     'src/dialogs/edit_table_window.cpp',
+    'src/dialogs/edit_qrcode_window.cpp',
     'src/dialogs/edit_text_window.cpp',
     'src/dialogs/edit_via.cpp',
     'src/dialogs/enter_datum_angle_window.cpp',
@@ -780,6 +783,7 @@ src_tests = files(
     '3rd_party/catch2/catch_amalgamated.cpp',
     'src/tests/tool_lut.cpp',
     'src/tests/layer_display_default.cpp',
+    'src/tests/qrcode.cpp',
     'src/imp/action_catalog.cpp',
     'src/imp/action.cpp',
 )
@@ -1034,6 +1038,7 @@ horizon_tests = executable('horizon-tests',
     dependencies: build_dependencies_libhorizon,
     link_with: [clipper_nopic, libhorizon],
     include_directories: include_directories,
+    cpp_args: cpp_args,
     build_by_default: false,
 )
 

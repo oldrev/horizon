@@ -43,7 +43,7 @@ const LutEnumStr<Board::OutputFormat> Board::output_format_lut = {
         {"odb", Board::OutputFormat::ODB},
 };
 
-static const unsigned int app_version = 23;
+static const unsigned int app_version = 24;
 
 unsigned int Board::get_app_version()
 {
@@ -162,6 +162,13 @@ Board::Board(const UUID &uu, const json &j, Block &iblock, IPool &pool, const st
         for (auto it = o.cbegin(); it != o.cend(); ++it) {
             auto u = UUID(it.key());
             load_and_log(tables, ObjectType::TABLE, std::forward_as_tuple(u, it.value()), Logger::Domain::BOARD);
+        }
+    }
+    if (j.count("qrcodes")) {
+        const json &o = j["qrcodes"];
+        for (auto it = o.cbegin(); it != o.cend(); ++it) {
+            auto u = UUID(it.key());
+            load_and_log(qrcodes, ObjectType::QRCODE, std::forward_as_tuple(u, it.value()), Logger::Domain::BOARD);
         }
     }
     if (j.count("lines")) {
@@ -384,8 +391,8 @@ const std::map<int, Layer> &Board::get_layers() const
 
 Board::Board(const Board &brd, CopyMode copy_mode)
     : layers(brd.layers), uuid(brd.uuid), block(brd.block), name(brd.name), polygons(brd.polygons), holes(brd.holes),
-      junctions(brd.junctions), tracks(brd.tracks), texts(brd.texts), tables(brd.tables), lines(brd.lines),
-      arcs(brd.arcs), planes(brd.planes), keepouts(brd.keepouts), dimensions(brd.dimensions),
+      junctions(brd.junctions), tracks(brd.tracks), texts(brd.texts), tables(brd.tables), qrcodes(brd.qrcodes),
+      lines(brd.lines), arcs(brd.arcs), planes(brd.planes), keepouts(brd.keepouts), dimensions(brd.dimensions),
       connection_lines(brd.connection_lines), included_boards(brd.included_boards), board_panels(brd.board_panels),
       pictures(brd.pictures), decals(brd.decals), net_ties(brd.net_ties), height_restrictions(brd.height_restrictions),
       warnings(brd.warnings), output_format(brd.output_format), rules(brd.rules),
@@ -851,6 +858,25 @@ static std::string replace_text_map(const std::string &s, const std::map<std::st
     return interpolate_text(s, fn);
 }
 
+template <typename T> static void reset_text_overrides(T &items)
+{
+    for (auto &it : items) {
+        it.second.overridden = false;
+    }
+}
+
+template <typename T> static void expand_text_overrides(T &items, const std::map<std::string, std::string> &meta)
+{
+    for (auto &it : items) {
+        if (it.second.overridden == false) {
+            if (std::count(it.second.text.begin(), it.second.text.end(), '$')) {
+                it.second.overridden = true;
+                it.second.text_override = replace_text_map(it.second.text, meta);
+            }
+        }
+    }
+}
+
 void Board::expand()
 {
     expand_flags = EXPAND_ALL;
@@ -862,9 +888,8 @@ void Board::expand_some()
     delete_dependants();
     warnings.clear();
 
-    for (auto &it : texts) {
-        it.second.overridden = false;
-    }
+    reset_text_overrides(texts);
+    reset_text_overrides(qrcodes);
 
     if (expand_flags & EXPAND_PACKAGES)
         expand_packages();
@@ -954,14 +979,8 @@ void Board::expand_some()
         }
     }
 
-    for (auto &it : texts) {
-        if (it.second.overridden == false) {
-            if (std::count(it.second.text.begin(), it.second.text.end(), '$')) {
-                it.second.overridden = true;
-                it.second.text_override = replace_text_map(it.second.text, block->project_meta);
-            }
-        }
-    }
+    expand_text_overrides(texts, block->project_meta);
+    expand_text_overrides(qrcodes, block->project_meta);
 
     if (expand_flags & EXPAND_ALL_AIRWIRES)
         update_all_airwires();
@@ -1318,6 +1337,10 @@ json Board::serialize() const
     j["tables"] = json::object();
     for (const auto &it : tables) {
         j["tables"][(std::string)it.first] = it.second.serialize();
+    }
+    j["qrcodes"] = json::object();
+    for (const auto &it : qrcodes) {
+        j["qrcodes"][(std::string)it.first] = it.second.serialize();
     }
     j["lines"] = json::object();
     for (const auto &it : lines) {

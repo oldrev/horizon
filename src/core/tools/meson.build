@@ -10,6 +10,8 @@ src_tools = files(
     'tool_map_symbol.cpp',
     'tool_draw_line_net.cpp',
     'tool_place_table.cpp',
+    'tool_place_qrcode.cpp',
+    'tool_edit_qrcode.cpp',
     'tool_place_text.cpp',
     'tool_place_net_label.cpp',
     'tool_disconnect.cpp',

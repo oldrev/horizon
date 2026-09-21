@@ -75,6 +75,9 @@ void ToolHelperMove::move_do(const Coordi &delta)
         case ObjectType::TABLE:
             doc.r->get_table(it.uuid)->placement.shift += delta;
             break;
+        case ObjectType::QRCODE:
+            doc.r->get_qrcode(it.uuid)->placement.shift += delta;
+            break;
         case ObjectType::POLYGON_VERTEX:
             doc.r->get_polygon(it.uuid)->vertices.at(it.vertex).position += delta;
             break;
@@ -277,6 +280,22 @@ void ToolHelperMove::move_mirror_or_rotate(const Coordi &center, bool rotate)
             }
             else {
                 // mirroring is not supported
+            }
+        } break;
+
+        case ObjectType::QRCODE: {
+            QRCode *qr = doc.r->get_qrcode(it.uuid);
+            transform(qr->placement.shift, center, rotate);
+            if (rotate) {
+                if (qr->placement.mirror) {
+                    qr->placement.inc_angle_deg(90);
+                }
+                else {
+                    qr->placement.inc_angle_deg(-90);
+                }
+            }
+            else {
+                qr->placement.mirror = !qr->placement.mirror;
             }
         } break;
 

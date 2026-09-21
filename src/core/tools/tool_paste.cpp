@@ -260,6 +260,17 @@ ToolResponse ToolPaste::really_begin_paste(const json &j, const Coordi &cursor_p
             selection.emplace(u, ObjectType::TABLE);
         }
     }
+    if (j.count("qrcodes") && doc.r->has_object_type(ObjectType::QRCODE)) {
+        const json &o = j["qrcodes"];
+        for (auto it = o.cbegin(); it != o.cend(); ++it) {
+            auto u = UUID::random();
+            auto x = doc.r->insert_qrcode(u);
+            *x = QRCode(u, it.value());
+            transform(x->placement, ObjectType::QRCODE);
+            fix_layer(x->layer);
+            selection.emplace(u, ObjectType::QRCODE);
+        }
+    }
     if (j.count("dimensions") && doc.r->has_object_type(ObjectType::DIMENSION)) {
         const json &o = j["dimensions"];
         for (auto it = o.cbegin(); it != o.cend(); ++it) {

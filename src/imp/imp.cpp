@@ -1869,6 +1869,9 @@ ActionToolID ImpBase::get_doubleclick_action(ObjectType type, const UUID &uu)
     case ObjectType::TABLE:
         return ToolID::EDIT_TABLE;
 
+    case ObjectType::QRCODE:
+        return ToolID::EDIT_QRCODE;
+
     case ObjectType::POLYGON_ARC_CENTER:
     case ObjectType::POLYGON_VERTEX:
     case ObjectType::POLYGON_EDGE:

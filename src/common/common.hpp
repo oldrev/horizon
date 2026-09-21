@@ -72,6 +72,7 @@ enum class ObjectType {
     BOARD_NET_TIE,
     HEIGHT_RESTRICTION,
     TABLE,
+    QRCODE,
 };
 enum class PatchType { OTHER, TRACK, PAD, PAD_TH, VIA, PLANE, HOLE_PTH, HOLE_NPTH, BOARD_EDGE, TEXT, NET_TIE, N_TYPES };
 

@@ -6,6 +6,7 @@
 #include "shape.hpp"
 #include "pool/symbol.hpp"
 #include "board/via.hpp"
+#include "qrcode.hpp"
 
 namespace horizon {
 
@@ -432,6 +433,30 @@ const std::map<ObjectType, ObjectDescription> object_descriptions = {
                   {ObjectProperty::ID::SIZE, {ObjectProperty::Type::LENGTH, "Text Size", 5}},
                   {ObjectProperty::ID::WIDTH, {ObjectProperty::Type::LENGTH, "Line Width", 6}},
                   {ObjectProperty::ID::PADDING, {ObjectProperty::Type::LENGTH, "Cell Padding", 7}},
+          }}},
+        {ObjectType::QRCODE,
+         {"QR code",
+          "QR codes",
+          {
+                  {ObjectProperty::ID::LAYER, {ObjectProperty::Type::LAYER, "Layer", 0}},
+                  {ObjectProperty::ID::POSITION_X, {ObjectProperty::Type::DIM, "Position X", 1}},
+                  {ObjectProperty::ID::POSITION_Y, {ObjectProperty::Type::DIM, "Position Y", 2}},
+                  {ObjectProperty::ID::ANGLE, {ObjectProperty::Type::ANGLE, "Angle", 3}},
+                  {ObjectProperty::ID::MIRROR, {ObjectProperty::Type::BOOL, "Mirrored", 4}},
+                  {ObjectProperty::ID::TEXT, {ObjectProperty::Type::STRING, "Text", 5}},
+                  {ObjectProperty::ID::SIZE, {ObjectProperty::Type::LENGTH, "Module Size", 6}},
+                  {ObjectProperty::ID::ECC,
+                   {ObjectProperty::Type::ENUM,
+                    "Error Correction",
+                    7,
+                    {
+                            {static_cast<int>(QRCode::ECC::LOW), "Low (7%)"},
+                            {static_cast<int>(QRCode::ECC::MEDIUM), "Medium (15%)"},
+                            {static_cast<int>(QRCode::ECC::QUARTILE), "Quartile (25%)"},
+                            {static_cast<int>(QRCode::ECC::HIGH), "High (30%)"},
+                    }}},
+                  {ObjectProperty::ID::BORDER_MODULES, {ObjectProperty::Type::INT, "Quiet Zone", 8}},
+                  {ObjectProperty::ID::INVERTED, {ObjectProperty::Type::BOOL, "Inverted", 9}},
           }}},
 };
 } // namespace horizon

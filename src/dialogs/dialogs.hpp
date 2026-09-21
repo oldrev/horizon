@@ -82,6 +82,7 @@ public:
     class EditPlaneWindow *show_edit_plane_window(class Plane &plane, class Board &brd);
     class EditTextWindow *show_edit_text_window(class Text &text, bool use_ok);
     class EditTableWindow *show_edit_table_window(class Table &table, bool use_ok);
+    class EditQRCodeWindow *show_edit_qrcode_window(class QRCode &qr, bool use_ok);
 
     void close_nonmodal();
     class ToolWindow *get_nonmodal();

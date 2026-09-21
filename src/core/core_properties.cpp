@@ -7,10 +7,12 @@
 #include "common/arc.hpp"
 #include "common/text.hpp"
 #include "common/table.hpp"
+#include "common/qrcode.hpp"
 #include "common/line.hpp"
 #include "common/keepout.hpp"
 #include "core.hpp"
 #include "util/util.hpp"
+#include <algorithm>
 #include <assert.h>
 
 namespace horizon {
@@ -140,6 +142,56 @@ bool Core::get_property(ObjectType type, const UUID &uu, ObjectProperty::ID prop
 
         case ObjectProperty::ID::PADDING:
             dynamic_cast<PropertyValueInt &>(value).value = table->get_padding();
+            return true;
+
+        default:
+            return false;
+        }
+    } break;
+
+    case ObjectType::QRCODE: {
+        auto qr = get_qrcode(uu);
+        switch (property) {
+        case ObjectProperty::ID::LAYER:
+            dynamic_cast<PropertyValueInt &>(value).value = qr->layer;
+            return true;
+
+        case ObjectProperty::ID::POSITION_X:
+        case ObjectProperty::ID::POSITION_Y:
+        case ObjectProperty::ID::MIRROR:
+            get_placement(qr->placement, value, property);
+            return true;
+
+        case ObjectProperty::ID::ANGLE:
+            if (qr->placement.mirror) {
+                Placement pl = qr->placement;
+                pl.invert_angle();
+                pl.inc_angle_deg(180);
+                dynamic_cast<PropertyValueInt &>(value).value = pl.get_angle();
+            }
+            else {
+                dynamic_cast<PropertyValueInt &>(value).value = qr->placement.get_angle();
+            }
+            return true;
+
+        case ObjectProperty::ID::TEXT:
+            dynamic_cast<PropertyValueString &>(value).value = qr->text;
+            return true;
+
+        case ObjectProperty::ID::SIZE:
+            dynamic_cast<PropertyValueInt &>(value).value = qr->module_size;
+            return true;
+
+        case ObjectProperty::ID::ECC:
+            dynamic_cast<PropertyValueInt &>(value).value = static_cast<int>(qr->ecc);
+            return true;
+
+        case ObjectProperty::ID::BORDER_MODULES:
+            dynamic_cast<PropertyValueInt &>(value).value = qr->border_modules;
+            return true;
+
+        case ObjectProperty::ID::INVERTED:
+            dynamic_cast<PropertyValueBool &>(value).value = qr->inverted;
             return true;
 
         default:
@@ -354,6 +406,53 @@ bool Core::set_property(ObjectType type, const UUID &uu, ObjectProperty::ID prop
         }
     } break;
 
+    case ObjectType::QRCODE: {
+        auto qr = get_qrcode(uu);
+        switch (property) {
+        case ObjectProperty::ID::LAYER:
+            qr->layer = dynamic_cast<const PropertyValueInt &>(value).value;
+            break;
+
+        case ObjectProperty::ID::POSITION_X:
+        case ObjectProperty::ID::POSITION_Y:
+        case ObjectProperty::ID::MIRROR:
+            set_placement(qr->placement, value, property);
+            break;
+
+        case ObjectProperty::ID::ANGLE:
+            qr->placement.set_angle(dynamic_cast<const PropertyValueInt &>(value).value);
+            if (qr->placement.mirror) {
+                qr->placement.invert_angle();
+                qr->placement.inc_angle_deg(180);
+            }
+            break;
+
+        case ObjectProperty::ID::TEXT:
+            qr->text = dynamic_cast<const PropertyValueString &>(value).value;
+            break;
+
+        case ObjectProperty::ID::SIZE:
+            qr->module_size = dynamic_cast<const PropertyValueInt &>(value).value;
+            break;
+
+        case ObjectProperty::ID::ECC:
+            qr->ecc = static_cast<QRCode::ECC>(dynamic_cast<const PropertyValueInt &>(value).value);
+            break;
+
+        case ObjectProperty::ID::BORDER_MODULES:
+            qr->border_modules = std::min<unsigned int>(dynamic_cast<const PropertyValueInt &>(value).value,
+                                                        QRCode::max_border_modules);
+            break;
+
+        case ObjectProperty::ID::INVERTED:
+            qr->inverted = dynamic_cast<const PropertyValueBool &>(value).value;
+            break;
+
+        default:
+            return false;
+        }
+    } break;
+
     case ObjectType::DIMENSION: {
         auto dim = get_dimension(uu);
         switch (property) {
@@ -448,6 +547,15 @@ bool Core::get_property_meta(ObjectType type, const UUID &uu, ObjectProperty::ID
         }
         break;
     case ObjectType::TABLE:
+        switch (property) {
+        case ObjectProperty::ID::LAYER:
+            layers_to_meta(meta);
+            return true;
+        default:
+            return false;
+        }
+        break;
+    case ObjectType::QRCODE:
         switch (property) {
         case ObjectProperty::ID::LAYER:
             layers_to_meta(meta);

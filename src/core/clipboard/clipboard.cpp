@@ -8,6 +8,7 @@
 #include "common/polygon.hpp"
 #include "common/arc.hpp"
 #include "common/text.hpp"
+#include "common/qrcode.hpp"
 #include "document/idocument.hpp"
 #include "document/idocument_padstack.hpp"
 #include "document/idocument_package.hpp"
@@ -96,6 +97,10 @@ void ClipboardBase::serialize(json &j)
 
         case ObjectType::TABLE:
             j["tables"][(std::string)it.uuid] = get_doc().get_table(it.uuid)->serialize();
+            break;
+
+        case ObjectType::QRCODE:
+            j["qrcodes"][(std::string)it.uuid] = get_doc().get_qrcode(it.uuid)->serialize();
             break;
 
         case ObjectType::JUNCTION:

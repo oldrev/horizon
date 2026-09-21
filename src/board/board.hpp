@@ -26,6 +26,7 @@
 #include "included_board.hpp"
 #include "board_panel.hpp"
 #include "common/picture.hpp"
+#include "common/qrcode.hpp"
 #include "board_decal.hpp"
 #include "util/file_version.hpp"
 #include "common/grid_settings.hpp"
@@ -106,6 +107,7 @@ public:
     std::map<UUID, Via> vias;
     std::map<UUID, Text> texts;
     std::map<UUID, Table> tables;
+    std::map<UUID, QRCode> qrcodes;
     std::map<UUID, Line> lines;
     std::map<UUID, Arc> arcs;
     std::map<UUID, Plane> planes;

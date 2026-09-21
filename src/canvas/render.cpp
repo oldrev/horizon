@@ -6,6 +6,7 @@
 #include "common/polygon.hpp"
 #include "common/text.hpp"
 #include "common/table.hpp"
+#include "common/qrcode.hpp"
 #include "layer_display.hpp"
 #include "package/pad.hpp"
 #include "poly2tri/poly2tri.h"
@@ -874,6 +875,64 @@ void Canvas::render(const Table &table, bool interactive, ColorP co)
     if (interactive) {
         selectables.append(table.uuid, ObjectType::TABLE, {0, 0}, {0, 0}, {total_width, total_height}, 0, table.layer);
         targets.emplace_back(table.uuid, ObjectType::TABLE, transform.transform(Coordi(0, 0)), 0, table.layer);
+    }
+
+    transform_restore();
+}
+
+void Canvas::render(const QRCode &qr, bool interactive, ColorP co)
+{
+    const auto &layers = layer_provider.get_layers();
+    if (!layers.count(qr.layer))
+        return;
+
+    // on reversed (i.e. bottom side) layers the symbol has to be mirrored to be
+    // readable from that layer's point of view
+    const bool rev = layers.at(qr.layer).reverse;
+
+    transform_save();
+    transform.accumulate(qr.placement);
+
+    const auto &error = qr.get_error();
+    if (!error.empty()) {
+        if (!img_mode)
+            draw_error({0, 0}, 2e5, error);
+    }
+    else {
+        const auto rects = qr.get_drawn_rects(rev);
+        const bool draw = !img_mode && layer_display.count(qr.layer) && !rects.empty();
+
+        Polygon poly(UUID::random());
+        poly.layer = qr.layer;
+
+        if (!rects.empty())
+            object_ref_push(ObjectType::QRCODE, qr.uuid);
+        for (const auto &[from, to] : rects) {
+            poly.vertices.clear();
+            poly.vertices.emplace_back(from);
+            poly.vertices.emplace_back(Coordi(to.x, from.y));
+            poly.vertices.emplace_back(to);
+            poly.vertices.emplace_back(Coordi(from.x, to.y));
+            img_polygon(poly, true);
+
+            if (draw) {
+                const auto p0 = transform.transform(from);
+                const auto p1 = transform.transform(Coordi(to.x, from.y));
+                const auto p2 = transform.transform(to);
+                const auto p3 = transform.transform(Coordi(from.x, to.y));
+                add_triangle(qr.layer, p0, p1, p2, co);
+                add_triangle(qr.layer, p0, p2, p3, co);
+            }
+        }
+        if (!rects.empty())
+            object_ref_pop();
+    }
+
+    // even a broken or still empty code has to stay selectable
+    if (interactive && !img_mode && layer_display.count(qr.layer)) {
+        const auto bbox = qr.get_bbox();
+        selectables.append(qr.uuid, ObjectType::QRCODE, {0, 0}, bbox.first, bbox.second, 0, qr.layer);
+        targets.emplace_back(qr.uuid, ObjectType::QRCODE, transform.transform(Coordi(0, 0)), 0, qr.layer);
     }
 
     transform_restore();
@@ -1772,6 +1831,9 @@ void Canvas::render(const Board &brd, bool interactive, PanelMode mode, OutlineM
         render(it.second, interactive);
     }
     for (const auto &it : brd.tables) {
+        render(it.second, interactive);
+    }
+    for (const auto &it : brd.qrcodes) {
         render(it.second, interactive);
     }
     for (const auto &it : brd.tracks) {

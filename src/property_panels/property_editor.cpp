@@ -341,6 +341,9 @@ Gtk::Widget *PropertyEditorInt::create_editor()
 {
     sp = Gtk::manage(new Gtk::SpinButton());
     sp->set_range(0, 65536);
+    // a spin button created without an explicit step leaves the adjustment's
+    // step increment at zero, which makes the up/down buttons do nothing
+    sp->set_increments(1, 1);
     sp->set_width_chars(7);
     connections.push_back(sp->signal_value_changed().connect([this] { s_signal_changed.emit(); }));
     sp->signal_activate().connect([this] { s_signal_activate.emit(); });

@@ -1425,6 +1425,8 @@ std::map<ObjectType, ImpBase::SelectionFilterInfo> ImpBoard::get_selection_filte
             {ObjectType::CONNECTION_LINE, {}},
             {ObjectType::BOARD_PANEL, {}},
             {ObjectType::PICTURE, {}},
+            {ObjectType::QRCODE, {}},
+            {ObjectType::TABLE, {}},
     };
     return r;
 }

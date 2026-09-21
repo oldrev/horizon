@@ -4,6 +4,7 @@
 #include "common/arc.hpp"
 #include "common/text.hpp"
 #include "common/table.hpp"
+#include "common/qrcode.hpp"
 #include "common/hole.hpp"
 #include "common/dimension.hpp"
 #include "common/keepout.hpp"
@@ -128,6 +129,25 @@ class Table *Document::get_table(const UUID &uu)
 void Document::delete_table(const UUID &uu)
 {
     auto map = get_table_map();
+    map->erase(uu);
+}
+
+class QRCode *Document::insert_qrcode(const UUID &uu)
+{
+    auto map = get_qrcode_map();
+    auto x = map->emplace(std::make_pair(uu, uu));
+    return &(x.first->second);
+}
+
+class QRCode *Document::get_qrcode(const UUID &uu)
+{
+    auto map = get_qrcode_map();
+    return &map->at(uu);
+}
+
+void Document::delete_qrcode(const UUID &uu)
+{
+    auto map = get_qrcode_map();
     map->erase(uu);
 }
 

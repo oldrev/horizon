@@ -47,6 +47,7 @@
 #include "select_block.hpp"
 #include "align_and_distribute_window.hpp"
 #include "edit_table_window.hpp"
+#include "edit_qrcode_window.hpp"
 #include "edit_text_window.hpp"
 #include "plane_update.hpp"
 #include "util/automatic_prefs.hpp"
@@ -748,6 +749,19 @@ EditTableWindow *Dialogs::show_edit_table_window(class Table &table, bool use_ok
         return win;
     }
     auto win = new EditTableWindow(parent, interface, table, use_ok);
+    window_nonmodal = win;
+    win->signal_hide().connect([this] { close_nonmodal(); });
+    win->present();
+    return win;
+}
+
+EditQRCodeWindow *Dialogs::show_edit_qrcode_window(class QRCode &qr, bool use_ok)
+{
+    if (auto win = dynamic_cast<EditQRCodeWindow *>(window_nonmodal)) {
+        win->present();
+        return win;
+    }
+    auto win = new EditQRCodeWindow(parent, interface, qr, use_ok);
     window_nonmodal = win;
     win->signal_hide().connect([this] { close_nonmodal(); });
     win->present();
