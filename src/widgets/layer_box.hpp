@@ -24,6 +24,10 @@ public:
     {
         return p_property_layer_opacity.get_proxy();
     }
+    Glib::PropertyProxy<float> property_plane_opacity()
+    {
+        return p_property_plane_opacity.get_proxy();
+    }
     Glib::PropertyProxy<CanvasGL::HighlightMode> property_highlight_mode()
     {
         return p_property_highlight_mode.get_proxy();
@@ -46,6 +50,7 @@ private:
 
     Glib::Property<int> p_property_work_layer;
     Glib::Property<float> p_property_layer_opacity;
+    Glib::Property<float> p_property_plane_opacity;
     Glib::Property<CanvasGL::HighlightMode> p_property_highlight_mode;
     Glib::Property<CanvasGL::LayerMode> p_property_layer_mode;
     type_signal_set_layer_display s_signal_set_layer_display;
@@ -54,5 +59,6 @@ private:
 
     Glib::RefPtr<Glib::Binding> binding_select_work_layer_only;
     Glib::RefPtr<Glib::Binding> binding_layer_opacity;
+    Glib::RefPtr<Glib::Binding> binding_plane_opacity;
 };
 } // namespace horizon

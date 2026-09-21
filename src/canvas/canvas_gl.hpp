@@ -146,6 +146,14 @@ public:
     {
         return Glib::PropertyProxy_ReadOnly<float>(this, "layer-opacity");
     }
+    Glib::PropertyProxy<float> property_plane_opacity()
+    {
+        return p_property_plane_opacity.get_proxy();
+    }
+    Glib::PropertyProxy_ReadOnly<float> property_plane_opacity() const
+    {
+        return Glib::PropertyProxy_ReadOnly<float>(this, "plane-opacity");
+    }
     Markers markers;
     void update_markers() override;
 
@@ -276,6 +284,7 @@ private:
     bool selection_allowed = true;
     Glib::Property<int> p_property_work_layer;
     Glib::Property<float> p_property_layer_opacity;
+    Glib::Property<float> p_property_plane_opacity;
 
     Gtk::Menu *clarify_menu;
 

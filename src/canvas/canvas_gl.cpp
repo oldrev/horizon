@@ -36,7 +36,7 @@ CanvasGL::CanvasGL()
     : Glib::ObjectBase(typeid(CanvasGL)), Canvas::Canvas(), markers(*this), selection_filter(*this), grid(*this),
       drag_selection(*this), selectables_renderer(*this, selectables), triangle_renderer(*this, triangles),
       marker_renderer(*this, markers), picture_renderer(*this), p_property_work_layer(*this, "work-layer"),
-      p_property_layer_opacity(*this, "layer-opacity")
+      p_property_layer_opacity(*this, "layer-opacity"), p_property_plane_opacity(*this, "plane-opacity")
 {
     add_events(Gdk::BUTTON_PRESS_MASK | Gdk::BUTTON_RELEASE_MASK | Gdk::BUTTON_MOTION_MASK | Gdk::POINTER_MOTION_MASK
                | Gdk::SCROLL_MASK | Gdk::SMOOTH_SCROLL_MASK | Gdk::KEY_PRESS_MASK);
@@ -51,6 +51,8 @@ CanvasGL::CanvasGL()
 
     property_layer_opacity() = 100;
     property_layer_opacity().signal_changed().connect([this] { queue_draw(); });
+    property_plane_opacity() = 100;
+    property_plane_opacity().signal_changed().connect([this] { queue_draw(); });
     clarify_menu = Gtk::manage(new Gtk::Menu);
 
     layer_colors = appearance.layer_colors;

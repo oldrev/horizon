@@ -276,7 +276,8 @@ void LayerBoxRow::set_name(const std::string &n)
 LayerBox::LayerBox(LayerProvider &lpr, bool show_title)
     : Glib::ObjectBase(typeid(LayerBox)), Gtk::Box(Gtk::Orientation::ORIENTATION_VERTICAL, 2), lp(lpr),
       p_property_work_layer(*this, "work-layer"), p_property_layer_opacity(*this, "layer-opacity"),
-      p_property_highlight_mode(*this, "highlight-mode"), p_property_layer_mode(*this, "layer-mode")
+      p_property_plane_opacity(*this, "plane-opacity"), p_property_highlight_mode(*this, "highlight-mode"),
+      p_property_layer_mode(*this, "layer-mode")
 {
     if (show_title) {
         auto *la = Gtk::manage(new Gtk::Label());
@@ -353,6 +354,16 @@ LayerBox::LayerBox(LayerProvider &lpr, bool show_title)
     layer_opacity_scale->set_digits(0);
     layer_opacity_scale->set_value_pos(Gtk::POS_LEFT);
     grid_attach_label_and_widget(layer_opacity_grid, "Layer Opacity", layer_opacity_scale, top);
+
+    auto plane_adj = Gtk::Adjustment::create(90.0, 10.0, 100.0, 1.0, 10.0, 0.0);
+    binding_plane_opacity = Glib::Binding::bind_property(plane_adj->property_value(), property_plane_opacity(),
+                                                         Glib::BINDING_BIDIRECTIONAL);
+
+    auto plane_opacity_scale = Gtk::manage(new Gtk::Scale(plane_adj, Gtk::ORIENTATION_HORIZONTAL));
+    plane_opacity_scale->set_hexpand(true);
+    plane_opacity_scale->set_digits(0);
+    plane_opacity_scale->set_value_pos(Gtk::POS_LEFT);
+    grid_attach_label_and_widget(layer_opacity_grid, "Plane Opacity", plane_opacity_scale, top);
 
 
     auto highlight_mode_combo = Gtk::manage(new Gtk::ComboBoxText);
@@ -467,6 +478,7 @@ json LayerBox::serialize()
 {
     json j;
     j["layer_opacity"] = property_layer_opacity().get_value();
+    j["plane_opacity"] = property_plane_opacity().get_value();
     auto children = lb->get_children();
     for (auto ch : children) {
         auto lrow = dynamic_cast<Gtk::ListBoxRow *>(ch);
@@ -482,7 +494,9 @@ json LayerBox::serialize()
 void LayerBox::load_from_json(const json &j)
 {
     if (j.count("layers")) {
-        property_layer_opacity() = j.value("layer_opacity", 90);
+        const auto layer_opacity = j.value("layer_opacity", 90.0f);
+        property_layer_opacity() = layer_opacity;
+        property_plane_opacity() = j.value("plane_opacity", layer_opacity);
         const auto &j2 = j.at("layers");
         for (auto ch : lb->get_children()) {
             auto lrow = dynamic_cast<Gtk::ListBoxRow *>(ch);

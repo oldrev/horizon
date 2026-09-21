@@ -26,24 +26,25 @@ private:
         Type type;
         bool highlight;
         bool stencil;
+        bool plane_fill;
 
         unsigned int hash() const
         {
-            return (static_cast<unsigned int>(type) & 0x7) | (highlight << 3) | (stencil << 4);
+            return (static_cast<unsigned int>(type) & 0x7) | (highlight << 3) | (stencil << 4) | (plane_fill << 5);
         }
 
         static BatchKey unhash(unsigned int h)
         {
-            return BatchKey{static_cast<Type>(h & 0x7), !!(h & (1 << 3)), !!(h & (1 << 4))};
+            return BatchKey{static_cast<Type>(h & 0x7), !!(h & (1 << 3)), !!(h & (1 << 4)), !!(h & (1 << 5))};
         }
 
-        static constexpr unsigned int hash_max = 0x7 | (1 << 3) | (1 << 4);
-        static_assert(hash_max == 0b11'111);
+        static constexpr unsigned int hash_max = 0x7 | (1 << 3) | (1 << 4) | (1 << 5);
+        static_assert(hash_max == 0b111'111);
 
     private:
         auto tie() const
         {
-            return std::tie(type, highlight, stencil);
+            return std::tie(type, highlight, stencil, plane_fill);
         }
 
     public:

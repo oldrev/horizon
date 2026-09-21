@@ -230,7 +230,6 @@ void TriangleRenderer::render_layer_batch(int layer, HighlightMode highlight_mod
     const auto &ld = ca.get_layer_display(layer);
     UBOBufferTriangle buf;
 
-    buf.alpha = ca.property_layer_opacity() / 100;
     gl_mat3_to_array(buf.screenmat, ca.screenmat);
     if (ignore_flip)
         gl_mat3_to_array(buf.viewmat, ca.viewmat_noflip);
@@ -246,6 +245,7 @@ void TriangleRenderer::render_layer_batch(int layer, HighlightMode highlight_mod
     buf.force_aliased = ca.appearance.min_line_width < 1.1 || ca.appearance.msaa < 1;
 
     for (const auto &[key, span] : batch) {
+        buf.alpha = (key.plane_fill ? ca.property_plane_opacity() : ca.property_layer_opacity()) / 100;
         bool skip = false;
         switch (key.type) {
         case Type::TRIANGLE:
@@ -513,7 +513,8 @@ void TriangleRenderer::push()
                                        || (tri.color == static_cast<int>(ColorP::LAYER_HIGHLIGHT))
                                        || (tri.color == static_cast<int>(ColorP::LAYER_HIGHLIGHT_LIGHTEN));
                 const bool do_stencil = tri_info.type == TriangleInfo::Type::PAD;
-                const BatchKey key{ty, highlight, do_stencil};
+                const bool plane_fill = tri_info.type == TriangleInfo::Type::PLANE_FILL;
+                const BatchKey key{ty, highlight, do_stencil, plane_fill};
                 type_indices.at(key.hash()).push_back(i + ofs);
             }
             i++;

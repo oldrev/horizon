@@ -23,6 +23,8 @@ void ImpLayer::construct_layer_box(bool pack)
                                                       Glib::BINDING_BIDIRECTIONAL);
     layer_opacity_binding = Glib::Binding::bind_property(layer_box->property_layer_opacity(),
                                                          canvas->property_layer_opacity(), Glib::BINDING_BIDIRECTIONAL);
+    plane_opacity_binding = Glib::Binding::bind_property(layer_box->property_plane_opacity(),
+                                                         canvas->property_plane_opacity(), Glib::BINDING_BIDIRECTIONAL);
     layer_box->property_highlight_mode().signal_changed().connect(
             [this] { canvas->set_highlight_mode(layer_box->property_highlight_mode()); });
     canvas->set_highlight_mode(CanvasGL::HighlightMode::DIM);
